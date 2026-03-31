@@ -14,6 +14,10 @@
 #include <hbwmalloc.h>
 #endif
 
+#ifdef GGML_XSAI_ALLOC
+#include "../include/xsai_alloc.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -348,6 +352,12 @@ void * ggml_aligned_malloc(size_t size) {
             result = EFAULT;
             break;
     }
+  #elif defined(GGML_XSAI_ALLOC)
+    int result = 0;
+    aligned_memory = xsai_malloc(size);
+    if (aligned_memory == NULL) {
+        result = ENOMEM;
+    }
   #else
     int result = posix_memalign(&aligned_memory, alignment, size);
   #endif
@@ -381,6 +391,8 @@ void ggml_aligned_free(void * ptr, size_t size) {
     if (ptr != NULL) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)ptr, size);
     }
+#elif defined(GGML_XSAI_ALLOC)
+    xsai_free(ptr);
 #else
     free(ptr);
 #endif

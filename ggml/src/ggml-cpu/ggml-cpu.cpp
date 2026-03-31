@@ -26,6 +26,10 @@
 #    include "arch/riscv/ame/ame-backend.h"
 #endif
 
+#ifdef GGML_XSAI_ALLOC
+#    include "xsai_alloc.h"
+#endif
+
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -125,7 +129,11 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+#ifdef GGML_XSAI_ALLOC
+    xsai_free(cpu_ctx->work_data);
+#else
     delete[] cpu_ctx->work_data;
+#endif
     delete cpu_ctx;
     delete backend;
 }
@@ -144,7 +152,11 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 
     if (cpu_plan->cplan.work_size > 0) {
+#ifdef GGML_XSAI_ALLOC
+        cpu_plan->cplan.work_data = (uint8_t *)xsai_malloc(cpu_plan->cplan.work_size);
+#else
         cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
+#endif
         if (cpu_plan->cplan.work_data == NULL) {
             delete cpu_plan;
             return NULL;
@@ -160,7 +172,11 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
 static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
+#ifdef GGML_XSAI_ALLOC
+    xsai_free(cpu_plan->cplan.work_data);
+#else
     delete[] cpu_plan->cplan.work_data;
+#endif
     delete cpu_plan;
 
     GGML_UNUSED(backend);
@@ -180,8 +196,13 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
+#ifdef GGML_XSAI_ALLOC
+        xsai_free(cpu_ctx->work_data);
+        cpu_ctx->work_data = (uint8_t *)xsai_malloc(cplan.work_size);
+#else
         delete[] cpu_ctx->work_data;
         cpu_ctx->work_data = new uint8_t[cplan.work_size];
+#endif
         if (cpu_ctx->work_data == NULL) {
             cpu_ctx->work_size = 0;
             return GGML_STATUS_ALLOC_FAILED;

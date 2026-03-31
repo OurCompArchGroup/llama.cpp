@@ -291,7 +291,7 @@ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struc
 
 // AME buffer interface
 static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    free(buffer->context);
+    ggml_aligned_free(buffer->context, buffer->size);
 }
 
 static void * ggml_backend_ame_buffer_get_base(ggml_backend_buffer_t buffer) {

@@ -47,6 +47,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/xsai_alloc.c
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
@@ -96,6 +97,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_HBM)
 
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
+    endif()
+
+    if (GGML_XSAI_ALLOC)
+        find_package(Threads REQUIRED)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE Threads::Threads)
     endif()
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")

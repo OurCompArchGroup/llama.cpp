@@ -432,6 +432,15 @@ struct llama_mmap::impl {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
+#ifdef __linux__
+        // Hint the kernel to back model weight pages with transparent huge pages
+        // (2 MiB on RISC-V sv39/sv48).  Requires CONFIG_TRANSPARENT_HUGEPAGE=y and
+        // /sys/kernel/mm/transparent_hugepage/enabled set to "always" or "madvise".
+        if (madvise(addr, file->size(), MADV_HUGEPAGE) != 0) {
+            LLAMA_LOG_WARN("warning: madvise(.., MADV_HUGEPAGE) failed: %s\n", strerror(errno));
+        }
+#endif
+
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",

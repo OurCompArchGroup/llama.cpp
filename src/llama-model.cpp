@@ -8124,7 +8124,11 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.vocab_only                  =*/ false,
+#ifdef GGML_XSAI_ALLOC
+        /*.use_mmap                    =*/ false,
+#else
         /*.use_mmap                    =*/ true,
+#endif
         /*.use_direct_io               =*/ false,
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
