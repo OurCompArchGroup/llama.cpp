@@ -2,6 +2,10 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#ifndef AME_MLOAD_FENCE
+#define AME_MLOAD_FENCE 1
+#endif
+
 // INT8 GEMM using RISC-V AME instructions
 // Tile size: M=AME_TILE_M, K=AME_TILE_K, N=AME_TILE_N (atomic AME variant)
 // C(MxN) = A(MxK) × B^T(NxK), where B is transposed in memory
@@ -29,7 +33,11 @@ void ggml_ame_gemm_tile_i8_i32_bT(
     int stride_c = TILE_N; // Row stride (in elements)
     
     MZERO_ACC(acc0);
-    MLCE32(acc0, addr_c, stride_c * 4);
+#if AME_MLOAD_FENCE
+    asm volatile("fence rw, rw" ::: "memory");
+#endif
+    // tile_c is always zeroed by the caller; MZERO_ACC is sufficient.
+    // (Removed: MLCE32 was redundant and triggered a NEMU mlce32 coherence bug)
     
     // Load left matrix A tile: MxK
     const int8_t *addr_a = A;

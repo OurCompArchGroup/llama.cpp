@@ -54,6 +54,10 @@ typedef struct alloc_header {
 static void          *pool_base  = NULL;
 static size_t         pool_size  = 0;
 static free_block_t  *free_list  = NULL;   /* sorted by address */
+/* 1 when the pool is backed by physically-contiguous memory (huge pages or
+ * RESERVED_PHYS_BASE_ADDR).  The AMU may then use "single-TLB-base + PA
+ * offset" addressing: PA = TLB(pool_base) + (ptr - pool_base). */
+static int            pool_phys_contiguous = 0;
 
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -76,6 +80,9 @@ static int pool_init(void) {
     pool_size = (size_t)RESERVED_MEMORY_SIZE;
 
 #ifdef RESERVED_PHYS_BASE_ADDR
+    /* Map a pre-reserved physically-contiguous region via /dev/mem.
+     * The entire pool is one contiguous PA range, so pool_phys_contiguous=1.
+     * The AMU can do: PA = RESERVED_PHYS_BASE_ADDR + (ptr - pool_base). */
     fprintf(stderr, "[xsai_alloc] ACTIVE mode=phys  phys_base=0x%lx  size=%zu MiB\n",
             (unsigned long)(RESERVED_PHYS_BASE_ADDR), pool_size >> 20);
     int fd = open("/dev/mem", O_RDWR);
@@ -86,12 +93,56 @@ static int pool_init(void) {
     pool_base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE,
                      MAP_SHARED, fd, (off_t)(RESERVED_PHYS_BASE_ADDR));
     close(fd);
+    if (pool_base != MAP_FAILED)
+        pool_phys_contiguous = 1;
 #else
-    fprintf(stderr, "[xsai_alloc] ACTIVE mode=anon  size=%zu MiB\n", pool_size >> 20);
+    /* Try to obtain a physically-contiguous pool via huge pages.
+     *
+     * Huge-page PTEs cover the whole page in a single TLB entry, so every
+     * allocation within a single huge page is also physically contiguous by
+     * definition.  This is the software contract required for the AMU's
+     * "single-TLB-base + PA-offset" addressing mode:
+     *   PA_row = TLB(base_VA) + row * stride
+     *
+     * Prerequisite (RISC-V Linux):
+     *   echo N > /proc/sys/vm/nr_hugepages   (N >= pool_size / 2MiB)
+     * or reserve at boot with hugepages=N.
+     */
+    pool_base = MAP_FAILED;
+
+#if defined(__linux__) && defined(MAP_HUGETLB)
+    /* Try default huge-page size (typically 2 MiB on RISC-V Sv39). */
     pool_base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE,
+                     -1, 0);
+    if (pool_base != MAP_FAILED) {
+        pool_phys_contiguous = 1;
+        fprintf(stderr, "[xsai_alloc] ACTIVE mode=anon-hugepage  size=%zu MiB"
+                        "  pool_base=%p  (phys-contiguous)\n",
+                pool_size >> 20, pool_base);
+    }
+#endif /* __linux__ && MAP_HUGETLB */
+
+    if (pool_base == MAP_FAILED) {
+        /* Hugepages unavailable: fall back to regular anonymous pages.
+         * Physical contiguity is NOT guaranteed across 4 KiB boundaries.
+         * The AMU must NOT use single-TLB-base mode in this configuration. */
+        fprintf(stderr, "[xsai_alloc] WARNING: hugepages unavailable -- "
+                        "physical contiguity NOT guaranteed.\n"
+                        "  AMU single-TLB-base mode will corrupt data when a "
+                        "tile crosses a physical page boundary.\n"
+                        "  Set vm.nr_hugepages >= %zu or define "
+                        "RESERVED_PHYS_BASE_ADDR.\n",
+                pool_size >> 21 /* pool_size / 2MiB */);
+        pool_base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (pool_base != MAP_FAILED) {
+            mlock(pool_base, pool_size); /* pin pages; NOT a contiguity guarantee */
+        }
+        pool_phys_contiguous = 0;
+    }
     fprintf(stderr, "[xsai_alloc] pool_base = %p\n", pool_base);
-#endif
+#endif /* RESERVED_PHYS_BASE_ADDR */
 
     if (pool_base == MAP_FAILED) {
         fprintf(stderr, "[xsai_alloc] mmap failed\n");
@@ -221,6 +272,24 @@ int xsai_in_pool(const void *ptr) {
     return pool_base != NULL
         && (uintptr_t)ptr >= (uintptr_t)pool_base
         && (uintptr_t)ptr <  (uintptr_t)pool_base + pool_size;
+}
+
+/* Returns 1 if the pool is backed by physically-contiguous memory.
+ *
+ * When this returns 1 the AMU may use "single-TLB-base + PA-offset" mode:
+ *   PA(ptr) = TLB(pool_base) + (ptr - pool_base)
+ * i.e. one TLB lookup for pool_base, then all intra-pool addresses are
+ * resolved by pure PA arithmetic without further page-table walks.
+ *
+ * This is valid because every VA offset within the pool maps to the
+ * same PA offset from the pool's physical base — guaranteed by the
+ * huge-page or /dev/mem mapping that backs the pool.
+ *
+ * Returns 0 if the pool uses ordinary 4 KiB pages: physical contiguity
+ * is not guaranteed, and the AMU must perform a TLB lookup whenever it
+ * crosses a virtual page boundary. */
+int xsai_pool_phys_contiguous(void) {
+    return pool_phys_contiguous;
 }
 
 void xsai_alloc_print_stats(void) {

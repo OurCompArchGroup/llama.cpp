@@ -20,6 +20,15 @@ void  xsai_free(void *ptr);
  * Useful for diagnostics / verify the allocator is active. */
 int   xsai_in_pool(const void *ptr);
 
+/* Returns 1 if the pool is physically contiguous (huge pages or
+ * RESERVED_PHYS_BASE_ADDR), 0 if backed by ordinary 4 KiB pages.
+ *
+ * The AMU driver should query this before enabling "single-TLB-base +
+ * PA-offset" addressing mode.  The invariant is:
+ *   PA(p) == TLB(pool_base) + (p - pool_base)   for all p in pool
+ * which only holds when pool_phys_contiguous == 1. */
+int   xsai_pool_phys_contiguous(void);
+
 /* Print a human-readable statistics summary to stderr.
  * Reports: pool capacity, total alloc calls, live allocations,
  * live bytes, peak usage, peak/capacity ratio, free blocks. */

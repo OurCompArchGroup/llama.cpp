@@ -89,6 +89,64 @@ static inline double ipc(uint64_t cy, uint64_t ir) {
 }
 
 // ---------------------------------------------------------------------------
+// Layer-output hash callback
+//
+// Called by ggml_backend_sched after each graph node.
+//   ask=true  → return true to request that tensor data is kept readable
+//   ask=false → tensor data is ready; compute and print hash
+//
+// Only fires for tensors whose names match "l_out-<N>" (one per transformer
+// layer).  Uses FNV-1a over the raw element bytes so it is cheap on NEMU.
+// ---------------------------------------------------------------------------
+
+static uint32_t fnv1a_32(const void * data, size_t len) {
+    const uint8_t * p   = (const uint8_t *)data;
+    uint32_t        h   = 0x811c9dc5u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint32_t)p[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+// Returns the element size in bytes for a ggml type (only types used in
+// llama.cpp 'l_out' tensors matter; anything exotic returns 0 → skip).
+static size_t ggml_type_nbytes_per_elem(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return 4;
+        case GGML_TYPE_F16:  return 2;
+        case GGML_TYPE_BF16: return 2;
+        default:             return ggml_type_size(t) / ggml_blck_size(t);
+    }
+}
+
+static bool layer_hash_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/) {
+    const char * name = ggml_get_name(t);
+
+    // Only interested in "l_out-<N>" tensors
+    if (strncmp(name, "l_out-", 6) != 0) {
+        return false;  // don't need this tensor's data
+    }
+
+    if (ask) {
+        return true;   // yes, keep the data accessible
+    }
+
+    // Compute total element count
+    int64_t  ne    = ggml_nelements(t);
+    size_t   esz   = ggml_type_nbytes_per_elem(t->type);
+    uint32_t hash  = 0;
+
+    if (esz > 0 && t->data != NULL) {
+        hash = fnv1a_32(t->data, (size_t)ne * esz);
+    }
+
+    fprintf(stderr, "[layer_hash] %-12s  ne=%-8" PRId64 "  type=%-5s  fnv1a32=0x%08x\n",
+            name, ne, ggml_type_name(t->type), hash);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 
 static void print_usage(const char * prog) {
     fprintf(stderr,

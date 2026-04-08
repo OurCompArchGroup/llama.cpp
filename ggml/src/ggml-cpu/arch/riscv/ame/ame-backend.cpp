@@ -37,67 +37,63 @@ static void reference_mul_mat_q8_0_f32(
         ggml_ame_quantize_row_f32_to_q8_0(src1_col, y + n * nb, K);
     }
     
-    // Matrix multiply using AME tile function (scalar emulation or real hardware)
-    // Tiling: M=16, N=16, K=32 (one block)
-    const int TILE_M = AME_TILE_M;
-    const int TILE_N = AME_TILE_N;
-    const int TILE_K = AME_TILE_K; // Must be 32 for Q8_0 block match
+    // Heap-allocated via ggml_aligned_malloc so the buffers come from the xsai
+    // pool and are physically contiguous (required by CUTE AMU PA-offset addressing).
+    int8_t  * tile_A = (int8_t  *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    int8_t  * tile_B = (int8_t  *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    int32_t * tile_C = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+    if (!tile_A || !tile_B || !tile_C) {
+        ggml_aligned_free(tile_A, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_B, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_C, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+        free(y);
+        return;
+    }
 
-    // Buffers for one tile
-    // Use aligned allocation for AME instructions (stack or heap)
-    // AME instructions likely require 64-byte alignment
-    int8_t * tile_A = (int8_t *)ggml_aligned_malloc(TILE_M * TILE_K * sizeof(int8_t));
-    int8_t * tile_B = (int8_t *)ggml_aligned_malloc(TILE_N * TILE_K * sizeof(int8_t));
-    int32_t * tile_C = (int32_t *)ggml_aligned_malloc(TILE_M * TILE_N * sizeof(int32_t));
-
-    // Clear destination (if not already cleared by caller, but we overwrite/accumulate correctly)
-    // Actually caller expects us to write result, not accumulate on existing dst? ggml usually expects overwrite unless accumulated.
-    // Standard matmul overwrites.
-    // We will accumulate into dst buffer, so first clear it.
     memset(dst_data, 0, M * N * sizeof(float));
 
-    for (int64_t m0 = 0; m0 < M; m0 += TILE_M) {
-        for (int64_t n0 = 0; n0 < N; n0 += TILE_N) {
+    for (int64_t m0 = 0; m0 < M; m0 += AME_TILE_M) {
+        for (int64_t n0 = 0; n0 < N; n0 += AME_TILE_N) {
             
             // Loop over blocks (K dimension)
             for (int64_t b = 0; b < nb; b++) {
-                // Pack A tile: [TILE_M, TILE_K]
-                for (int i = 0; i < TILE_M; i++) {
+                // Pack A tile: [AME_TILE_M, AME_TILE_K]
+                for (int i = 0; i < AME_TILE_M; i++) {
                     if (m0 + i < M) {
                          const block_q8_0 * blk = &x[b + (m0 + i) * nb];
-                         memcpy(&tile_A[i * TILE_K], blk->qs, TILE_K);
+                         memcpy(&tile_A[i * AME_TILE_K], blk->qs, AME_TILE_K);
                     } else {
-                         memset(&tile_A[i * TILE_K], 0, TILE_K);
+                         memset(&tile_A[i * AME_TILE_K], 0, AME_TILE_K);
                     }
                 }
 
-                // Pack B tile: [TILE_N, TILE_K]
+                // Pack B tile: [AME_TILE_N, AME_TILE_K]
                 // Note: y is column-major logic (N x nb), but stored linear.
                 // y[b + n*nb] is block for col 'n'.
                 // We want tile_B to have rows corresponding to 'n' (transposed B).
-                for (int j = 0; j < TILE_N; j++) {
+                for (int j = 0; j < AME_TILE_N; j++) {
                     if (n0 + j < N) {
                          const block_q8_0 * blk = &y[b + (n0 + j) * nb];
-                         memcpy(&tile_B[j * TILE_K], blk->qs, TILE_K);
+                         memcpy(&tile_B[j * AME_TILE_K], blk->qs, AME_TILE_K);
                     } else {
-                         memset(&tile_B[j * TILE_K], 0, TILE_K);
+                         memset(&tile_B[j * AME_TILE_K], 0, AME_TILE_K);
                     }
                 }
 
                 // Compute Tile
-                memset(tile_C, 0, TILE_M * TILE_N * sizeof(int32_t));
+                memset(tile_C, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
                 ggml_ame_gemm_tile_i8_i32_bT(tile_A, tile_B, tile_C);
 
                 // Accumulate to destination with scales
-                for (int i = 0; i < TILE_M; i++) {
+                for (int i = 0; i < AME_TILE_M; i++) {
                     if (m0 + i >= M) continue;
                     const float d_a = GGML_FP16_TO_FP32(x[b + (m0 + i) * nb].d);
                     
-                    for (int j = 0; j < TILE_N; j++) {
+                    for (int j = 0; j < AME_TILE_N; j++) {
                         if (n0 + j >= N) continue;
                         const float d_b = GGML_FP16_TO_FP32(y[b + (n0 + j) * nb].d);
                         
-                        float val = (float)tile_C[i * TILE_N + j];
+                        float val = (float)tile_C[i * AME_TILE_N + j];
                         dst_data[(m0 + i) + (n0 + j) * M] += val * d_a * d_b;
                     }
                 }
@@ -105,10 +101,9 @@ static void reference_mul_mat_q8_0_f32(
         }
     }
     
-    ggml_aligned_free(tile_A, TILE_M * TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_B, TILE_N * TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_C, TILE_M * TILE_N * sizeof(int32_t));
-    
+    ggml_aligned_free(tile_A, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_B, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_C, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
     free(y);
 }
 

@@ -5,10 +5,40 @@
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 
+#if defined(GGML_XSAI_ALLOC)
+#include "xsai_alloc.h"
+#endif
+
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
 #include <stdio.h>
+
+/* Method A safety gate: CUTE AMU computes per-row addresses as
+ *   PA_row = PA_base + row * stride
+ * without issuing a TLB re-query for each virtual page boundary.
+ * This is only correct when the tile buffers are physically contiguous.
+ * tile_a = AME_TILE_M * AME_TILE_K = 128*64 = 8192 bytes spans 3 virtual
+ * pages, so non-contiguous allocation silently corrupts rows >= 63 and >=127.
+ */
+static void ame_assert_phys_contiguous(void) {
+#if defined(GGML_USE_RV_AME) && defined(GGML_XSAI_ALLOC)
+    static int checked = 0;
+    if (checked) return;
+    checked = 1;
+    if (!xsai_pool_phys_contiguous()) {
+        fprintf(stderr,
+            "[AME] FATAL: xsai memory pool is not physically contiguous.\n"
+            "             CUTE AMU row-address formula: PA_row = PA_base + row*stride\n"
+            "             (no per-row TLB re-query, LocalMMU TODO not yet implemented).\n"
+            "             tile_a (8192 B) spans 3 virtual pages; rows >=63 and >=127\n"
+            "             will read wrong physical addresses => silent data corruption.\n"
+            "             Fix: boot kernel with hugepages=512, or define\n"
+            "             RESERVED_PHYS_BASE_ADDR for /dev/mem-backed pool.\n");
+        abort();
+    }
+#endif
+}
 
 // Forward declaration of atomic GEMM function
 extern void ggml_ame_gemm_tile_i8_i32_bT(
@@ -133,17 +163,26 @@ void ggml_ame_mul_mat_q8_0(
     block_q8_0 * y_q8 = (block_q8_0 *)malloc(y_q8_size * sizeof(block_q8_0));
     if (!y_q8) return;
 
-    // Quantize src1 -> y_q8 (transposed state: y[j][kb] is src1[kb][j])
+    // Quantize src1 -> y_q8 (transposed state: y[j][kb] is src1[kb][j]) -4420
     for (int64_t j = 0; j < N; j++) {
         const float * src1_col = (const float *)((const char *)src1 + j * src1_stride);
         ggml_ame_quantize_row_f32_to_q8_0(src1_col, y_q8 + j * nb_x, K);
     }
     const block_q8_0 * restrict y = y_q8;
 
-    // Aligned buffers for tiles
-    int8_t tile_a[AME_TILE_M * AME_TILE_K] __attribute__((aligned(64)));
-    int8_t tile_b[AME_TILE_N * AME_TILE_K] __attribute__((aligned(64)));
-    int32_t tile_c[AME_TILE_M * AME_TILE_N] __attribute__((aligned(64)));
+    // Aligned buffers for tiles (heap-allocated so AME sees contiguous physical pages)
+    int8_t * tile_a = (int8_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    int8_t * tile_b = (int8_t *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    int32_t * tile_c = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+    if (!tile_a || !tile_b || !tile_c) {
+        ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+        free(y_q8);
+        return;
+    }
+    // Method A: verify physical contiguity contract before first AME instruction
+    ame_assert_phys_contiguous();
 
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
         const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
@@ -174,25 +213,23 @@ void ggml_ame_mul_mat_q8_0(
             for (int64_t kb = 0; kb < nb_x; kb++) {
                 // Prepare Tile A (16 x 32)
                 for (int i = 0; i < AME_TILE_M; i++) {
+                     memset(&tile_a[i * AME_TILE_K], 0, AME_TILE_K);
                      if (i < imax) {
                          const block_q8_0 * b = &x[(i0 + i) * nb_x + kb];
                          memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
-                     } else {
-                         memset(&tile_a[i * AME_TILE_K], 0, qk);
                      }
                 }
 
                 // Prepare Tile B (16 x 32)
                 for (int j = 0; j < AME_TILE_N; j++) {
+                     memset(&tile_b[j * AME_TILE_K], 0, AME_TILE_K);
                      if (j < jmax) {
                          const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
                          memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
-                     } else {
-                         memset(&tile_b[j * AME_TILE_K], 0, qk);
                      }
                 }
 
-                memset(tile_c, 0, sizeof(tile_c));
+                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
 
                 // Accumulate scaling factors
@@ -217,6 +254,9 @@ void ggml_ame_mul_mat_q8_0(
         }
     }
 
+    ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
     free(y_q8);
 }
 
@@ -254,9 +294,18 @@ void ggml_ame_mul_mat_q4_0(
     }
     const block_q8_0 * restrict y = y_q8;
 
-    int8_t tile_a[AME_TILE_M * AME_TILE_K] __attribute__((aligned(64)));
-    int8_t tile_b[AME_TILE_N * AME_TILE_K] __attribute__((aligned(64)));
-    int32_t tile_c[AME_TILE_M * AME_TILE_N] __attribute__((aligned(64)));
+    int8_t * tile_a = (int8_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    int8_t * tile_b = (int8_t *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    int32_t * tile_c = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+    if (!tile_a || !tile_b || !tile_c) {
+        ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+        free(y_q8);
+        return;
+    }
+    // Method A: verify physical contiguity contract before first AME instruction
+    ame_assert_phys_contiguous();
 
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
         const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
@@ -285,25 +334,23 @@ void ggml_ame_mul_mat_q4_0(
                 
                 // Prepare Tile A (16 x 32) - Directly copy repacked data
                 for (int i = 0; i < AME_TILE_M; i++) {
+                     memset(&tile_a[i * AME_TILE_K], 0, AME_TILE_K);
                      if (i < imax) {
                          const block_q4_0_ame * b = &x[(i0 + i) * nb_x + kb];
                          memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
-                     } else {
-                         memset(&tile_a[i * AME_TILE_K], 0, qk);
                      }
                 }
 
                 // Prepare Tile B (16 x 32)
                 for (int j = 0; j < AME_TILE_N; j++) {
+                     memset(&tile_b[j * AME_TILE_K], 0, AME_TILE_K);
                      if (j < jmax) {
                          const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
                          memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
-                     } else {
-                         memset(&tile_b[j * AME_TILE_K], 0, qk);
                      }
                 }
 
-                memset(tile_c, 0, sizeof(tile_c));
+                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
 
                 for (int i = 0; i < imax; i++) {
@@ -325,5 +372,8 @@ void ggml_ame_mul_mat_q4_0(
         }
     }
 
+    ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
     free(y_q8);
 }
