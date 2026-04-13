@@ -44,15 +44,17 @@ static inline void ame_log_init(void) {
 #define AME_TILE_K 64
 #define AME_TILE_N 128
 
-// Helper function to check if AME can be used for given dimensions
-// We remove minimum size checks to properly support Q4_0 repacked weights
-// which must use AME backend even for small batches (N=1)
-// Also require K to be a multiple of 32 (Q8_0/Q4_0 block size) for validity
+// Helper function to check if AME can be used for given dimensions.
+//
+// The current AME backend only accelerates Q8_0 GEMM. It only reaches the
+// AME core on full MxN tiles; smaller shapes fall back to RVV/scalar helpers
+// and usually lose to the generic CPU path once the extra quantize/pack cost is
+// accounted for.
 static inline int ggml_ame_can_use(int M, int N, int K) {
-    // if (K % 32 != 0) return 0;
-
-    // AME kernels handle padding/tiling for small dimensions,
-    // so we accept any size provided K is aligned.
+    if (M <= 0 || N <= 0 || K <= 0) return 0;
+    if (K % 32 != 0) return 0;
+    if (M < AME_TILE_M) return 0;
+    if (N < AME_TILE_N) return 0;
     return 1;
 }
 
@@ -295,7 +297,9 @@ void ggml_ame_mul_mat_q8_0(
     int64_t ne01,
     int64_t ne10,
     int64_t ne11,
-    size_t src1_stride  // stride in bytes for src1 columns (nb[1])
+    size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
+    void * work_data,
+    size_t work_size
 );
 
 // GGML integration wrapper for Q4_0 quantized matrix multiplication

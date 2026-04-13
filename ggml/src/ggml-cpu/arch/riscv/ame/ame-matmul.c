@@ -137,6 +137,24 @@ static void ame_vec_dot_q4_0_rvv(int n, float * s, const void * vx, const void *
 
 // ggml_ame_quantize_row_f32_to_q8_0 is now in ame-helper.c
 
+static size_t ame_align_up_size(size_t value, size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+static size_t ggml_ame_q8_0_workspace_size(int64_t N, int64_t K) {
+    const size_t nb_x = (size_t)(K / 32);
+    size_t size = 64;
+    size = ame_align_up_size(size, 64);
+    size += (size_t)N * nb_x * sizeof(block_q8_0);
+    size = ame_align_up_size(size, 64);
+    size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up_size(size, 64);
+    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up_size(size, 64);
+    size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
+    return size;
+}
+
 
 // Wrapper for AME-accelerated Q8_0 GEMM
 void ggml_ame_mul_mat_q8_0(
@@ -147,7 +165,9 @@ void ggml_ame_mul_mat_q8_0(
     int64_t ne01,       // M
     int64_t ne10,       // K (unused)
     int64_t ne11,       // N
-    size_t src1_stride
+    size_t src1_stride,
+    void * work_data,
+    size_t work_size
 ) {
     const int64_t M = ne01;
     const int64_t N = ne11;
@@ -159,9 +179,43 @@ void ggml_ame_mul_mat_q8_0(
     const block_q8_0 * restrict x = (const block_q8_0 *)src0;
     float * restrict out = (float *)dst;
 
+    const size_t required_wsize = ggml_ame_q8_0_workspace_size(N, K);
+    uint8_t * workspace = (uint8_t *)work_data;
+    int allocated_workspace = 0;
+
+    if (workspace == NULL || work_size < required_wsize) {
+        workspace = (uint8_t *)ggml_aligned_malloc(required_wsize);
+        if (!workspace) return;
+        work_size = required_wsize;
+        allocated_workspace = 1;
+    }
+
+    uintptr_t ws_ptr = (uintptr_t)workspace;
+    uintptr_t ws_end = ws_ptr + work_size;
+
+    ws_ptr = ame_align_up_size(ws_ptr, 64);
     const int64_t y_q8_size = N * nb_x;
-    block_q8_0 * y_q8 = (block_q8_0 *)malloc(y_q8_size * sizeof(block_q8_0));
-    if (!y_q8) return;
+    block_q8_0 * y_q8 = (block_q8_0 *)ws_ptr;
+    ws_ptr += y_q8_size * sizeof(block_q8_0);
+
+    ws_ptr = ame_align_up_size(ws_ptr, 64);
+    int8_t * tile_a = (int8_t *)ws_ptr;
+    ws_ptr += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+
+    ws_ptr = ame_align_up_size(ws_ptr, 64);
+    int8_t * tile_b = (int8_t *)ws_ptr;
+    ws_ptr += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+
+    ws_ptr = ame_align_up_size(ws_ptr, 64);
+    int32_t * tile_c = (int32_t *)ws_ptr;
+    ws_ptr += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
+
+    if (ws_ptr > ws_end) {
+        if (allocated_workspace) {
+            ggml_aligned_free(workspace, work_size);
+        }
+        return;
+    }
 
     // Quantize src1 -> y_q8 (transposed state: y[j][kb] is src1[kb][j]) -4420
     for (int64_t j = 0; j < N; j++) {
@@ -170,19 +224,10 @@ void ggml_ame_mul_mat_q8_0(
     }
     const block_q8_0 * restrict y = y_q8;
 
-    // Aligned buffers for tiles (heap-allocated so AME sees contiguous physical pages)
-    int8_t * tile_a = (int8_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-    int8_t * tile_b = (int8_t *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-    int32_t * tile_c = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-    if (!tile_a || !tile_b || !tile_c) {
-        ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-        ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-        ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-        free(y_q8);
-        return;
-    }
     // Method A: verify physical contiguity contract before first AME instruction
     ame_assert_phys_contiguous();
+    memset(tile_a, 0, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
 
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
         const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
@@ -213,23 +258,24 @@ void ggml_ame_mul_mat_q8_0(
             for (int64_t kb = 0; kb < nb_x; kb++) {
                 // Prepare Tile A (16 x 32)
                 for (int i = 0; i < AME_TILE_M; i++) {
-                     memset(&tile_a[i * AME_TILE_K], 0, AME_TILE_K);
                      if (i < imax) {
                          const block_q8_0 * b = &x[(i0 + i) * nb_x + kb];
                          memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_a[i * AME_TILE_K], 0, qk);
                      }
                 }
 
                 // Prepare Tile B (16 x 32)
                 for (int j = 0; j < AME_TILE_N; j++) {
-                     memset(&tile_b[j * AME_TILE_K], 0, AME_TILE_K);
                      if (j < jmax) {
                          const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
                          memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
+                     } else {
+                         memset(&tile_b[j * AME_TILE_K], 0, qk);
                      }
                 }
 
-                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
 
                 // Accumulate scaling factors
@@ -254,10 +300,9 @@ void ggml_ame_mul_mat_q8_0(
         }
     }
 
-    ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-    free(y_q8);
+    if (allocated_workspace) {
+        ggml_aligned_free(workspace, work_size);
+    }
 }
 
 // Wrapper for AME-accelerated Q4_0 GEMM

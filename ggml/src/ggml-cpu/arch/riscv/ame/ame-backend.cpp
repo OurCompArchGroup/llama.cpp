@@ -109,8 +109,28 @@ static void reference_mul_mat_q8_0_f32(
 
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
-    // AME supports Q8_0 (native int8) and Q4_0 (dequantized to int8)
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+    return type == GGML_TYPE_Q8_0;
+}
+
+static size_t ame_align_up(size_t value, size_t alignment) {
+    return (value + alignment - 1) / alignment * alignment;
+}
+
+static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
+    const int64_t K = op->src[0]->ne[0];
+    const int64_t N = op->src[1]->ne[1];
+    const int64_t nb_x = K / QK8_0;
+
+    size_t size = 64;
+    size = ame_align_up(size, 64);
+    size += (size_t) N * (size_t) nb_x * sizeof(block_q8_0);
+    size = ame_align_up(size, 64);
+    size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up(size, 64);
+    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up(size, 64);
+    size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
+    return size;
 }
 
 // Compute forward for AME operations
@@ -131,32 +151,19 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
 
     AME_LOG("backend_ame_mul_mat: src0_type=%d M=%lld N=%lld K=%lld", src0->type, (long long)ne01, (long long)ne11, (long long)ne00);
 
-    // Call AME implementation
-    if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
-        AME_LOG("backend_ame_mul_mat: dispatching to Q8_0 kernel");
-        // For Q8_0 x F32, we need to quantize src1 first
-        // This is typically done in a separate step
-        // For now, call the Q8_0 x Q8_0 kernel
-        ggml_ame_mul_mat_q8_0(
-            src0->data,
-            src1->data,
-            dst->data,
-            ne00, ne01,
-            ne10, ne11,
-            src1->nb[1]  // pass stride
-        );
-    } else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
-        AME_LOG("backend_ame_mul_mat: dispatching to Q4_0 kernel");
-        // Q4_0 x F32: dequantize Q4_0 to int8, then use AME
-        ggml_ame_mul_mat_q4_0(
-            src0->data,
-            src1->data,
-            dst->data,
-            ne00, ne01,
-            ne10, ne11,
-            src1->nb[1]
-        );
-    }
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+
+    AME_LOG("backend_ame_mul_mat: dispatching to Q8_0 kernel");
+    ggml_ame_mul_mat_q8_0(
+        src0->data,
+        src1->data,
+        dst->data,
+        ne00, ne01,
+        ne10, ne11,
+        src1->nb[1],
+        params->wdata,
+        params->wsize
+    );
 
     GGML_UNUSED(params);
 }
@@ -166,9 +173,17 @@ namespace ggml::cpu::riscv_ame {
 
 class tensor_traits : public ggml::cpu::tensor_traits {
 public:
-    bool work_size(int /* n_threads */, const struct ggml_tensor * /* op */, size_t & size) override {
-        // AME doesn't need extra workspace for now
-        size = 0;
+    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        if (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[1]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+            return false;
+        }
+        size = ggml_backend_ame_desired_wsize(op);
         return true;
     }
 
@@ -267,6 +282,15 @@ public:
                 free(ame_data);
                 return true;
             }
+
+            const ggml_tensor * src0 = op->src[0];
+            const ggml_tensor * src1 = op->src[1];
+            if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
             
             AME_LOG("tensor_traits::compute_forward: calling AME mul_mat");
             ggml_backend_ame_mul_mat(params, op);
@@ -319,20 +343,7 @@ static void ggml_backend_ame_buffer_set_tensor(
     size_t offset,
     size_t size
 ) {
-    // Repack Q4_0 weights to AME-optimized format (pre-unpacked int8)
-    // This follows the AMX/SpaceMit pattern of preprocessing weights once
-    if (tensor->type == GGML_TYPE_Q4_0 && offset == 0) {
-        // Calculate number of Q4_0 blocks
-        const int64_t ne0 = tensor->ne[0];
-        const int64_t nblocks = ne0 / 32;  // Q4_0 block size is 32
-        const int64_t total_blocks = nblocks * ggml_nrows(tensor);
-        
-        // Repack from block_q4_0 to block_q4_0_ame
-        ggml_ame_repack_q4_0(tensor->data, data, total_blocks);
-    } else {
-        // For Q8_0 and other types, direct copy
-        memcpy((char *)tensor->data + offset, data, size);
-    }
+    memcpy((char *)tensor->data + offset, data, size);
     GGML_UNUSED(buffer);
 }
 
@@ -380,18 +391,6 @@ static size_t ggml_backend_ame_buffer_type_get_alloc_size(
     ggml_backend_buffer_type_t buft,
     const ggml_tensor * tensor
 ) {
-    // Q4_0 needs extra space for repacked format
-    // block_q4_0: 2 bytes (d) + 16 bytes (qs) = 18 bytes
-    // block_q4_0_ame: 2 bytes (d) + 32 bytes (qs) = 34 bytes
-    // Size increase: 34/18 = 1.889x
-    if (tensor->type == GGML_TYPE_Q4_0) {
-        const int64_t ne0 = tensor->ne[0];
-        const int64_t nblocks = ne0 / 32;  // Q4_0 block size is 32
-        const int64_t nrows = ggml_nrows(tensor);
-        return nrows * nblocks * sizeof(block_q4_0_ame);
-    }
-    
-    // For other types, return standard size
     return ggml_nbytes(tensor);
     GGML_UNUSED(buft);
 }
@@ -402,7 +401,15 @@ namespace ggml::cpu::riscv_ame {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
 public:
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-        // Handle only 2D matrix multiply for now
+        // AME buffers keep standard ggml tensor bytes, so the generic CPU backend
+        // can still execute unsupported ops directly from the same storage.  This
+        // method therefore only decides whether the AME-specialized path may run;
+        // it must not block CPU fallback at scheduling time.
+
+        if (op->op != GGML_OP_MUL_MAT) {
+            return true;
+        }
+
         auto is_contiguous_2d = [](const struct ggml_tensor * t) {
             return ggml_is_contiguous(t) && t->ne[3] == 1 && t->ne[2] == 1;
         };
@@ -411,52 +418,40 @@ public:
                 op->src[0] ? op->src[0]->type : -1, 
                 op->src[1] ? op->src[1]->type : -1);
 
-        if (op->op != GGML_OP_MUL_MAT) {
-            AME_LOG("supports_op: reject (not MUL_MAT)");
-            return false;
-        }
-
         if (!is_contiguous_2d(op->src[0])) {
-            AME_LOG("supports_op: reject (src0 not contiguous 2d)");
-            return false;
+            AME_LOG("supports_op: fallback (src0 not contiguous 2d)");
+            return true;
         }
 
         if (!is_contiguous_2d(op->src[1])) {
-            AME_LOG("supports_op: reject (src1 not contiguous 2d)");
-            return false;
+            AME_LOG("supports_op: fallback (src1 not contiguous 2d)");
+            return true;
         }
 
         if (!op->src[0]->buffer) {
-            AME_LOG("supports_op: reject (src0 has no buffer)");
-            return false;
+            AME_LOG("supports_op: fallback (src0 has no buffer)");
+            return true;
         }
 
-        // TEMPORARY: Accept both AME buffer and host buffer for testing
-        // In production, only AME buffer should be accepted for optimal performance
-        bool is_ame_buffer = (op->src[0]->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type());
-        bool is_host_buffer = ggml_backend_buft_is_host(op->src[0]->buffer->buft);
-        
-        if (!is_ame_buffer && !is_host_buffer) {
-            AME_LOG("supports_op: reject (src0 buffer type mismatch: %p vs %p, name=%s)", 
-                    (void*)op->src[0]->buffer->buft, 
-                    (void*)ggml_backend_cpu_riscv_ame_buffer_type(),
-                    op->src[0]->buffer->buft ? ggml_backend_buft_name(op->src[0]->buffer->buft) : "NULL");
-            return false;
-        }
-        
-        if (is_host_buffer) {
-            AME_LOG("supports_op: accepting host buffer (testing mode)");
+        if (op->src[0]->buffer->buft != ggml_backend_cpu_riscv_ame_buffer_type()) {
+            AME_LOG("supports_op: fallback (src0 not in AME buffer)");
+            return true;
         }
 
         if (!qtype_has_ame_kernels(op->src[0]->type)) {
-            AME_LOG("supports_op: reject (src0 type not supported)");
-            return false;
+            AME_LOG("supports_op: fallback (src0 type not supported)");
+            return true;
+        }
+
+        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+            AME_LOG("supports_op: fallback (shape not AME-friendly)");
+            return true;
         }
             
         // src1 must be host buffer
         if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
-            AME_LOG("supports_op: reject (src1 not host)");
-            return false;
+            AME_LOG("supports_op: fallback (src1 not host)");
+            return true;
         }
         // src1 must be float32
         if (op->src[1]->type == GGML_TYPE_F32) {
@@ -464,8 +459,8 @@ public:
             return true;
         }
 
-        AME_LOG("supports_op: reject (src1 not F32)");
-        return false;
+        AME_LOG("supports_op: fallback (src1 not F32)");
+        return true;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
