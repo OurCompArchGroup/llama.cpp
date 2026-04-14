@@ -120,6 +120,7 @@ static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
     const int64_t K = op->src[0]->ne[0];
     const int64_t N = op->src[1]->ne[1];
     const int64_t nb_x = K / QK8_0;
+    const size_t packed_b_panel_size = (size_t) nb_x * AME_TILE_N * AME_TILE_K * sizeof(int8_t);
 
     size_t size = 64;
     size = ame_align_up(size, 64);
@@ -127,7 +128,7 @@ static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
     size = ame_align_up(size, 64);
     size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
     size = ame_align_up(size, 64);
-    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size += packed_b_panel_size;
     size = ame_align_up(size, 64);
     size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
     return size;
@@ -347,6 +348,17 @@ static void ggml_backend_ame_buffer_set_tensor(
     GGML_UNUSED(buffer);
 }
 
+static void ggml_backend_ame_buffer_get_tensor(
+    ggml_backend_buffer_t buffer,
+    const struct ggml_tensor * tensor,
+    void * data,
+    size_t offset,
+    size_t size
+) {
+    memcpy((char *)data, (const char *)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
 static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     memset(buffer->context, value, buffer->size);
 }
@@ -357,7 +369,7 @@ static ggml_backend_buffer_i ggml_backend_ame_buffer_interface = {
     /* .init_tensor     = */ ggml_backend_ame_buffer_init_tensor,
     /* .memset_tensor   = */ ggml_backend_ame_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_ame_buffer_set_tensor,
-    /* .get_tensor      = */ nullptr,
+    /* .get_tensor      = */ ggml_backend_ame_buffer_get_tensor,
     /* .cpy_tensor      = */ nullptr,
     /* .clear           = */ ggml_backend_ame_buffer_clear,
     /* .reset           = */ nullptr,

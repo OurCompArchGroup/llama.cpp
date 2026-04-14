@@ -20,6 +20,8 @@
 #include <ggml-backend.h>
 #include <ggml-cpp.h>
 
+#include "../ggml/src/ggml-cpu/traits.h"
+
 #include <algorithm>
 #include <array>
 #include <cfloat>
@@ -41,20 +43,164 @@
 #include <vector>
 #include <unordered_map>
 
+#define DISABLE_TIME_INTR 0x100
+#define NOTIFY_PROFILER 0x101
+#define NOTIFY_PROFILE_EXIT 0x102
+#define GOOD_TRAP 0x0
+
+#if defined(__riscv)
+void nemu_signal(int a){
+    asm volatile ("mv a0, %0\n\t"
+                  ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
+                  :
+                  : "r"(a)
+                  : "a0");
+}
+#else
+static inline void nemu_signal(int code) {
+    (void)code;
+}
+#endif
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
 #else
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+static constexpr double XSAI_CPU_FREQ_GHZ = 2.0;
+static constexpr double XSAI_CYCLES_PER_US = XSAI_CPU_FREQ_GHZ * 1000.0;
+
+static inline uint64_t read_cycle(void) {
+#if defined(__riscv)
+    uint64_t c;
+    asm volatile("rdcycle %0" : "=r"(c));
+    return c;
+#else
+    return 0;
+#endif
+}
+
+static inline uint64_t read_instret(void) {
+#if defined(__riscv)
+    uint64_t c;
+    asm volatile("rdinstret %0" : "=r"(c));
+    return c;
+#else
+    return 0;
+#endif
+}
+
+static ggml_backend_buffer_type_t g_forced_buft = nullptr;
+static const char * g_forced_buft_name = nullptr;
+
+static ggml_backend_buffer_type_t test_buft_from_name(const char * name) {
+    if (name == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    if (cpu_buft && strcmp(name, ggml_backend_buft_name(cpu_buft)) == 0) {
+        return cpu_buft;
+    }
+
+    for (auto * extra_buft : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra_buft && strcmp(name, ggml_backend_buft_name(extra_buft)) == 0) {
+            return extra_buft;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool forced_buft_is_ame() {
+    return g_forced_buft != nullptr && strcmp(ggml_backend_buft_name(g_forced_buft), "RISCV_AME") == 0;
+}
+
+static int effective_test_threads() {
+    return forced_buft_is_ame() ? 1 : (int) N_THREADS;
+}
+
+static uint64_t effective_perf_target_flops_cpu() {
+    const uint64_t GFLOP = 1000ULL * 1000ULL * 1000ULL;
+    const uint64_t MFLOP = 1000ULL * 1000ULL;
+    return forced_buft_is_ame() ? 512ULL * MFLOP : 8ULL * GFLOP;
+}
+
+static void print_available_bufts() {
+    printf("Available CPU buffer types:\n");
+    if (auto * cpu_buft = ggml_backend_cpu_buffer_type()) {
+        printf("  %s\n", ggml_backend_buft_name(cpu_buft));
+    }
+    for (auto * extra_buft : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra_buft) {
+            printf("  %s\n", ggml_backend_buft_name(extra_buft));
+        }
+    }
+}
+
+static ggml_tensor * root_view_tensor(ggml_tensor * tensor) {
+    while (tensor && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static enum ggml_status init_view_chain(ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->view_src == nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    enum ggml_status status = init_view_chain(tensor->view_src);
+    if (status != GGML_STATUS_SUCCESS) {
+        return status;
+    }
+
+    if (tensor->buffer == nullptr) {
+        return ggml_backend_view_init(tensor);
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
+static bool supports_selected_buft_op(ggml_backend_t backend, ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return ggml_backend_supports_op(backend, tensor);
+    }
+
+    if (!(tensor->op == GGML_OP_MUL_MAT && tensor->src[0] && tensor->src[0]->buffer && tensor->src[0]->buffer->buft == buft)) {
+        return ggml_backend_supports_op(backend, tensor);
+    }
+
+    size_t dummy_wsize = 0;
+    return ggml_cpu_extra_work_size(effective_test_threads(), tensor, &dummy_wsize);
+}
+
+static std::string backend_display_name(ggml_backend_t backend) {
+    std::string name = ggml_backend_name(backend);
+    if (g_forced_buft != nullptr) {
+        name += "/";
+        name += ggml_backend_buft_name(g_forced_buft);
+    }
+    return name;
+}
+
+static std::string backend_display_name(ggml_backend_dev_t dev) {
+    std::string name = ggml_backend_dev_name(dev);
+    if (g_forced_buft != nullptr) {
+        name += "/";
+        name += ggml_backend_buft_name(g_forced_buft);
+    }
+    return name;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
         // parallel initialization
-        static const size_t n_threads = N_THREADS;
+        const size_t n_threads = effective_test_threads();
         // static RNG initialization (revisit if n_threads stops being constant)
-        static std::vector<std::default_random_engine> generators = []() {
+        std::vector<std::default_random_engine> generators = [n_threads]() {
             std::random_device rd;
             std::vector<std::default_random_engine> vec;
             vec.reserve(n_threads);
@@ -115,7 +261,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             };
 
             const size_t min_blocks_per_thread = 1;
-            const size_t n_quant_threads = std::min<size_t>(std::max<size_t>(N_THREADS/2, 1),
+            const size_t n_quant_threads = std::min<size_t>(std::max<size_t>(effective_test_threads()/2, 1),
                                                             std::max<size_t>(1, n_blocks / min_blocks_per_thread));
 
             if (n_quant_threads == 1) {
@@ -526,6 +672,9 @@ struct test_result {
     double      time_us;
     double      flops;
     double      bandwidth_gb_s;
+    uint64_t    cycles_per_run;
+    uint64_t    instret_per_run;
+    double      ipc;
     size_t      memory_kb;
     int         n_runs;
     std::string device_description;
@@ -536,6 +685,9 @@ struct test_result {
         time_us        = 0.0;
         flops          = 0.0;
         bandwidth_gb_s = 0.0;
+        cycles_per_run = 0;
+        instret_per_run = 0;
+        ipc = 0.0;
         memory_kb      = 0;
         n_runs         = 0;
         supported      = false;
@@ -553,7 +705,8 @@ struct test_result {
 
     test_result(const std::string & backend_name, const std::string & op_name, const std::string & op_params,
                 const std::string & test_mode, bool supported, bool passed, const std::string & error_message = "",
-                double time_us = 0.0, double flops = 0.0, double bandwidth_gb_s = 0.0, size_t memory_kb = 0,
+                double time_us = 0.0, double flops = 0.0, double bandwidth_gb_s = 0.0,
+                uint64_t cycles_per_run = 0, uint64_t instret_per_run = 0, double ipc = 0.0, size_t memory_kb = 0,
                 int n_runs = 0, const std::string & device_description = "", const std::string & backend_reg_name = "") :
         backend_name(backend_name),
         op_name(op_name),
@@ -565,6 +718,9 @@ struct test_result {
         time_us(time_us),
         flops(flops),
         bandwidth_gb_s(bandwidth_gb_s),
+        cycles_per_run(cycles_per_run),
+        instret_per_run(instret_per_run),
+        ipc(ipc),
         memory_kb(memory_kb),
         n_runs(n_runs),
         device_description(device_description),
@@ -582,7 +738,7 @@ struct test_result {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "test_time", "build_commit",  "backend_name", "op_name", "op_params",      "test_mode", "supported",
-            "passed",    "error_message", "time_us",      "flops",   "bandwidth_gb_s", "memory_kb", "n_runs",
+            "passed",    "error_message", "time_us",      "flops",   "bandwidth_gb_s", "cycles_per_run", "instret_per_run", "ipc", "memory_kb", "n_runs",
             "device_description", "backend_reg_name"
         };
         return fields;
@@ -594,10 +750,10 @@ struct test_result {
         if (field == "supported" || field == "passed") {
             return BOOL;
         }
-        if (field == "memory_kb" || field == "n_runs") {
+        if (field == "memory_kb" || field == "n_runs" || field == "cycles_per_run" || field == "instret_per_run") {
             return INT;
         }
-        if (field == "time_us" || field == "flops" || field == "bandwidth_gb_s") {
+        if (field == "time_us" || field == "flops" || field == "bandwidth_gb_s" || field == "ipc") {
             return FLOAT;
         }
         return STRING;
@@ -616,6 +772,9 @@ struct test_result {
                  std::to_string(time_us),
                  std::to_string(flops),
                  std::to_string(bandwidth_gb_s),
+                 std::to_string(cycles_per_run),
+                 std::to_string(instret_per_run),
+                 std::to_string(ipc),
                  std::to_string(memory_kb),
                  std::to_string(n_runs),
                  device_description,
@@ -965,7 +1124,17 @@ struct console_printer : public printer {
         }
         printf("%*s", last - len, "");
 
-        printf("    %8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
+        printf("    %8d runs - ", result.n_runs);
+
+        if (result.cycles_per_run > 0) {
+            printf("%10llu cyc/run - %8.2f us@%.1fGHz/run - IPC %5.3f - ",
+                   (unsigned long long) result.cycles_per_run,
+                   result.time_us,
+                   XSAI_CPU_FREQ_GHZ,
+                   result.ipc);
+        } else {
+            printf("%8.2f us/run - ", result.time_us);
+        }
 
         if (result.flops > 0) {
             auto format_flops = [](double flops) -> std::string {
@@ -981,7 +1150,12 @@ struct console_printer : public printer {
                 }
                 return buf;
             };
-            uint64_t op_flops_per_run = result.flops * result.time_us / 1e6;
+            uint64_t op_flops_per_run = 0;
+            if (result.cycles_per_run > 0) {
+                op_flops_per_run = (uint64_t) (result.flops * ((double) result.cycles_per_run / (XSAI_CPU_FREQ_GHZ * 1e3)));
+            } else {
+                op_flops_per_run = (uint64_t) (result.flops * result.time_us / 1e6);
+            }
             printf("%s/run - \033[1;34m%sS\033[0m", format_flops(op_flops_per_run).c_str(),
                    format_flops(result.flops).c_str());
         } else {
@@ -1190,6 +1364,11 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual ggml_tensor * tensor_to_preallocate(ggml_tensor * out, ggml_backend_buffer_type_t buft) {
+        GGML_UNUSED(out);
+        GGML_UNUSED(buft);
+        return nullptr;
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1273,6 +1452,52 @@ struct test_case {
         }
     }
 
+    bool preallocate_selected_tensor(ggml_tensor * out, ggml_backend_buffer_type_t buft,
+            std::vector<ggml_backend_buffer_t> & extra_buffers, std::string & error_message) {
+        if (buft == nullptr) {
+            return true;
+        }
+
+        ggml_tensor * selected = tensor_to_preallocate(out, buft);
+        if (selected == nullptr) {
+            return true;
+        }
+
+        ggml_tensor * base = root_view_tensor(selected);
+        if (base == nullptr || base->buffer != nullptr) {
+            return true;
+        }
+
+        size_t alignment = ggml_backend_buft_get_alignment(buft);
+        size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, base);
+        size_t buffer_size = GGML_PAD(alloc_size, alignment) + alignment;
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, buffer_size);
+        if (buffer == nullptr) {
+            error_message = std::string("failed to allocate buffer type ") + ggml_backend_buft_name(buft);
+            return false;
+        }
+
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_tallocr tallocr = ggml_tallocr_new(buffer);
+        enum ggml_status status = ggml_tallocr_alloc(&tallocr, base);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            error_message = std::string("failed to place tensor in buffer type ") + ggml_backend_buft_name(buft);
+            return false;
+        }
+
+        status = init_view_chain(selected);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            error_message = std::string("failed to initialize view chain for buffer type ") + ggml_backend_buft_name(buft);
+            return false;
+        }
+
+        extra_buffers.push_back(buffer);
+        return true;
+    }
+
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
@@ -1295,17 +1520,32 @@ struct test_case {
         ggml_tensor * out = build_graph(ctx);
         current_op_name   = op_desc(out);
 
+        std::vector<ggml_backend_buffer_t> extra_buffers;
+        auto free_extra_buffers = [&]() {
+            for (auto * buffer : extra_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            extra_buffers.clear();
+        };
+
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             ggml_free(ctx);
             return test_status_t::SKIPPED;
         }
 
+        std::string prealloc_error;
+        if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
+            ggml_free(ctx);
+            return test_status_t::FAIL;
+        }
+
         // check if the backends support the ops
         bool supported = true;
         for (ggml_backend_t backend : {backend1, backend2}) {
+            const ggml_backend_buffer_type_t forced_buft = backend == backend1 ? g_forced_buft : nullptr;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-                if (!ggml_backend_supports_op(backend, t)) {
+                if (!supports_selected_buft_op(backend, t, forced_buft)) {
                     supported = false;
                     break;
                 }
@@ -1314,13 +1554,14 @@ struct test_case {
 
         if (!supported) {
             // Create test result for unsupported operation
-            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+            test_result result(backend_display_name(backend1), current_op_name, vars(), "test",
                              false, false, "not supported");
 
             if (output_printer) {
                 output_printer->print_test_result(result);
             }
 
+            free_extra_buffers();
             ggml_free(ctx);
             return test_status_t::NOT_SUPPORTED;
         }
@@ -1332,7 +1573,7 @@ struct test_case {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend1);
 
         if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+            printf("failed to allocate tensors [%s] ", backend_display_name(backend1).c_str());
             ggml_free(ctx);
             return test_status_t::FAIL;
         }
@@ -1365,8 +1606,10 @@ struct test_case {
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
             callback_userdata * ud = (callback_userdata *) user_data;
-            const char * bn1 = ggml_backend_name(ud->backend1);
-            const char * bn2 = ggml_backend_name(ud->backend2);
+            const std::string bn1s = backend_display_name(ud->backend1);
+            const std::string bn2s = backend_display_name(ud->backend2);
+            const char * bn1 = bn1s.c_str();
+            const char * bn2 = bn2s.c_str();
 
             if (t1->op == GGML_OP_NONE) {
                 // sentinels must be unchanged
@@ -1432,13 +1675,14 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         ggml_backend_buffer_free(buf);
+        free_extra_buffers();
 
         ggml_free(ctx);
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
-        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
+        test_result result(backend_display_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
         if (output_printer) {
@@ -1463,17 +1707,35 @@ struct test_case {
 
         ggml_tensor * out             = build_graph(ctx.get());
         current_op_name               = op_desc(out);
+
+        std::vector<ggml_backend_buffer_t> extra_buffers;
+        auto free_extra_buffers = [&]() {
+            for (auto * buffer : extra_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            extra_buffers.clear();
+        };
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return true;
         }
 
-        if (!ggml_backend_supports_op(backend, out)) {
+        std::string prealloc_error;
+        if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
+            test_result result(backend_display_name(backend), current_op_name, vars(), "perf", false, false,
+                               prealloc_error);
+            output_printer->print_test_result(result);
+            return true;
+        }
+
+        if (!supports_selected_buft_op(backend, out, g_forced_buft)) {
             // Create test result for unsupported performance test
-            test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", false, false,
+            test_result result(backend_display_name(backend), current_op_name, vars(), "perf", false, false,
                                "not supported");
 
             output_printer->print_test_result(result);
+
+            free_extra_buffers();
 
             return true;
         }
@@ -1492,6 +1754,8 @@ struct test_case {
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+        nemu_signal(DISABLE_TIME_INTR);
+        nemu_signal(NOTIFY_PROFILER);
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -1506,7 +1770,7 @@ struct test_case {
         if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
-            const uint64_t target_flops_cpu =   8ULL * GFLOP;
+            const uint64_t target_flops_cpu = effective_perf_target_flops_cpu();
             const uint64_t target_flops_gpu = 100ULL * GFLOP;
             uint64_t target_flops = is_cpu ? target_flops_cpu : target_flops_gpu;
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_flops / op_flops(out)) + 1;
@@ -1547,33 +1811,64 @@ struct test_case {
         int64_t total_time_us = 0;
         int64_t total_mem = 0;
         int total_runs = 0;
+        uint64_t total_cycles = 0;
+        uint64_t total_instret = 0;
+
+        const int outer_runs = forced_buft_is_ame() ? 1 : -1;
+        int outer_iter = 0;
         do {
             int64_t start_time = ggml_time_us();
+            uint64_t start_cycle = read_cycle();
+            uint64_t start_instret = read_instret();
             ggml_status status = ggml_backend_graph_compute(backend, gf);
             if (status != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
                 return false;
             }
             int64_t end_time = ggml_time_us();
+            uint64_t end_cycle = read_cycle();
+            uint64_t end_instret = read_instret();
 
             total_time_us += end_time - start_time;
             total_mem += mem;
             total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+            if (end_cycle >= start_cycle) {
+                total_cycles += end_cycle - start_cycle;
+            }
+            if (end_instret >= start_instret) {
+                total_instret += end_instret - start_instret;
+            }
+            outer_iter++;
+        } while (forced_buft_is_ame() ? (outer_iter < outer_runs) : (total_time_us < 1000*1000)); // run for at least 1 second on host, exactly once for XSAI target perf
 
         // Create test result
-        double avg_time_us      = (double) total_time_us / total_runs;
-        double calculated_flops = (op_flops(out) > 0) ? (op_flops(out) * total_runs) / (total_time_us / 1e6) : 0.0;
+        const uint64_t cycles_per_run = total_runs > 0 ? total_cycles / total_runs : 0;
+        const uint64_t instret_per_run = total_runs > 0 ? total_instret / total_runs : 0;
+        const double ipc = cycles_per_run > 0 ? (double) instret_per_run / (double) cycles_per_run : 0.0;
+        const bool use_cycle_metrics = cycles_per_run > 0;
+
+        double avg_time_us      = use_cycle_metrics ? ((double) cycles_per_run / XSAI_CYCLES_PER_US)
+                                                    : ((double) total_time_us / total_runs);
+        double calculated_flops = 0.0;
+        if (op_flops(out) > 0) {
+            if (use_cycle_metrics) {
+                calculated_flops = (double) op_flops(out) * XSAI_CPU_FREQ_GHZ * 1e9 / (double) cycles_per_run;
+            } else {
+                calculated_flops = (op_flops(out) * total_runs) / (total_time_us / 1e6);
+            }
+        }
         double calculated_bandwidth =
-            (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
+            (op_flops(out) == 0) ? total_mem / ((use_cycle_metrics ? (double) total_cycles / (XSAI_CPU_FREQ_GHZ * 1e9) : total_time_us / 1e6)) / 1024.0 / 1024.0 / 1024.0 : 0.0;
         size_t calculated_memory_kb = op_size(out) / 1024;
 
-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
-                           calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+        test_result result(backend_display_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
+                           calculated_flops, calculated_bandwidth, cycles_per_run, instret_per_run, ipc, calculated_memory_kb, total_runs);
 
         if (output_printer) {
             output_printer->print_test_result(result);
         }
+
+        free_extra_buffers();
 
         return true;
     }
@@ -1596,19 +1891,39 @@ struct test_case {
         ggml_tensor * out = build_graph(ctx.get());
         current_op_name   = op_desc(out);
 
+        std::vector<ggml_backend_buffer_t> extra_buffers;
+        auto free_extra_buffers = [&]() {
+            for (auto * buffer : extra_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            extra_buffers.clear();
+        };
+
         if (!matches_filter(out, op_names_filter)) {
             return true;
         }
 
-        bool supported = ggml_backend_supports_op(backend, out);
+        std::string prealloc_error;
+        if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
+            test_result result(backend_display_name(backend), current_op_name, vars(), "support", false, false,
+                               prealloc_error, 0.0, 0.0, 0.0, 0, 0, 0.0, 0, 0,
+                               ggml_backend_dev_description(ggml_backend_get_device(backend)),
+                               ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend))));
+            output_printer->print_test_result(result);
+            return true;
+        }
+
+        bool supported = supports_selected_buft_op(backend, out, g_forced_buft);
 
         std::string device_desc = ggml_backend_dev_description(ggml_backend_get_device(backend));
         std::string backend_reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
 
-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "support", supported, supported,
-                           supported ? "yes" : "no", 0.0, 0.0, 0.0, 0, 0, device_desc, backend_reg_name);
+        test_result result(backend_display_name(backend), current_op_name, vars(), "support", supported, supported,
+                           supported ? "yes" : "no", 0.0, 0.0, 0.0, 0, 0, 0.0, 0, 0, device_desc, backend_reg_name);
 
         output_printer->print_test_result(result);
+
+        free_extra_buffers();
 
         return true;
     }
@@ -1630,19 +1945,37 @@ struct test_case {
 
         ggml_tensor * out = build_graph(ctx.get());
 
+        std::vector<ggml_backend_buffer_t> extra_buffers;
+        auto free_extra_buffers = [&]() {
+            for (auto * buffer : extra_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            extra_buffers.clear();
+        };
+
+        std::string prealloc_error;
+        if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
+            output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend),
+                                                                test_status_t::FAIL, prealloc_error));
+            free_extra_buffers();
+            return true;
+        }
+
         if (!matches_filter(out, op_names_filter) || out->op == GGML_OP_OPT_STEP_ADAMW) {
+            free_extra_buffers();
             return true;
         }
 
         if (out->type != GGML_TYPE_F32) {
-            output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+            output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend),
                                                                 test_status_t::NOT_SUPPORTED,
                                                                 out->name + std::string("->type != FP32")));
+            free_extra_buffers();
             return true;
         }
 
         // Print operation info first
-        output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend)));
+        output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend)));
 
         // check if the backend supports the ops
         bool        supported  = true;
@@ -1650,9 +1983,9 @@ struct test_case {
         std::string failure_reason;
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!ggml_backend_supports_op(backend, t)) {
+            if (!supports_selected_buft_op(backend, t, g_forced_buft)) {
                 supported      = false;
-                failure_reason = ggml_backend_name(backend);
+                failure_reason = backend_display_name(backend);
                 break;
             }
             if ((t->flags & GGML_TENSOR_FLAG_PARAM)) {
@@ -1670,8 +2003,9 @@ struct test_case {
         }
 
         if (!supported) {
-            output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+            output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend),
                                                                 test_status_t::NOT_SUPPORTED, failure_reason));
+            free_extra_buffers();
             return true;
         }
 
@@ -1682,9 +2016,10 @@ struct test_case {
             }
         }
         if (ngrads > grad_nmax()) {
-            test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+            test_operation_info info(op_desc(out), vars(), backend_display_name(backend));
             info.set_large_tensor_skip();
             output_printer->print_operation(info);
+            free_extra_buffers();
             return true;
         }
 
@@ -1707,14 +2042,14 @@ struct test_case {
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
             if (!ggml_backend_supports_op(backend, t)) {
-                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend),
                                                                     test_status_t::NOT_SUPPORTED,
-                                                                    ggml_backend_name(backend)));
+                                                                    backend_display_name(backend)));
                 supported = false;
                 break;
             }
             if ((t->flags & GGML_TENSOR_FLAG_PARAM) && t->type != GGML_TYPE_F32) {
-                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                output_printer->print_operation(test_operation_info(op_desc(out), vars(), backend_display_name(backend),
                                                                     test_status_t::NOT_SUPPORTED,
                                                                     std::string(t->name) + "->type != FP32"));
                 supported = false;
@@ -1722,15 +2057,17 @@ struct test_case {
             }
         }
         if (!supported) {
+            free_extra_buffers();
             return true;
         }
 
         // allocate
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
         if (buf == NULL) {
-            test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+            test_operation_info info(op_desc(out), vars(), backend_display_name(backend));
             info.set_error("allocation", "");
             output_printer->print_operation(info);
+            free_extra_buffers();
             return false;
         }
 
@@ -1740,11 +2077,13 @@ struct test_case {
         ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+            free_extra_buffers();
             return false;
         }
         status = ggml_backend_graph_compute(backend, gb);
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+            free_extra_buffers();
             return false;
         }
 
@@ -1754,7 +2093,8 @@ struct test_case {
                 continue;
             }
 
-            const char * bn = ggml_backend_name(backend);
+            const std::string bns = backend_display_name(backend);
+            const char * bn = bns.c_str();
             const int64_t ne = ggml_nelements(t);
 
             std::vector<float> ga;
@@ -1768,7 +2108,7 @@ struct test_case {
             for (int64_t i = 0; i < ne; ++i) { // gradient algebraic
                 // check for nans
                 if (!std::isfinite(ga[i])) {
-                    test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+                    test_operation_info info(op_desc(out), vars(), backend_display_name(backend));
                     info.set_gradient_info(i, bn, ga[i]);
                     output_printer->print_operation(info);
                     ok = false;
@@ -1799,6 +2139,7 @@ struct test_case {
                 status = ggml_backend_graph_compute(backend, gf);
                 if (status != GGML_STATUS_SUCCESS) {
                     fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                    free_extra_buffers();
                     return false;
                 }
                 ggml_backend_tensor_get(out, &fu, 0, ggml_nbytes(out));
@@ -1807,6 +2148,7 @@ struct test_case {
                 status = ggml_backend_graph_compute(backend, gf);
                 if (status != GGML_STATUS_SUCCESS) {
                     fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                    free_extra_buffers();
                     return false;
                 }
                 ggml_backend_tensor_get(out, &fd, 0, ggml_nbytes(out));
@@ -1816,6 +2158,7 @@ struct test_case {
                     status = ggml_backend_graph_compute(backend, gf);
                     if (status != GGML_STATUS_SUCCESS) {
                         fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                        free_extra_buffers();
                         return false;
                     }
                     ggml_backend_tensor_get(out, &fuh, 0, ggml_nbytes(out));
@@ -1824,6 +2167,7 @@ struct test_case {
                     status = ggml_backend_graph_compute(backend, gf);
                     if (status != GGML_STATUS_SUCCESS) {
                         fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                        free_extra_buffers();
                         return false;
                     }
                     ggml_backend_tensor_get(out, &fdh, 0, ggml_nbytes(out));
@@ -1838,7 +2182,7 @@ struct test_case {
 
             const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect);
             if (err > max_maa_err()) {
-                test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+                test_operation_info info(op_desc(out), vars(), backend_display_name(backend));
                 info.set_maa_error(err, max_maa_err());
                 output_printer->print_operation(info);
                 ok = false;
@@ -1850,12 +2194,14 @@ struct test_case {
         }
 
         // Create final test result
-        test_operation_info final_info(op_desc(out), vars(), ggml_backend_name(backend));
+        test_operation_info final_info(op_desc(out), vars(), backend_display_name(backend));
         if (!ok) {
             final_info.set_compare_failure();
         }
         final_info.status = ok ? test_status_t::OK : test_status_t::FAIL;
         output_printer->print_operation(final_info);
+
+        free_extra_buffers();
 
         if (ok) {
             return true;
@@ -3806,6 +4152,14 @@ struct test_mul_mat : public test_case {
     }
 
     bool run_whole_graph() override { return o > 1; }
+
+    ggml_tensor * tensor_to_preallocate(ggml_tensor * out, ggml_backend_buffer_type_t buft) override {
+        GGML_UNUSED(buft);
+        if (out->op != GGML_OP_MUL_MAT || out->src[0] == nullptr) {
+            return nullptr;
+        }
+        return out->src[0];
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7612,6 +7966,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768,   1, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 768, {1, 1}, {1, 1}));
+
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -8319,6 +8680,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;
@@ -8590,6 +8955,14 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             return false;
         }
 
+        if (forced_buft_is_ame()) {
+            ggml_backend_reg_t reg_cpu = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto ggml_backend_set_n_threads_fn_cpu = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg_cpu, "ggml_backend_set_n_threads");
+            if (ggml_backend_set_n_threads_fn_cpu) {
+                ggml_backend_set_n_threads_fn_cpu(backend_cpu, 1);
+            }
+        }
+
         size_t n_ok = 0;
         size_t                   tests_run = 0;
         std::vector<std::string> failed_tests;
@@ -8758,7 +9131,7 @@ static void show_test_coverage() {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops] [--show-coverage]\n", argv[0]);
+    printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [--buft <buffer type>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops] [--show-coverage]\n", argv[0]);
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -8776,6 +9149,7 @@ int main(int argc, char ** argv) {
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
     const char * backend_filter = nullptr;
+    const char * buft_filter = nullptr;
     const char * params_filter = nullptr;
 
     for (int i = 1; i < argc; i++) {
@@ -8797,6 +9171,13 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "-b") == 0) {
             if (i + 1 < argc) {
                 backend_filter = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--buft") == 0) {
+            if (i + 1 < argc) {
+                buft_filter = argv[++i];
             } else {
                 usage(argv);
                 return 1;
@@ -8833,6 +9214,14 @@ int main(int argc, char ** argv) {
     // load and enumerate backends
     ggml_backend_load_all();
 
+    g_forced_buft = test_buft_from_name(buft_filter);
+    g_forced_buft_name = buft_filter;
+    if (buft_filter != nullptr && g_forced_buft == nullptr) {
+        fprintf(stderr, "Unknown buffer type: %s\n", buft_filter);
+        print_available_bufts();
+        return 1;
+    }
+
     // Create printer for output format
     std::unique_ptr<printer> output_printer = create_printer(output_format);
     if (output_printer) {
@@ -8848,14 +9237,14 @@ int main(int argc, char ** argv) {
 
         if (backend_filter != NULL && strcmp(backend_filter, ggml_backend_dev_name(dev)) != 0) {
             output_printer->print_backend_init(
-                backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true, "Skipping"));
+                backend_init_info(i, ggml_backend_dev_count(), backend_display_name(dev), true, "Skipping"));
             n_ok++;
             continue;
         }
 
-        if (backend_filter == NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && mode != MODE_GRAD) {
+        if (backend_filter == NULL && buft_filter == NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && mode != MODE_GRAD) {
             output_printer->print_backend_init(backend_init_info(
-                i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true, "Skipping CPU backend"));
+                i, ggml_backend_dev_count(), backend_display_name(dev), true, "Skipping CPU backend"));
             n_ok++;
             continue;
         }
@@ -8865,16 +9254,19 @@ int main(int argc, char ** argv) {
 
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        const int n_threads = effective_test_threads();
         if (ggml_backend_set_n_threads_fn) {
-            // TODO: better value for n_threads
-            ggml_backend_set_n_threads_fn(backend, N_THREADS);
+            // AME path is currently validated/perf-tested as single-threaded.
+            ggml_backend_set_n_threads_fn(backend, n_threads);
         }
 
         size_t free, total;  // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
-        output_printer->print_backend_init(backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev),
+        output_printer->print_backend_init(backend_init_info(i, ggml_backend_dev_count(), backend_display_name(dev),
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
+        printf("  Requested backend threads: %d%s\n\n", n_threads,
+               forced_buft_is_ame() ? " (forced for RISCV_AME)" : "");
 
         bool ok = test_backend(backend, mode, op_names_filter, params_filter, output_printer.get());
 
@@ -8882,7 +9274,7 @@ int main(int argc, char ** argv) {
             n_ok++;
         }
         output_printer->print_backend_status(
-            backend_status_info(ggml_backend_name(backend), ok ? test_status_t::OK : test_status_t::FAIL));
+            backend_status_info(backend_display_name(backend), ok ? test_status_t::OK : test_status_t::FAIL));
 
         ggml_backend_free(backend);
     }
