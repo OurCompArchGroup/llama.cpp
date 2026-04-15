@@ -44,6 +44,8 @@ static inline void ame_log_init(void) {
 #define AME_TILE_K 64
 #define AME_TILE_N 128
 
+#define AME_Q8_PACK_K 64
+
 // Helper function to check if AME can be used for given dimensions.
 //
 // The current AME backend only accelerates Q8_0 GEMM. It only reaches the
@@ -64,6 +66,11 @@ typedef struct {
     uint16_t d;         // scale factor FP16 (same format as block_q4_0)
     int8_t qs[32];      // pre-unpacked 4-bit values to int8 [-8, 7]
 } block_q4_0_ame;
+
+typedef struct {
+    uint16_t d;
+    int8_t qs[AME_Q8_PACK_K];
+} block_q8_ame64;
 
 // Matrix configuration instructions
 #ifdef STC
@@ -288,6 +295,14 @@ void ggml_ame_repack_q4_0(
     int64_t nblocks          // Number of Q4_0 blocks
 );
 
+// Experimental Q8_0 -> AME-native packed K64 repack.
+void ggml_ame_repack_q8_0_to_ame64(
+    void * dst,
+    const void * src,
+    int64_t nrows,
+    int64_t k
+);
+
 // GGML integration wrapper for Q8_0 quantized matrix multiplication
 void ggml_ame_mul_mat_q8_0(
     const void * src0,
@@ -298,6 +313,21 @@ void ggml_ame_mul_mat_q8_0(
     int64_t ne10,
     int64_t ne11,
     size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
+    void * work_data,
+    size_t work_size
+);
+
+void ggml_ame_mul_mat_q8_0_ame64(
+    const void * src0,
+    const void * src1_key,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride,
+    int graph_id,
     void * work_data,
     size_t work_size
 );

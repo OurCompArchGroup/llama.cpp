@@ -520,6 +520,7 @@ void ggml_barrier(struct ggml_threadpool * tp);
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+int  ggml_threadpool_graph_id(struct ggml_threadpool * tp);
 
 #ifdef __cplusplus
 }

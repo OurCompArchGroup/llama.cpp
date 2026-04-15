@@ -1150,12 +1150,7 @@ struct console_printer : public printer {
                 }
                 return buf;
             };
-            uint64_t op_flops_per_run = 0;
-            if (result.cycles_per_run > 0) {
-                op_flops_per_run = (uint64_t) (result.flops * ((double) result.cycles_per_run / (XSAI_CPU_FREQ_GHZ * 1e3)));
-            } else {
-                op_flops_per_run = (uint64_t) (result.flops * result.time_us / 1e6);
-            }
+            uint64_t op_flops_per_run = (uint64_t) (result.flops * result.time_us / 1e6);
             printf("%s/run - \033[1;34m%sS\033[0m", format_flops(op_flops_per_run).c_str(),
                    format_flops(result.flops).c_str());
         } else {
