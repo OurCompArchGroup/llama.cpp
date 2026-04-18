@@ -4,41 +4,39 @@
 #include <stdint.h>
 #include <stddef.h>  // for size_t
 
-// AME debug logging (default on for development)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// AME debug logging can be forced at build time with AME_DEBUG=1 or enabled at
+// runtime with GGML_AME_LOG=1 so logs are visible in QEMU serial output.
 #ifndef AME_DEBUG
 #define AME_DEBUG 0
 #endif
 
+static inline int ame_log_enabled(void) {
 #if AME_DEBUG
-#include <stdio.h>
-#include <time.h>
-
-static FILE* ame_log_file = NULL;
-
-static inline void ame_log_init(void) {
-    if (ame_log_file == NULL) {
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        char filename[256];
-        snprintf(filename, sizeof(filename), "rv-ame-%04d%02d%02d-%02d%02d%02d.log",
-                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                 t->tm_hour, t->tm_min, t->tm_sec);
-        ame_log_file = fopen(filename, "a");
-        if (ame_log_file == NULL) {
-            ame_log_file = stderr; // fallback to stderr if file can't be opened
+    return 1;
+#else
+    static int cached = -1;
+    if (cached == -1) {
+        const char * value = getenv("GGML_AME_LOG");
+        cached = 0;
+        if (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "off") != 0 && strcmp(value, "no") != 0) {
+            cached = 1;
         }
     }
+    return cached;
+#endif
 }
 
 #define AME_LOG(fmt, ...)                             \
     do {                                              \
-        ame_log_init();                              \
-        fprintf(ame_log_file, "[AME] " fmt "\n", ##__VA_ARGS__);   \
-        /*fflush(ame_log_file);*/                        \
+        if (ame_log_enabled()) {                      \
+            fprintf(stderr, "[AME] " fmt "\n", ##__VA_ARGS__); \
+            fflush(stderr);                           \
+        }                                             \
     } while (0)
-#else
-#define AME_LOG(fmt, ...) do { (void)sizeof(fmt); } while (0)
-#endif
 
 #define AME_TILE_M 128
 #define AME_TILE_K 64

@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 // AME_DEBUG/AME_LOG now defined in ame.h
 // Simple scalar reference implementation for Q8_0 x F32 matmul
@@ -150,6 +151,7 @@ struct ame_buffer_context {
     void * base = nullptr;
     size_t base_size = 0;
     std::unordered_map<const ggml_tensor *, ame_packed_q8_info> packed_q8;
+    std::vector<ggml_tensor *> tensors;
 };
 
 static inline ame_buffer_context * ame_buffer_ctx(ggml_backend_buffer_t buffer) {
@@ -197,6 +199,29 @@ static void ame_store_packed_q8_weight(
     if (entry.data != nullptr) {
         ggml_ame_repack_q8_0_to_ame64(entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
     }
+}
+
+static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
+    if (!ame_use_packed_q8()) {
+        return 0;
+    }
+
+    ame_buffer_context * ctx = ame_buffer_ctx(buffer);
+    size_t repacked = 0;
+
+    for (ggml_tensor * tensor : ctx->tensors) {
+        if (tensor == nullptr || tensor->data == nullptr) {
+            continue;
+        }
+        if (tensor->type != GGML_TYPE_Q8_0) {
+            continue;
+        }
+
+        ame_store_packed_q8_weight(buffer, tensor, tensor->data);
+        ++repacked;
+    }
+
+    return repacked;
 }
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
@@ -361,6 +386,7 @@ static enum ggml_status ggml_backend_ame_buffer_init_tensor(
     ggml_backend_buffer_t buffer,
     struct ggml_tensor * tensor
 ) {
+    ame_buffer_ctx(buffer)->tensors.push_back(tensor);
     tensor->extra = (void *)ggml::cpu::riscv_ame::get_tensor_traits(buffer, tensor);
     return GGML_STATUS_SUCCESS;
 }
@@ -403,6 +429,13 @@ static void ggml_backend_ame_buffer_get_tensor(
 static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
     memset(ctx->base, value, buffer->size);
+
+    if (value == 0) {
+        const size_t repacked = ame_refresh_packed_q8_weights(buffer);
+        if (repacked > 0) {
+            AME_LOG("buffer_clear: synthesized %zu packed Q8_64 tensors after zero-fill", repacked);
+        }
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_ame_buffer_interface = {
