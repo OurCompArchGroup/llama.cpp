@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
@@ -18,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_set>
+#include <mutex>
 
 #include "common.h"
 #include "ggml.h"
@@ -31,10 +33,336 @@
 #    include <windows.h>
 #endif
 
+#define DISABLE_TIME_INTR 0x100
+#define NOTIFY_PROFILER 0x101
+#define NOTIFY_PROFILE_EXIT 0x102
+#define GOOD_TRAP 0x0
+
+#ifndef PROFILER_LAYER_START
+#define PROFILER_LAYER_START 0
+#endif
+
+#define PROFILER_LAYER_STOP (PROFILER_LAYER_START + 1)
+
+// TODO(xsai): Do not hard-code the benchmark clock rate here. The current
+// 2 GHz assumption makes avg_ns/tokens-per-second numerically wrong on RISC-V
+// targets whose actual CPU frequency differs from this value.
+static constexpr uint64_t LLAMA_BENCH_ASSUMED_CPU_FREQ_HZ = 2000000000ull;
+
+static void nemu_signal(int a) {
+#ifdef __riscv
+    asm volatile ("mv a0, %0\n\t"
+                  ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
+                  :
+                  : "r"(a)
+                  : "a0");
+#else
+    (void) a;
+#endif
+}
+
 // utils
+static uint64_t read_cycle() {
+#if defined(__riscv)
+    uint64_t c;
+    asm volatile ("rdcycle %0" : "=r"(c));
+    return c;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t read_instret() {
+#if defined(__riscv)
+    uint64_t c;
+    asm volatile ("rdinstret %0" : "=r"(c));
+    return c;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t cycles_to_ns(uint64_t cycles) {
+    return (uint64_t) llround((long double) cycles * 1000000000.0L / (long double) LLAMA_BENCH_ASSUMED_CPU_FREQ_HZ);
+}
+
 static uint64_t get_time_ns() {
+#if defined(__riscv)
+    return cycles_to_ns(read_cycle());
+#else
     using clock = std::chrono::high_resolution_clock;
     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+#endif
+}
+
+struct layer_debug_data {
+    std::unordered_set<std::string> printed;
+    std::mutex                      lock;
+    bool                            print_layer01_debug = false;
+    bool                            profiler_started = false;
+    bool                            profiler_good_trap_sent = false;
+    int                             model_n_layer = 0;
+    int                             estimate_layer_start = PROFILER_LAYER_START;
+    int                             estimate_layer_stop = PROFILER_LAYER_STOP;
+    std::atomic<bool>               estimate_active = false;
+    std::atomic<bool>               abort_requested = false;
+    bool                            estimate_started = false;
+    bool                            estimate_valid = false;
+    uint64_t                        estimate_start_ns = 0;
+    uint64_t                        estimate_start_cycle = 0;
+    uint64_t                        estimate_start_instret = 0;
+    uint64_t                        estimate_window_ns = 0;
+    uint64_t                        estimate_window_cycles = 0;
+    uint64_t                        estimate_window_instret = 0;
+    uint64_t                        estimate_total_ns = 0;
+    uint64_t                        estimate_total_cycles = 0;
+    uint64_t                        estimate_total_instret = 0;
+};
+
+static bool layer_estimation_is_configured(const layer_debug_data * data) {
+    return data != nullptr &&
+           data->estimate_layer_stop > data->estimate_layer_start &&
+           data->model_n_layer > data->estimate_layer_stop;
+}
+
+static void layer_debug_prepare_estimate(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    data->estimate_started = false;
+    data->estimate_valid = false;
+    data->estimate_start_ns = 0;
+    data->estimate_start_cycle = 0;
+    data->estimate_start_instret = 0;
+    data->estimate_window_ns = 0;
+    data->estimate_window_cycles = 0;
+    data->estimate_window_instret = 0;
+    data->estimate_total_ns = 0;
+    data->estimate_total_cycles = 0;
+    data->estimate_total_instret = 0;
+    data->abort_requested.store(false, std::memory_order_relaxed);
+    data->estimate_active.store(true, std::memory_order_relaxed);
+}
+
+static void layer_debug_finish_estimate(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    data->estimate_active.store(false, std::memory_order_relaxed);
+    data->abort_requested.store(false, std::memory_order_relaxed);
+}
+
+static bool layer_debug_get_estimate(layer_debug_data * data, uint64_t * estimated_ns, uint64_t * estimated_cycles, uint64_t * estimated_instret) {
+    if (data == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    if (!data->estimate_valid) {
+        return false;
+    }
+
+    if (estimated_ns != nullptr) {
+        *estimated_ns = data->estimate_total_ns;
+    }
+    if (estimated_cycles != nullptr) {
+        *estimated_cycles = data->estimate_total_cycles;
+    }
+    if (estimated_instret != nullptr) {
+        *estimated_instret = data->estimate_total_instret;
+    }
+
+    return true;
+}
+
+static int parse_layer_id(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+
+    int layer = -1;
+    if (sscanf(name, "blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    if (sscanf(name, "dec.blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    if (sscanf(name, "enc.blk.%d.", &layer) == 1) {
+        return layer;
+    }
+
+    const char * dash = strrchr(name, '-');
+    if (dash != nullptr && dash[1] != '\0') {
+        char * end = nullptr;
+        long parsed = strtol(dash + 1, &end, 10);
+        if (end != dash + 1 && end != nullptr && *end == '\0' && parsed >= 0) {
+            return static_cast<int>(parsed);
+        }
+    }
+
+    return -1;
+}
+
+static int parse_l_out_layer_id(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+
+    int layer = -1;
+    if (sscanf(name, "l_out-%d", &layer) == 1) {
+        return layer;
+    }
+
+    return -1;
+}
+
+static bool llama_bench_abort_cb(void * user_data) {
+    auto * data = static_cast<layer_debug_data *>(user_data);
+    return data != nullptr && data->abort_requested.load(std::memory_order_relaxed);
+}
+
+static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    const char * name = ggml_get_name(t);
+    const int layer = parse_layer_id(name);
+    const int l_out_layer = parse_l_out_layer_id(name);
+    auto * data = static_cast<layer_debug_data *>(user_data);
+    const bool estimate_active = data != nullptr &&
+                                 data->estimate_active.load(std::memory_order_relaxed) &&
+                                 layer_estimation_is_configured(data);
+
+    if (ask) {
+        if (estimate_active && (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
+            return true;
+        }
+        if (layer == PROFILER_LAYER_START || layer == PROFILER_LAYER_STOP) {
+            return true;
+        }
+        return data != nullptr && data->print_layer01_debug && (layer == 0 || layer == 1);
+    }
+
+    bool handled_profiler_start = false;
+    if (layer == PROFILER_LAYER_START) {
+        bool should_start = false;
+        if (data != nullptr) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (!data->profiler_started) {
+                data->profiler_started = true;
+                should_start = true;
+            }
+        } else {
+            should_start = true;
+        }
+
+        if (should_start) {
+            nemu_signal(DISABLE_TIME_INTR);
+            nemu_signal(NOTIFY_PROFILER);
+        }
+
+        handled_profiler_start = true;
+    }
+
+    bool should_abort_estimate = false;
+    if (estimate_active) {
+        if (l_out_layer == data->estimate_layer_start) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (!data->estimate_started) {
+                data->estimate_started = true;
+                data->estimate_start_ns = get_time_ns();
+                data->estimate_start_cycle = read_cycle();
+                data->estimate_start_instret = read_instret();
+            }
+        } else if (l_out_layer == data->estimate_layer_stop) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (data->estimate_started && !data->estimate_valid) {
+                const int measured_layers = data->estimate_layer_stop - data->estimate_layer_start;
+                const uint64_t end_ns = get_time_ns();
+                const uint64_t end_cycle = read_cycle();
+                const uint64_t end_instret = read_instret();
+
+                data->estimate_window_ns = end_ns - data->estimate_start_ns;
+                data->estimate_window_cycles = end_cycle - data->estimate_start_cycle;
+                data->estimate_window_instret = end_instret - data->estimate_start_instret;
+                if (data->estimate_window_cycles > 0) {
+                    data->estimate_window_ns = cycles_to_ns(data->estimate_window_cycles);
+                }
+                data->estimate_total_cycles = (uint64_t) llround((double) data->estimate_window_cycles * data->model_n_layer / measured_layers);
+                data->estimate_total_instret = (uint64_t) llround((double) data->estimate_window_instret * data->model_n_layer / measured_layers);
+                data->estimate_total_ns = data->estimate_total_cycles > 0
+                    ? cycles_to_ns(data->estimate_total_cycles)
+                    : (uint64_t) llround((double) data->estimate_window_ns * data->model_n_layer / measured_layers);
+                data->estimate_valid = true;
+                data->abort_requested.store(true, std::memory_order_relaxed);
+                should_abort_estimate = true;
+            }
+        }
+    }
+
+    bool handled_profiler_stop = false;
+    if (layer == PROFILER_LAYER_STOP) {
+        bool should_stop = false;
+        if (!estimate_active) {
+            if (data != nullptr) {
+                std::lock_guard<std::mutex> guard(data->lock);
+                if (data->profiler_started && !data->profiler_good_trap_sent) {
+                    data->profiler_good_trap_sent = true;
+                    should_stop = true;
+                }
+            } else {
+                should_stop = true;
+            }
+        }
+
+        if (should_stop) {
+            nemu_signal(GOOD_TRAP);
+        }
+
+        handled_profiler_stop = true;
+    }
+
+    if (should_abort_estimate) {
+        return false;
+    }
+
+    if (handled_profiler_start || handled_profiler_stop) {
+        return true;
+    }
+
+    if (layer != 0 && layer != 1) {
+        return true;
+    }
+
+    if (data == nullptr || !data->print_layer01_debug) {
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(data->lock);
+        if (!data->printed.insert(name).second) {
+            return true;
+        }
+    }
+
+    fprintf(stderr,
+            "[LLAMA_LAYER_DEBUG] layer=%d name=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            layer,
+            name,
+            ggml_op_desc(t),
+            ggml_type_name(t->type),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+
+    return true;
+}
+
+static bool getenv_bool(const char * name) {
+    const char * v = getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+
+    return strcmp(v, "0") != 0;
 }
 
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
@@ -338,6 +666,8 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
+    std::vector<bool>                estimate_prompt;
+    bool                             use_synthetic_weights;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -377,6 +707,8 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
+    /* estimate_prompt      */ { false },
+    /* use_synthetic_weights*/ false,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -408,12 +740,17 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                             verbose output\n");
     printf("  --progress                                print test progress indicators\n");
     printf("  --no-warmup                               skip warmup runs before benchmarking\n");
+        printf("  --estimate-prompt <0|1>                   estimate prompt throughput from l_out layers [%d,%d)\n",
+            PROFILER_LAYER_START, PROFILER_LAYER_STOP);
+        printf("                                            only for prompt-only tests with n_prompt <= n_batch (default: %s)\n",
+            join(cmd_params_defaults.estimate_prompt, ",").c_str());
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)\n");
     }
     printf("\n");
     printf("test parameters:\n");
     printf("  -m, --model <filename>                    (default: %s)\n", join(cmd_params_defaults.model, ",").c_str());
+    printf("  --fake-like <filename>                    load GGUF metadata only and synthesize weights in memory\n");
     printf("  -p, --n-prompt <n>                        (default: %s)\n",
            join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                           (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
@@ -513,6 +850,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.use_synthetic_weights = cmd_params_defaults.use_synthetic_weights;
+
+    bool has_model_arg = false;
+    bool has_fake_like_arg = false;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -525,12 +866,30 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 print_usage(argc, argv);
                 exit(0);
             } else if (arg == "-m" || arg == "--model") {
+                if (has_fake_like_arg) {
+                    invalid_param = true;
+                    break;
+                }
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
                 params.model.insert(params.model.end(), p.begin(), p.end());
+                has_model_arg = true;
+            } else if (arg == "--fake-like") {
+                if (has_model_arg) {
+                    invalid_param = true;
+                    break;
+                }
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                params.model.insert(params.model.end(), p.begin(), p.end());
+                params.use_synthetic_weights = true;
+                has_fake_like_arg = true;
             } else if (arg == "-p" || arg == "--n-prompt") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -804,6 +1163,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--estimate-prompt") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.estimate_prompt.insert(params.estimate_prompt.end(), p.begin(), p.end());
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1031,6 +1397,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
+    if (params.estimate_prompt.empty()) {
+        params.estimate_prompt = cmd_params_defaults.estimate_prompt;
+    }
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
@@ -1071,9 +1440,11 @@ struct cmd_params_instance {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               use_mmap;
     bool               use_direct_io;
+    bool               use_synthetic_weights;
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    bool               estimate_prompt;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1087,6 +1458,7 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
+        mparams.use_synthetic_weights = use_synthetic_weights;
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1132,7 +1504,8 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
+             use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
+             use_synthetic_weights == other.use_synthetic_weights &&
                devices == other.devices &&
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
@@ -1184,6 +1557,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
+    for (const auto & estp : params.estimate_prompt)
     for (const auto & pl : params.poll) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
@@ -1213,9 +1587,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .use_synthetic_weights = */ params.use_synthetic_weights,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .estimate_prompt = */ estp,
             };
             instances.push_back(instance);
         }
@@ -1248,9 +1624,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .use_synthetic_weights = */ params.use_synthetic_weights,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .estimate_prompt = */ estp,
             };
             instances.push_back(instance);
         }
@@ -1283,9 +1661,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
+                /* .use_synthetic_weights = */ params.use_synthetic_weights,
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .estimate_prompt = */ estp,
             };
             instances.push_back(instance);
         }
@@ -1329,8 +1709,14 @@ struct test {
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
+    bool                     estimated;
+    int                      model_n_layer;
+    int                      estimate_layer_start;
+    int                      estimate_layer_stop;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    std::vector<uint64_t>    samples_cycles;
+    std::vector<uint64_t>    samples_insts;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1367,6 +1753,10 @@ struct test {
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
+        estimated      = inst.estimate_prompt;
+        model_n_layer  = llama_model_n_layer(lmodel);
+        estimate_layer_start = PROFILER_LAYER_START;
+        estimate_layer_stop  = PROFILER_LAYER_STOP;
         // RFC 3339 date-time format
         time_t t       = time(NULL);
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
@@ -1378,6 +1768,24 @@ struct test {
     uint64_t avg_ns() const { return ::avg(samples_ns); }
 
     uint64_t stdev_ns() const { return ::stdev(samples_ns); }
+
+    uint64_t avg_cycles() const { return ::avg(samples_cycles); }
+
+    uint64_t stdev_cycles() const { return ::stdev(samples_cycles); }
+
+    std::vector<double> get_ipcs() const {
+        std::vector<double> ipcs;
+        const size_t n = std::min(samples_cycles.size(), samples_insts.size());
+        ipcs.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            ipcs.push_back(samples_cycles[i] > 0 ? (double) samples_insts[i] / (double) samples_cycles[i] : 0.0);
+        }
+        return ipcs;
+    }
+
+    double avg_ipc() const { return ::avg(get_ipcs()); }
+
+    double stdev_ipc() const { return ::stdev(get_ipcs()); }
 
     std::vector<double> get_ts() const {
         int                 n_tokens = n_prompt + n_gen;
@@ -1422,7 +1830,8 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "n_prompt",      "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_cycles",     "stddev_cycles",
+            "avg_ipc",        "stddev_ipc",     "avg_ts",         "stddev_ts"
         };
         return fields;
     }
@@ -1433,14 +1842,14 @@ struct test {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
-            field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe") {
+            field == "stddev_ns" || field == "avg_cycles" || field == "stddev_cycles" || field == "no_op_offload" || field == "n_cpu_moe") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ipc" || field == "stddev_ipc" || field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
         }
         return STRING;
@@ -1520,6 +1929,10 @@ struct test {
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
+                                            std::to_string(avg_cycles()),
+                                            std::to_string(stdev_cycles()),
+                                            std::to_string(avg_ipc()),
+                                            std::to_string(stdev_ipc()),
                                             std::to_string(avg_ts()),
                                             std::to_string(stdev_ts()) };
         return values;
@@ -1630,6 +2043,8 @@ struct json_printer : public printer {
         fprintf(fout, "  {\n");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "    \"samples_ns\": [ %s ],\n", join(t.samples_ns, ", ").c_str());
+        fprintf(fout, "    \"samples_cycles\": [ %s ],\n", join(t.samples_cycles, ", ").c_str());
+        fprintf(fout, "    \"samples_ipc\": [ %s ],\n", join(t.get_ipcs(), ", ").c_str());
         fprintf(fout, "    \"samples_ts\": [ %s ]\n", join(t.get_ts(), ", ").c_str());
         fprintf(fout, "  }");
         fflush(fout);
@@ -1650,6 +2065,8 @@ struct jsonl_printer : public printer {
         fprintf(fout, "{");
         print_fields(test::get_fields(), t.get_values());
         fprintf(fout, "\"samples_ns\": [ %s ],", join(t.samples_ns, ", ").c_str());
+        fprintf(fout, "\"samples_cycles\": [ %s ],", join(t.samples_cycles, ", ").c_str());
+        fprintf(fout, "\"samples_ipc\": [ %s ],", join(t.get_ipcs(), ", ").c_str());
         fprintf(fout, "\"samples_ts\": [ %s ]", join(t.get_ts(), ", ").c_str());
         fprintf(fout, "}\n");
         fflush(fout);
@@ -1659,15 +2076,102 @@ struct jsonl_printer : public printer {
 struct markdown_printer : public printer {
     std::vector<std::string> fields;
 
+    static bool has_nonzero_samples(const std::vector<uint64_t> & samples) {
+        return std::any_of(samples.begin(), samples.end(), [](uint64_t sample) {
+            return sample != 0;
+        });
+    }
+
+    static std::string format_compact_count(uint64_t value) {
+        static const char * suffixes[] = { "", "K", "M", "G", "T", "P" };
+        double scaled = (double) value;
+        size_t suffix_idx = 0;
+        const size_t n_suffixes = sizeof(suffixes) / sizeof(suffixes[0]);
+
+        while (scaled >= 1000.0 && suffix_idx + 1 < n_suffixes) {
+            scaled /= 1000.0;
+            ++suffix_idx;
+        }
+
+        char buf[32];
+        if (suffix_idx == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu64, value);
+        } else if (scaled < 10.0) {
+            snprintf(buf, sizeof(buf), "%.2f%s", scaled, suffixes[suffix_idx]);
+        } else if (scaled < 100.0) {
+            snprintf(buf, sizeof(buf), "%.1f%s", scaled, suffixes[suffix_idx]);
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f%s", scaled, suffixes[suffix_idx]);
+        }
+
+        return buf;
+    }
+
+    static std::string format_compact_range(uint64_t avg, uint64_t stdev) {
+        return format_compact_count(avg) + "±" + format_compact_count(stdev);
+    }
+
+    static std::string format_compact_float_range(double avg, double stdev, int precision) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.*f±%.*f", precision, avg, precision, stdev);
+        return buf;
+    }
+
+    static std::string format_compact_binary_size(uint64_t bytes) {
+        static const char * suffixes[] = { "B", "K", "M", "G", "T", "P" };
+        double scaled = (double) bytes;
+        size_t suffix_idx = 0;
+        const size_t n_suffixes = sizeof(suffixes) / sizeof(suffixes[0]);
+
+        while (scaled >= 1024.0 && suffix_idx + 1 < n_suffixes) {
+            scaled /= 1024.0;
+            ++suffix_idx;
+        }
+
+        char buf[32];
+        if (suffix_idx == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu64 "%s", bytes, suffixes[suffix_idx]);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f%s", scaled, suffixes[suffix_idx]);
+        }
+        return buf;
+    }
+
+    static std::string format_compact_decimal_count(uint64_t value) {
+        static const char * suffixes[] = { "", "K", "M", "B", "T", "P" };
+        double scaled = (double) value;
+        size_t suffix_idx = 0;
+        const size_t n_suffixes = sizeof(suffixes) / sizeof(suffixes[0]);
+
+        while (scaled >= 1000.0 && suffix_idx + 1 < n_suffixes) {
+            scaled /= 1000.0;
+            ++suffix_idx;
+        }
+
+        char buf[32];
+        if (suffix_idx == 0) {
+            snprintf(buf, sizeof(buf), "%" PRIu64, value);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f%s", scaled, suffixes[suffix_idx]);
+        }
+        return buf;
+    }
+
     static int get_field_width(const std::string & field) {
         if (field == "model") {
-            return -30;
+            return -22;
+        }
+        if (field == "cycles") {
+            return 11;
+        }
+        if (field == "ipc") {
+            return 9;
         }
         if (field == "t/s") {
-            return 20;
+            return 10;
         }
         if (field == "size" || field == "params") {
-            return 10;
+            return 7;
         }
         if (field == "n_gpu_layers") {
             return 3;
@@ -1700,7 +2204,7 @@ struct markdown_printer : public printer {
             return 3;
         }
         if (field == "test") {
-            return 15;
+            return -15;
         }
         if (field == "no_op_offload") {
             return 4;
@@ -1725,7 +2229,10 @@ struct markdown_printer : public printer {
             return "sm";
         }
         if (field == "n_threads") {
-            return "threads";
+            return "th";
+        }
+        if (field == "backend") {
+            return "be";
         }
         if (field == "no_kv_offload") {
             return "nkvo";
@@ -1756,6 +2263,9 @@ struct markdown_printer : public printer {
         }
         if (field == "tensor_buft_overrides") {
             return "ot";
+        }
+        if (field == "cycles") {
+            return "cyc";
         }
         return field;
     }
@@ -1836,6 +2346,8 @@ struct markdown_printer : public printer {
             fields.emplace_back("no_host");
         }
         fields.emplace_back("test");
+        fields.emplace_back("cycles");
+        fields.emplace_back("ipc");
         fields.emplace_back("t/s");
 
         fprintf(fout, "|");
@@ -1861,19 +2373,9 @@ struct markdown_printer : public printer {
             if (field == "model") {
                 value = t.model_type;
             } else if (field == "size") {
-                if (t.model_size < 1024 * 1024 * 1024) {
-                    snprintf(buf, sizeof(buf), "%.2f MiB", t.model_size / 1024.0 / 1024.0);
-                } else {
-                    snprintf(buf, sizeof(buf), "%.2f GiB", t.model_size / 1024.0 / 1024.0 / 1024.0);
-                }
-                value = buf;
+                value = format_compact_binary_size(t.model_size);
             } else if (field == "params") {
-                if (t.model_n_params < 1000 * 1000 * 1000) {
-                    snprintf(buf, sizeof(buf), "%.2f M", t.model_n_params / 1e6);
-                } else {
-                    snprintf(buf, sizeof(buf), "%.2f B", t.model_n_params / 1e9);
-                }
-                value = buf;
+                value = format_compact_decimal_count(t.model_n_params);
             } else if (field == "backend") {
                 value = test::get_backend();
             } else if (field == "test") {
@@ -1886,12 +2388,28 @@ struct markdown_printer : public printer {
                 }
                 if (t.n_depth > 0) {
                     int len = strlen(buf);
-                    snprintf(buf + len, sizeof(buf) - len, " @ d%d", t.n_depth);
+                    snprintf(buf + len, sizeof(buf) - len, "@d%d", t.n_depth);
+                }
+                if (t.estimated) {
+                    int len = strlen(buf);
+                    snprintf(buf + len, sizeof(buf) - len, " e[%d,%d)/%d",
+                             t.estimate_layer_start, t.estimate_layer_stop, t.model_n_layer);
                 }
                 value = buf;
+            } else if (field == "cycles") {
+                if (!has_nonzero_samples(t.samples_cycles)) {
+                    value = "n/a";
+                } else {
+                    value = format_compact_range(t.avg_cycles(), t.stdev_cycles());
+                }
+            } else if (field == "ipc") {
+                if (!has_nonzero_samples(t.samples_cycles) || !has_nonzero_samples(t.samples_insts)) {
+                    value = "n/a";
+                } else {
+                    value = format_compact_float_range(t.avg_ipc(), t.stdev_ipc(), 2);
+                }
             } else if (field == "t/s") {
-                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
-                value = buf;
+                value = format_compact_float_range(t.avg_ts(), t.stdev_ts(), 1);
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
             } else {
@@ -1900,7 +2418,7 @@ struct markdown_printer : public printer {
             }
 
             int width = get_field_width(field);
-            if (field == "t/s") {
+            if (field == "cycles" || field == "ipc" || field == "t/s") {
                 // HACK: the utf-8 character is 2 bytes
                 width += 1;
             }
@@ -1959,8 +2477,20 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads, layer_debug_data * layer_dbg = nullptr, bool use_estimate = false) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+
+    if (use_estimate) {
+        if (!layer_estimation_is_configured(layer_dbg)) {
+            fprintf(stderr, "%s: prompt estimate mode is not configured for this model/layer window\n", __func__);
+            return false;
+        }
+        if (n_prompt > n_batch) {
+            fprintf(stderr, "%s: prompt estimate mode requires n_prompt <= n_batch\n", __func__);
+            return false;
+        }
+        layer_debug_prepare_estimate(layer_dbg);
+    }
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -1978,13 +2508,30 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         }
         int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
         if (res != 0) {
+            if (use_estimate && res == 2) {
+                break;
+            }
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
+            if (use_estimate) {
+                layer_debug_finish_estimate(layer_dbg);
+            }
             return false;
         }
         n_processed += n_tokens;
     }
 
     llama_synchronize(ctx);
+
+    if (use_estimate) {
+        const bool ok = layer_debug_get_estimate(layer_dbg, nullptr, nullptr, nullptr);
+        layer_debug_finish_estimate(layer_dbg);
+        if (!ok) {
+            fprintf(stderr, "%s: failed to capture prompt estimate from l_out layers [%d,%d)\n",
+                    __func__, layer_dbg->estimate_layer_start, layer_dbg->estimate_layer_stop);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -2090,6 +2637,7 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+    const bool print_layer01_debug = getenv_bool("LLAMA_BENCH_PRINT_LAYERS_01");
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
@@ -2119,7 +2667,20 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
-        llama_context * ctx = llama_init_from_model(lmodel, inst.to_llama_cparams());
+        layer_debug_data layer_dbg;
+        layer_dbg.print_layer01_debug = print_layer01_debug;
+        layer_dbg.model_n_layer = llama_model_n_layer(lmodel);
+
+        llama_context_params cparams = inst.to_llama_cparams();
+        // TODO(xsai): Only install these callbacks when prompt estimation or
+        // layer debug is explicitly requested. Ordinary benchmark runs on
+        // RISC-V currently still route through the profiler/NEMU hook path.
+        cparams.cb_eval = llama_bench_layer01_cb;
+        cparams.cb_eval_user_data = &layer_dbg;
+        cparams.abort_callback = llama_bench_abort_cb;
+        cparams.abort_callback_data = &layer_dbg;
+
+        llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
@@ -2127,6 +2688,18 @@ int main(int argc, char ** argv) {
         }
 
         test t(inst, lmodel, ctx);
+        const bool prompt_estimate_enabled = inst.estimate_prompt &&
+                             t.n_prompt > 0 &&
+                             t.n_gen == 0 &&
+                             t.n_prompt <= t.n_batch &&
+                             layer_estimation_is_configured(&layer_dbg);
+        t.estimated = prompt_estimate_enabled;
+
+        if (inst.estimate_prompt && !prompt_estimate_enabled && (params.verbose || params.progress)) {
+            fprintf(stderr,
+                "llama-bench: prompt estimate mode disabled for this test (requires n_gen=0, n_prompt<=n_batch, and l_out layers [%d,%d) within model depth %d)\n",
+                layer_dbg.estimate_layer_start, layer_dbg.estimate_layer_stop, layer_dbg.model_n_layer);
+        }
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2163,7 +2736,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, &layer_dbg, prompt_estimate_enabled);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2205,7 +2778,7 @@ int main(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads, &layer_dbg, false);
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2225,19 +2798,38 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            uint64_t t_start = get_time_ns();
+            uint64_t t_start_ns = get_time_ns();
+            uint64_t t_start_cycles = read_cycle();
+            uint64_t t_start_instret = read_instret();
+            bool used_prompt_estimate = false;
+            uint64_t estimated_cycles = 0;
+            uint64_t estimated_instret = 0;
 
             if (t.n_prompt > 0) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, &layer_dbg, prompt_estimate_enabled);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
+                }
+
+                if (prompt_estimate_enabled) {
+                    uint64_t estimated_ns = 0;
+                    if (!layer_debug_get_estimate(&layer_dbg, &estimated_ns, &estimated_cycles, &estimated_instret)) {
+                        fprintf(stderr, "%s: error: failed to read prompt estimate\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        exit(1);
+                    }
+                    t.samples_ns.push_back(estimated_ns);
+                    t.samples_cycles.push_back(estimated_cycles);
+                    t.samples_insts.push_back(estimated_instret);
+                    used_prompt_estimate = true;
                 }
             }
             if (t.n_gen > 0) {
@@ -2254,8 +2846,25 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            uint64_t t_ns = get_time_ns() - t_start;
-            t.samples_ns.push_back(t_ns);
+            uint64_t t_ns = get_time_ns() - t_start_ns;
+            if (!used_prompt_estimate) {
+                uint64_t t_cycles = 0;
+                uint64_t t_instret = 0;
+                const uint64_t t_end_cycles = read_cycle();
+                const uint64_t t_end_instret = read_instret();
+                if (t_end_cycles >= t_start_cycles) {
+                    t_cycles = t_end_cycles - t_start_cycles;
+                }
+                if (t_end_instret >= t_start_instret) {
+                    t_instret = t_end_instret - t_start_instret;
+                }
+                if (t_cycles > 0) {
+                    t_ns = cycles_to_ns(t_cycles);
+                }
+                t.samples_ns.push_back(t_ns);
+                t.samples_cycles.push_back(t_cycles);
+                t.samples_insts.push_back(t_instret);
+            }
         }
 
         if (p) {
@@ -2266,6 +2875,12 @@ int main(int argc, char ** argv) {
         if (p_err) {
             p_err->print_test(t);
             fflush(p_err->fout);
+        }
+
+        if (t.estimated && params.verbose && !t.samples_cycles.empty()) {
+            fprintf(stderr,
+                    "llama-bench: estimated prompt throughput from l_out layers [%d,%d) over %d model layers: avg_cycles=%" PRIu64 " ± %" PRIu64 ", avg_ipc=%.3f ± %.3f\n",
+                    t.estimate_layer_start, t.estimate_layer_stop, t.model_n_layer, t.avg_cycles(), t.stdev_cycles(), t.avg_ipc(), t.stdev_ipc());
         }
 
         llama_perf_context_print(ctx);
