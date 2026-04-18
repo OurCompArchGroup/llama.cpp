@@ -56,7 +56,7 @@ static inline uint64_t read_instret(void) {
 #define NEMU_NOTIFY_PROFILE_EXIT 0x102
 
 static void nemu_signal(int code) {
-#if 1
+#if defined(__riscv)
     asm volatile(
         "mv a0, %0\n\t"
         ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
