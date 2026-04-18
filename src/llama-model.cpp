@@ -2474,14 +2474,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
+    const bool   use_synthetic_weights = params.use_synthetic_weights;
+    const bool   use_mmap_weights = ml.use_mmap && !use_synthetic_weights;
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
 
-    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
-        __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+    LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s, synthetic = %s)\n",
+        __func__, use_mmap_weights ? "true" : "false", ml.use_direct_io ? "true" : "false", use_synthetic_weights ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -2733,7 +2735,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
             // avoid using a host buffer when using mmap
             auto * buft_dev = ggml_backend_buft_get_device(buft);
-            if (ml.use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+            if (use_mmap_weights && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
                 auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                 if (!cpu_dev) {
                     throw std::runtime_error("no CPU backend found");
@@ -6984,8 +6986,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    // init_mappings() also computes size_data for the non-mmap load path.
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
-    pimpl->mappings.reserve(ml.mappings.size());
+
+    if (use_mmap_weights) {
+        pimpl->mappings.reserve(ml.mappings.size());
+    }
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
@@ -7021,7 +7027,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (use_mmap_weights && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -7112,6 +7118,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
+    if (use_synthetic_weights) {
+        for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf : bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
+        }
+        LLAMA_LOG_INFO("%s: synthetic weights enabled - skipping tensor data load\n", __func__);
+        return true;
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -7119,7 +7135,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (use_mmap_buffer) {
+    if (use_mmap_buffer && use_mmap_weights) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
@@ -8135,6 +8151,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.use_synthetic_weights       =*/ false,
     };
 
     return result;

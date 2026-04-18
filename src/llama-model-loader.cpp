@@ -506,6 +506,7 @@ llama_model_loader::llama_model_loader(
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
+    bool use_synthetic_weights,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
     int trace = 0;
@@ -564,7 +565,7 @@ llama_model_loader::llama_model_loader(
         }
         n_elements += ggml_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
-        weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
+        weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur, !use_synthetic_weights));
     }
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -630,7 +631,7 @@ llama_model_loader::llama_model_loader(
                 }
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
-                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur, !use_synthetic_weights));
             }
         }
 
@@ -763,6 +764,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap = use_mmap;
     this->use_direct_io = use_direct_io;
+    this->use_synthetic_weights = use_synthetic_weights;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
 }

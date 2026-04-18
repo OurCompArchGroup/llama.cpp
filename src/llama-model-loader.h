@@ -31,14 +31,14 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
-        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+        llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor, bool check_data_bounds = true) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            if (check_data_bounds && (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size())) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
@@ -71,6 +71,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool use_synthetic_weights = false;
     bool check_tensors;
     bool no_alloc;
 
@@ -101,6 +102,7 @@ struct llama_model_loader {
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
+        bool use_synthetic_weights,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
