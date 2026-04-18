@@ -316,6 +316,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool use_synthetic_weights; // allocate tensors but skip reading tensor data from file
+
+        int32_t synthetic_alloc_layer_stop; // synthetic estimate mode skips repeating layers with id > stop, -1 disables
     };
 
     struct llama_sampler_seq_config {

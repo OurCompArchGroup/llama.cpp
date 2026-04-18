@@ -1460,6 +1460,9 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.use_synthetic_weights = use_synthetic_weights;
         mparams.no_host       = no_host;
+        mparams.synthetic_alloc_layer_stop = estimate_prompt && use_synthetic_weights
+            ? PROFILER_LAYER_STOP
+            : -1;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {

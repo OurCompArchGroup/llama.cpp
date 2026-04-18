@@ -26,6 +26,8 @@
 #include <sstream>
 #include <stdexcept>
 
+static uint8_t llama_model_synthetic_skip_alloc_placeholder = 0;
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -2476,6 +2478,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & tensor_split = params.tensor_split;
     const bool   use_synthetic_weights = params.use_synthetic_weights;
     const bool   use_mmap_weights = ml.use_mmap && !use_synthetic_weights;
+    const int32_t synthetic_alloc_layer_stop = params.synthetic_alloc_layer_stop;
+    const bool synthetic_estimate_limited_alloc =
+        use_synthetic_weights && synthetic_alloc_layer_stop >= 0;
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
@@ -2761,7 +2766,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     return t;
                 }
             }
-            return ml.create_tensor(ctx, tn, ne, flags);
+
+            ggml_tensor * tensor = ml.create_tensor(ctx, tn, ne, flags);
+
+            if (synthetic_estimate_limited_alloc && tensor != nullptr && tensor->view_src == nullptr) {
+                const bool skip_repeating_tensor =
+                    info.layer == LLM_TENSOR_LAYER_REPEATING &&
+                    tn.bid > synthetic_alloc_layer_stop;
+
+                if (skip_repeating_tensor) {
+                    tensor->data = &llama_model_synthetic_skip_alloc_placeholder;
+                }
+            }
+
+            return tensor;
         };
 
         layers.resize(n_layer);
@@ -7056,7 +7074,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                bool has_real_alloc_tensor = false;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->data == nullptr && t->view_src == nullptr) {
+                        has_real_alloc_tensor = true;
+                        break;
+                    }
+                }
+
+                if (has_real_alloc_tensor) {
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                } else {
+                    buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer for fully skipped contexts
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -7068,6 +7098,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
             bufs.emplace_back(buf);
+            if (!ml.no_alloc) {
+                ggml_backend_buffer_t dummy_buf = nullptr;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->data == &llama_model_synthetic_skip_alloc_placeholder && t->buffer == nullptr) {
+                        if (dummy_buf == nullptr) {
+                            dummy_buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                            if (dummy_buf == nullptr) {
+                                throw std::runtime_error(format("unable to allocate %s dummy buffer", ggml_backend_buft_name(buft)));
+                            }
+                            bufs.emplace_back(dummy_buf);
+                        }
+                        t->buffer = dummy_buf;
+                    }
+                }
+            }
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 buf_map.emplace(idx, buf);
             }
@@ -8152,6 +8197,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.use_synthetic_weights       =*/ false,
+        /*.synthetic_alloc_layer_stop  =*/ -1,
     };
 
     return result;
