@@ -16,10 +16,15 @@
 #endif
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+#ifdef GGML_USE_RV_AME
+extern "C" int ggml_ame_bf16_smoke_once(void);
+#endif
 
 // ---------------------------------------------------------------------------
 // RISC-V hardware performance counters
@@ -55,8 +60,24 @@ static inline uint64_t read_instret(void) {
 #define NEMU_NOTIFY_PROFILER     0x101
 #define NEMU_NOTIFY_PROFILE_EXIT 0x102
 
+static bool nemu_signal_enabled() {
+#if defined(__riscv)
+    static int cached = -1;
+    if (cached == -1) {
+        const char * env = std::getenv("XSAI_ENABLE_NEMU_SIGNAL");
+        cached = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+#else
+    return false;
+#endif
+}
+
 static void nemu_signal(int code) {
 #if defined(__riscv)
+    if (!nemu_signal_enabled()) {
+        return;
+    }
     asm volatile(
         "mv a0, %0\n\t"
         ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
@@ -150,7 +171,7 @@ static bool layer_hash_cb(struct ggml_tensor * t, bool ask, void * /*user_data*/
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
-        "\nUsage: %s -m model.gguf [-n n_predict] [prompt]\n\n",
+        "\nUsage: %s -m model.gguf [-n n_predict] [--bf16-smoke-once] [prompt]\n\n",
         prog);
 }
 
@@ -158,6 +179,7 @@ int main(int argc, char ** argv) {
     std::string model_path;
     std::string prompt    = "Hello my name is";
     int         n_predict = 32;
+    bool        bf16_smoke_once = false;
 
     // ---- argument parsing ----
     {
@@ -171,6 +193,8 @@ int main(int argc, char ** argv) {
                     try { n_predict = std::stoi(argv[++i]); }
                     catch (...) { print_usage(argv[0]); return 1; }
                 } else { print_usage(argv[0]); return 1; }
+            } else if (strcmp(argv[i], "--bf16-smoke-once") == 0) {
+                bf16_smoke_once = true;
             } else {
                 break; // remainder is the prompt
             }
@@ -196,6 +220,19 @@ int main(int argc, char ** argv) {
     if (!model) {
         fprintf(stderr, "%s: error: unable to load model\n", __func__);
         return 1;
+    }
+
+    if (bf16_smoke_once) {
+#ifdef GGML_USE_RV_AME
+        const int smoke_rc = ggml_ame_bf16_smoke_once();
+        fprintf(stderr, "[simple-xsai] bf16 smoke %s (rc=%d)\n", smoke_rc == 0 ? "passed" : "failed", smoke_rc);
+        llama_model_free(model);
+        return smoke_rc;
+#else
+        fprintf(stderr, "[simple-xsai] bf16 smoke unavailable: binary not built with AME support\n");
+        llama_model_free(model);
+        return 2;
+#endif
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
