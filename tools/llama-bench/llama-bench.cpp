@@ -49,8 +49,24 @@
 // targets whose actual CPU frequency differs from this value.
 static constexpr uint64_t LLAMA_BENCH_ASSUMED_CPU_FREQ_HZ = 2000000000ull;
 
+static bool nemu_signal_enabled() {
+#ifdef __riscv
+    static int cached = -1;
+    if (cached == -1) {
+        const char * env = std::getenv("XSAI_ENABLE_NEMU_SIGNAL");
+        cached = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+#else
+    return false;
+#endif
+}
+
 static void nemu_signal(int a) {
 #ifdef __riscv
+    if (!nemu_signal_enabled()) {
+        return;
+    }
     asm volatile ("mv a0, %0\n\t"
                   ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
                   :
