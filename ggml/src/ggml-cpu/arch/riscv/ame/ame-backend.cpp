@@ -111,9 +111,46 @@ static void reference_mul_mat_q8_0_f32(
     free(y);
 }
 
+static float reference_dot_bf16(const ggml_bf16_t * a, const ggml_bf16_t * b, int64_t K) {
+    float sum = 0.0f;
+    for (int64_t k = 0; k < K; ++k) {
+        sum += GGML_BF16_TO_FP32(a[k]) * GGML_BF16_TO_FP32(b[k]);
+    }
+    return sum;
+}
+
+static void reference_mul_mat_bf16_f32(
+    const void * src0_data,
+    ggml_type src1_type,
+    const void * src1_data,
+    float * dst_data,
+    int64_t M, int64_t N, int64_t K,
+    size_t src1_stride_bytes
+) {
+    const ggml_bf16_t * a = (const ggml_bf16_t *) src0_data;
+    std::vector<ggml_bf16_t> src1_bf16;
+
+    if (src1_type == GGML_TYPE_F32) {
+        src1_bf16.resize((size_t) N * (size_t) K);
+        for (int64_t n = 0; n < N; ++n) {
+            const float * src1_col = (const float *) ((const char *) src1_data + n * src1_stride_bytes);
+            ggml_cpu_fp32_to_bf16(src1_col, src1_bf16.data() + n * K, K);
+        }
+    }
+
+    for (int64_t n = 0; n < N; ++n) {
+        const ggml_bf16_t * b_col = src1_type == GGML_TYPE_BF16
+            ? (const ggml_bf16_t *) ((const char *) src1_data + n * src1_stride_bytes)
+            : src1_bf16.data() + n * K;
+        for (int64_t m = 0; m < M; ++m) {
+            dst_data[n * M + m] = reference_dot_bf16(a + m * K, b_col, K);
+        }
+    }
+}
+
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
-    return type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16;
 }
 
 static size_t ame_align_up(size_t value, size_t alignment) {
@@ -132,6 +169,58 @@ static bool ame_parse_env_bool(const char * name) {
         return false;
     }
     return true;
+}
+
+static bool ame_diff_enabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_parse_env_bool("GGML_AME_DIFF") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static void ame_report_diff(
+    const char * tag,
+    const float * got,
+    const float * ref,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    float threshold
+) {
+    float max_abs = 0.0f;
+    int64_t max_i = 0;
+    int64_t max_j = 0;
+    float got_v = 0.0f;
+    float ref_v = 0.0f;
+
+    for (int64_t j = 0; j < N; ++j) {
+        for (int64_t i = 0; i < M; ++i) {
+            const float cur_got = got[j * M + i];
+            const float cur_ref = ref[j * M + i];
+            const float cur_abs = fabsf(cur_got - cur_ref);
+            if (cur_abs > max_abs) {
+                max_abs = cur_abs;
+                max_i = i;
+                max_j = j;
+                got_v = cur_got;
+                ref_v = cur_ref;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "[AME-DIFF] %s M=%lld N=%lld K=%lld max_abs=%.6f at (%lld,%lld) got=%.6f ref=%.6f%s\n",
+            tag,
+            (long long) M,
+            (long long) N,
+            (long long) K,
+            max_abs,
+            (long long) max_i,
+            (long long) max_j,
+            got_v,
+            ref_v,
+            max_abs > threshold ? " <!>" : "");
 }
 
 static bool ame_use_packed_q8() {
@@ -225,6 +314,10 @@ static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
 }
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
+    if (op->src[0]->type == GGML_TYPE_BF16) {
+        return 0;
+    }
+
     const int64_t K = op->src[0]->ne[0];
     const int64_t N = op->src[1]->ne[1];
     const int64_t nb_x = ame_use_packed_q8() ? ((K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K) : (K / QK8_0);
@@ -249,7 +342,7 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
 
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -257,35 +350,71 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     const int64_t ne11 = src1->ne[1];
 
     GGML_ASSERT(ne00 == ne10);
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
 
-    const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0);
-    if (packed_w != nullptr) {
-        AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel");
-        ggml_ame_mul_mat_q8_0_ame64(
-            packed_w,
-            src1,
-            src1->data,
-            dst->data,
-            ne00, ne01,
-            ne10, ne11,
-            src1->nb[1],
-            ggml_threadpool_graph_id(params->threadpool),
-            params->wdata,
-            params->wsize
-        );
+    if (src0->type == GGML_TYPE_Q8_0) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0);
+        if (packed_w != nullptr) {
+            AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel");
+            ggml_ame_mul_mat_q8_0_ame64(
+                packed_w,
+                src1,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                ggml_threadpool_graph_id(params->threadpool),
+                params->wdata,
+                params->wsize
+            );
+        } else {
+            AME_LOG("backend_ame_mul_mat: dispatching to baseline Q8_0 kernel");
+            ggml_ame_mul_mat_q8_0(
+                src0->data,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                params->wdata,
+                params->wsize
+            );
+        }
     } else {
-        AME_LOG("backend_ame_mul_mat: dispatching to baseline Q8_0 kernel");
-        ggml_ame_mul_mat_q8_0(
+        GGML_ASSERT(src0->type == GGML_TYPE_BF16);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
+
+        AME_LOG("backend_ame_mul_mat: dispatching to BF16 kernel");
+        ggml_ame_mul_mat_bf16(
             src0->data,
             src1->data,
             dst->data,
             ne00, ne01,
             ne10, ne11,
             src1->nb[1],
+            src1->type,
             params->wdata,
             params->wsize
         );
+    }
+
+    if (ame_diff_enabled()) {
+        std::vector<float> ref((size_t) ne01 * (size_t) ne11, 0.0f);
+        const float threshold = 0.01f;
+
+        if (src0->type == GGML_TYPE_BF16) {
+            reference_mul_mat_bf16_f32(
+                src0->data,
+                src1->type,
+                src1->data,
+                ref.data(),
+                ne01, ne11, ne00,
+                src1->nb[1]
+            );
+            ame_report_diff("bf16", (const float *) dst->data, ref.data(), ne01, ne11, ne00, threshold);
+        }
     }
 
     GGML_UNUSED(params);
@@ -300,14 +429,26 @@ public:
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
-        if (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[1]->type != GGML_TYPE_F32) {
-            return false;
+
+        if (op->src[0]->type == GGML_TYPE_Q8_0) {
+            if (op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+                return false;
+            }
+            size = ggml_backend_ame_desired_wsize(op);
+            return true;
         }
-        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
-            return false;
+
+        if (op->src[0]->type == GGML_TYPE_BF16 &&
+            (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16) &&
+            ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+            size = 0;
+            return true;
         }
-        size = ggml_backend_ame_desired_wsize(op);
-        return true;
+
+        return false;
     }
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
@@ -338,15 +479,38 @@ public:
                 );
                 return true;
             }
+            if (src0->type == GGML_TYPE_BF16 &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16)) {
+                reference_mul_mat_bf16_f32(
+                    src0->data,
+                    src1->type,
+                    src1->data,
+                    (float *) op->data,
+                    M, N, K,
+                    src1->nb[1]
+                );
+                return true;
+            }
             return false;
         }
 
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
-        if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (!ggml_ame_can_use(src0->ne[1], src1->ne[1], src0->ne[0])) {
+        if (src0->type == GGML_TYPE_Q8_0) {
+            if (src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
+        } else if (src0->type == GGML_TYPE_BF16) {
+            if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16) {
+                return false;
+            }
+            if (!ggml_ame_can_use_bf16(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
+        } else {
             return false;
         }
 
@@ -533,7 +697,11 @@ public:
             return true;
         }
 
-        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+        const bool shape_supported =
+            op->src[0]->type == GGML_TYPE_Q8_0
+                ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
+                : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
             return true;
         }
@@ -543,13 +711,16 @@ public:
             AME_LOG("supports_op: fallback (src1 not host)");
             return true;
         }
-        // src1 must be float32
-        if (op->src[1]->type == GGML_TYPE_F32) {
+
+        const bool src1_supported =
+            (op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32) ||
+            (op->src[0]->type == GGML_TYPE_BF16 && (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16));
+        if (src1_supported) {
             AME_LOG("supports_op: accept M=%lld N=%lld K=%lld", (long long) op->src[0]->ne[1], (long long) op->src[1]->ne[1], (long long) op->src[0]->ne[0]);
             return true;
         }
 
-        AME_LOG("supports_op: fallback (src1 not F32)");
+        AME_LOG("supports_op: fallback (src1 type not supported)");
         return true;
     }
 

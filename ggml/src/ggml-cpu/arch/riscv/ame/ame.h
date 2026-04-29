@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ggml.h"
+
 // AME debug logging can be forced at build time with AME_DEBUG=1 or enabled at
 // runtime with GGML_AME_LOG=1 so logs are visible in QEMU serial output.
 #ifndef AME_DEBUG
@@ -41,21 +43,35 @@ static inline int ame_log_enabled(void) {
 #define AME_TILE_M 128
 #define AME_TILE_K 64
 #define AME_TILE_N 128
+// mtilek is configured in bytes for the current AME/QEMU model, so BF16 uses
+// half as many K elements as the int8 path for the same 64-byte register row.
+#define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
 
 #define AME_Q8_PACK_K 64
 
-// Helper function to check if AME can be used for given dimensions.
+// Helper functions to check if AME can be used for given dimensions.
 //
-// The current AME backend only accelerates Q8_0 GEMM. It only reaches the
-// AME core on full MxN tiles; smaller shapes fall back to RVV/scalar helpers
-// and usually lose to the generic CPU path once the extra quantize/pack cost is
-// accounted for.
-static inline int ggml_ame_can_use(int M, int N, int K) {
+// Q8_0 keeps the existing K-alignment constraint from the block format.
+// BF16 can use AME on the full interior tiles and falls back on edge/tail
+// regions, so it only requires positive dimensions and at least one full MxN
+// tile to be worthwhile.
+static inline int ggml_ame_can_use_q8(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
     if (K % 32 != 0) return 0;
     if (M < AME_TILE_M) return 0;
     if (N < AME_TILE_N) return 0;
     return 1;
+}
+
+static inline int ggml_ame_can_use_bf16(int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return 0;
+    if (M < AME_TILE_M) return 0;
+    if (N < AME_TILE_N) return 0;
+    return 1;
+}
+
+static inline int ggml_ame_can_use(int M, int N, int K) {
+    return ggml_ame_can_use_q8(M, N, K);
 }
 
 // Repacked Q4_0 format for AME (pre-unpacked to int8)
@@ -138,6 +154,22 @@ typedef struct {
         : \
     )
 
+#define MLAE16(REG, SRC, N) \
+    asm volatile ( \
+        "mlae16.m " #REG ", (%0), %1" \
+        : \
+        : "r"(SRC), "r"(N) \
+        : \
+    )
+
+#define MLBE16(REG, SRC, N) \
+    asm volatile ( \
+        "mlbe16.m " #REG ", (%0), %1" \
+        : \
+        : "r"(SRC), "r"(N) \
+        : \
+    )
+
 #define MLCE32(REG, SRC, N) \
     asm volatile ( \
         "mlce32.m " #REG ", (%0), %1" \
@@ -167,6 +199,14 @@ typedef struct {
 #define MQMA(ACC, TR0, TR2) \
     asm volatile ( \
         "mqma.mm " #ACC ", " #TR0 ", " #TR2 "\n" \
+        : \
+        : \
+        : \
+    )
+
+#define MFMACC_S_BF16(ACC, TR0, TR2) \
+    asm volatile ( \
+        "mfmacc.s.bf16 " #ACC ", " #TR0 ", " #TR2 "\n" \
         : \
         : \
         : \
@@ -226,6 +266,22 @@ typedef struct {
         : \
     )
 
+#define MLAE16(REG, SRC, N) \
+    asm volatile ( \
+        "mlae16 " #REG ", (%0), %1" \
+        : \
+        : "r"(SRC), "r"(N) \
+        : \
+    )
+
+#define MLBE16(REG, SRC, N) \
+    asm volatile ( \
+        "mlbe16 " #REG ", (%0), %1" \
+        : \
+        : "r"(SRC), "r"(N) \
+        : \
+    )
+
 #define MLCE32(REG, SRC, N) \
     asm volatile ( \
         "mlce32 " #REG ", (%0), %1" \
@@ -259,6 +315,14 @@ typedef struct {
         : \
         : \
     )
+
+#define MFMACC_S_BF16(ACC, TR0, TR2) \
+    asm volatile ( \
+        "mfmacc.s.bf16 " #ACC ", " #TR0 ", " #TR2 "\n" \
+        : \
+        : \
+        : \
+    )
 #endif
 
 #ifdef __cplusplus
@@ -270,6 +334,12 @@ void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * A,
     const int8_t * B,
     int32_t * C
+);
+
+void ggml_ame_gemm_tile_bf16_fp32_bT(
+    const ggml_bf16_t * A,
+    const ggml_bf16_t * B,
+    float * C
 );
 
 // Core AME GEMM function for INT8 matrix multiplication
@@ -315,6 +385,20 @@ void ggml_ame_mul_mat_q8_0(
     size_t work_size
 );
 
+void ggml_ame_mul_mat_bf16(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride,
+    enum ggml_type src1_type,
+    void * work_data,
+    size_t work_size
+);
+
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
     const void * src1_key,
@@ -341,6 +425,8 @@ void ggml_ame_mul_mat_q4_0(
     int64_t ne11,
     size_t src1_stride
 );
+
+int ggml_ame_bf16_smoke_once(void);
 
 #ifdef __cplusplus
 }

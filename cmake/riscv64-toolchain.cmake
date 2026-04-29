@@ -8,6 +8,23 @@ set(CMAKE_SYSTEM_VERSION 1)
 # change and loses the sysroot-relative C++ include paths, causing
 # 'array' not found errors in incremental builds.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+# Propagate the RISC-V toolchain knobs into CMake's nested try_compile
+# projects; otherwise compiler ABI checks fall back to the cache defaults and
+# may silently switch from clang++ back to a non-existent ${RISCV_TRIPLE}-g++.
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES
+    RISCV_TRIPLE
+    RISCV_ROOT_PATH
+    RISCV_MARCH
+    RISCV_MABI
+    RISCV_USE_LLVM
+    RISCV_SYSROOT
+    RISCV_LIB_PATH
+    RISCV_ATOMIC_LIB_PATH
+    RISCV_STDCXX_LIB_PATH
+    RISCV_NIX_LIBC
+    RISCV_NIX_LIBC_DEV
+)
+list(REMOVE_DUPLICATES CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
 
 
 # 可通过 -DRISCV_TRIPLE=xxx -DRISCV_ROOT_PATH=xxx -DRISCV_MARCH=xxx -DRISCV_MABI=xxx -DRISCV_USE_LLVM=ON 传参
@@ -22,6 +39,16 @@ set(RISCV_ATOMIC_LIB_PATH "" CACHE PATH "Directory containing libatomic (default
 set(RISCV_NIX_LIBC "" CACHE PATH "Nix glibc root resolved from gcc wrapper")
 set(RISCV_NIX_LIBC_DEV "" CACHE PATH "Nix glibc dev root resolved from gcc wrapper")
 set(RISCV_STDCXX_LIB_PATH "" CACHE PATH "Directory containing libstdc++ for the target toolchain")
+
+if (DEFINED ENV{RISCV_USE_LLVM} AND NOT RISCV_USE_LLVM)
+    string(TOUPPER "$ENV{RISCV_USE_LLVM}" _RISCV_USE_LLVM_ENV)
+    if (_RISCV_USE_LLVM_ENV STREQUAL "1" OR
+        _RISCV_USE_LLVM_ENV STREQUAL "ON" OR
+        _RISCV_USE_LLVM_ENV STREQUAL "TRUE" OR
+        _RISCV_USE_LLVM_ENV STREQUAL "YES")
+        set(RISCV_USE_LLVM ON CACHE BOOL "Use LLVM/Clang toolchain if ON, otherwise use GCC" FORCE)
+    endif()
+endif()
 
 if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(riscv)")
     message(STATUS "HOST SYSTEM ${CMAKE_HOST_SYSTEM_PROCESSOR}")
@@ -55,6 +82,15 @@ else()
         if (RISCV_ROOT_PATH)
             set(ENV{RISCV_ROOT_PATH} "${RISCV_ROOT_PATH}")
         endif()
+    endif()
+
+    set(ENV{RISCV_TRIPLE} "${RISCV_TRIPLE}")
+    set(ENV{RISCV_MARCH} "${RISCV_MARCH}")
+    set(ENV{RISCV_MABI} "${RISCV_MABI}")
+    if (RISCV_USE_LLVM)
+        set(ENV{RISCV_USE_LLVM} "ON")
+    else()
+        set(ENV{RISCV_USE_LLVM} "OFF")
     endif()
 
     # 如果环境变量已有记录（例如父配置阶段设置），优先取出
