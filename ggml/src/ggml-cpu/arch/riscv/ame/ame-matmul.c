@@ -142,14 +142,14 @@ static size_t ame_align_up_size(size_t value, size_t alignment) {
 }
 
 static size_t ggml_ame_q8_workspace_size(int64_t N, int64_t n_k_tiles) {
-    const size_t packed_b_panel_size = (size_t) n_k_tiles * AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    GGML_UNUSED(N);
+    GGML_UNUSED(n_k_tiles);
+
     size_t size = 64;
-    size = ame_align_up_size(size, 64);
-    size += (size_t) N * (size_t) n_k_tiles * sizeof(ggml_fp16_t);
     size = ame_align_up_size(size, 64);
     size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
     size = ame_align_up_size(size, 64);
-    size += packed_b_panel_size;
+    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
     size = ame_align_up_size(size, 64);
     size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
     return size;
@@ -401,8 +401,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int64_t N = ne11;
     const int64_t K = ne00;
     const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-    const size_t packed_b_tile_size = AME_TILE_N * AME_TILE_K * sizeof(int8_t);
-    const size_t packed_b_panel_size = (size_t) nb64 * packed_b_tile_size;
 
     const block_q8_ame64 * restrict x = (const block_q8_ame64 *) src0;
     float * restrict out = (float *) dst;
@@ -422,17 +420,12 @@ void ggml_ame_mul_mat_q8_0_ame64(
     uintptr_t ws_end = ws_ptr + work_size;
 
     ws_ptr = ame_align_up_size(ws_ptr, 64);
-    const int64_t y_scale_count = N * nb64;
-    ggml_fp16_t * y_scales = (ggml_fp16_t *) ws_ptr;
-    ws_ptr += y_scale_count * sizeof(ggml_fp16_t);
-
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
     int8_t * tile_a = (int8_t *) ws_ptr;
     ws_ptr += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
 
     ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int8_t * packed_b_panel = (int8_t *) ws_ptr;
-    ws_ptr += packed_b_panel_size;
+    int8_t * tile_b = (int8_t *) ws_ptr;
+    ws_ptr += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
 
     ws_ptr = ame_align_up_size(ws_ptr, 64);
     int32_t * tile_c = (int32_t *) ws_ptr;
@@ -447,6 +440,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
     ame_assert_phys_contiguous();
     memset(tile_a, 0, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
 
     const block_q8_ame64 * xq = ame_prepare_x_q64_cache(src1_key, src1, K, N, src1_stride, graph_id);
     if (xq == NULL) {
@@ -463,25 +457,18 @@ void ggml_ame_mul_mat_q8_0_ame64(
         g_ame_x_q64_cache.graph_id = 0;
     }
 
-    for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
-        const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
+    for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
+        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
 
-        memset(packed_b_panel, 0, packed_b_panel_size);
-        for (int64_t kb = 0; kb < nb64; ++kb) {
-            int8_t * tile_b = packed_b_panel + kb * packed_b_tile_size;
-            for (int j = 0; j < jmax; ++j) {
-                const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                y_scales[(j0 + j) * nb64 + kb] = bx->d;
-                memcpy(&tile_b[j * AME_TILE_K], bx->qs, AME_Q8_PACK_K);
-            }
-        }
-
-        for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
-            const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+        for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
+            const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
             float acc_f32[AME_TILE_M * AME_TILE_N];
             memset(acc_f32, 0, sizeof(acc_f32));
 
             for (int64_t kb = 0; kb < nb64; ++kb) {
+                ggml_fp16_t y_scales[AME_TILE_N];
+                memset(y_scales, 0, sizeof(y_scales));
+
                 for (int i = 0; i < AME_TILE_M; ++i) {
                     if (i < imax) {
                         const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
@@ -491,7 +478,13 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     }
                 }
 
-                const int8_t * tile_b = packed_b_panel + kb * packed_b_tile_size;
+                memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+                for (int j = 0; j < jmax; ++j) {
+                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
+                    y_scales[j] = bx->d;
+                    memcpy(&tile_b[j * AME_TILE_K], bx->qs, AME_Q8_PACK_K);
+                }
+
                 memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
 
@@ -499,7 +492,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
                     const float d_x = GGML_FP16_TO_FP32(bx->d);
                     for (int j = 0; j < jmax; ++j) {
-                        const float d_y = GGML_FP16_TO_FP32(y_scales[(j0 + j) * nb64 + kb]);
+                        const float d_y = GGML_FP16_TO_FP32(y_scales[j]);
                         acc_f32[i * AME_TILE_N + j] += tile_c[i * AME_TILE_N + j] * (d_x * d_y);
                     }
                 }

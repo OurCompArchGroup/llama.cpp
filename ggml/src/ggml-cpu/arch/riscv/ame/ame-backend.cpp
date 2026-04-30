@@ -225,29 +225,15 @@ static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
 }
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
-    const int64_t K = op->src[0]->ne[0];
-    const int64_t N = op->src[1]->ne[1];
+    GGML_UNUSED(op);
 
     size_t size = 64;
     size = ame_align_up(size, 64);
-    if (ame_use_packed_q8()) {
-        const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-        const size_t packed_b_panel_size = (size_t) nb64 * AME_TILE_N * AME_TILE_K * sizeof(int8_t);
-
-        size += (size_t) N * (size_t) nb64 * sizeof(ggml_fp16_t);
-        size = ame_align_up(size, 64);
-        size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
-        size = ame_align_up(size, 64);
-        size += packed_b_panel_size;
-        size = ame_align_up(size, 64);
-        size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
-    } else {
-        size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
-        size = ame_align_up(size, 64);
-        size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
-        size = ame_align_up(size, 64);
-        size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
-    }
+    size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up(size, 64);
+    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up(size, 64);
+    size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
 
     return size;
 }
