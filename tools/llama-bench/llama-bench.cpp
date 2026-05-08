@@ -99,6 +99,9 @@ struct layer_debug_data {
     std::unordered_set<std::string> printed;
     std::mutex                      lock;
     bool                            print_layer01_debug = false;
+    bool                            profile_layers = false;
+    int                             profile_layer_start = PROFILER_LAYER_START;
+    int                             profile_layer_stop = PROFILER_LAYER_STOP;
     bool                            profiler_started = false;
     bool                            profiler_good_trap_sent = false;
     int                             model_n_layer = 0;
@@ -232,27 +235,24 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
     const bool estimate_active = data != nullptr &&
                                  data->estimate_active.load(std::memory_order_relaxed) &&
                                  layer_estimation_is_configured(data);
+    const bool profile_active = data != nullptr && data->profile_layers;
 
     if (ask) {
         if (estimate_active && (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
             return true;
         }
-        if (layer == PROFILER_LAYER_START || layer == PROFILER_LAYER_STOP) {
+        if (profile_active && (layer == data->profile_layer_start || layer == data->profile_layer_stop)) {
             return true;
         }
         return data != nullptr && data->print_layer01_debug && (layer == 0 || layer == 1);
     }
 
     bool handled_profiler_start = false;
-    if (layer == PROFILER_LAYER_START) {
+    if (profile_active && layer == data->profile_layer_start) {
         bool should_start = false;
-        if (data != nullptr) {
-            std::lock_guard<std::mutex> guard(data->lock);
-            if (!data->profiler_started) {
-                data->profiler_started = true;
-                should_start = true;
-            }
-        } else {
+        std::lock_guard<std::mutex> guard(data->lock);
+        if (!data->profiler_started) {
+            data->profiler_started = true;
             should_start = true;
         }
 
@@ -301,16 +301,12 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
     }
 
     bool handled_profiler_stop = false;
-    if (layer == PROFILER_LAYER_STOP) {
+    if (profile_active && layer == data->profile_layer_stop) {
         bool should_stop = false;
         if (!estimate_active) {
-            if (data != nullptr) {
-                std::lock_guard<std::mutex> guard(data->lock);
-                if (data->profiler_started && !data->profiler_good_trap_sent) {
-                    data->profiler_good_trap_sent = true;
-                    should_stop = true;
-                }
-            } else {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (data->profiler_started && !data->profiler_good_trap_sent) {
+                data->profiler_good_trap_sent = true;
                 should_stop = true;
             }
         }
@@ -598,6 +594,25 @@ static std::string pair_str(const std::pair<int, int> & p) {
     return buf;
 }
 
+static std::pair<int, int> parse_layer_pair(const std::string & value) {
+    auto parts = string_split<std::string>(value, ',');
+    if (parts.size() != 2) {
+        throw std::invalid_argument("expected layer pair as <start,stop>");
+    }
+
+    size_t start_end = 0;
+    size_t stop_end  = 0;
+    std::string start_str = string_strip(parts[0]);
+    std::string stop_str  = string_strip(parts[1]);
+    int start = std::stoi(start_str, &start_end);
+    int stop  = std::stoi(stop_str, &stop_end);
+    if (start_end != start_str.size() || stop_end != stop_str.size() || start < 0 || stop <= start) {
+        throw std::invalid_argument("invalid layer pair");
+    }
+
+    return { start, stop };
+}
+
 static std::vector<int> parse_int_range(const std::string & s) {
     // first[-last[(+|*)step]]
     std::regex range_regex(R"(^(\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))");
@@ -667,6 +682,9 @@ struct cmd_params {
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
     std::vector<bool>                estimate_prompt;
+    bool                             profile_layers;
+    int                              profile_layer_start;
+    int                              profile_layer_stop;
     bool                             use_synthetic_weights;
     ggml_numa_strategy               numa;
     int                              reps;
@@ -708,6 +726,9 @@ static const cmd_params cmd_params_defaults = {
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
     /* estimate_prompt      */ { false },
+    /* profile_layers       */ false,
+    /* profile_layer_start  */ PROFILER_LAYER_START,
+    /* profile_layer_stop   */ PROFILER_LAYER_STOP,
     /* use_synthetic_weights*/ false,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
@@ -744,6 +765,7 @@ static void print_usage(int /* argc */, char ** argv) {
             PROFILER_LAYER_START, PROFILER_LAYER_STOP);
         printf("                                            only for prompt-only tests with n_prompt <= n_batch (default: %s)\n",
             join(cmd_params_defaults.estimate_prompt, ",").c_str());
+    printf("  --profile-layers <start,stop>             enable RISC-V/NEMU profiler hooks at layer window (default: disabled)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)\n");
     }
@@ -850,6 +872,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.profile_layers       = cmd_params_defaults.profile_layers;
+    params.profile_layer_start  = cmd_params_defaults.profile_layer_start;
+    params.profile_layer_stop   = cmd_params_defaults.profile_layer_stop;
     params.use_synthetic_weights = cmd_params_defaults.use_synthetic_weights;
 
     bool has_model_arg = false;
@@ -1170,6 +1195,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.estimate_prompt.insert(params.estimate_prompt.end(), p.begin(), p.end());
+            } else if (arg == "--profile-layers" || arg == "--profiler-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto layers = parse_layer_pair(argv[i]);
+                params.profile_layers = true;
+                params.profile_layer_start = layers.first;
+                params.profile_layer_stop  = layers.second;
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1445,6 +1479,9 @@ struct cmd_params_instance {
     bool               no_op_offload;
     bool               no_host;
     bool               estimate_prompt;
+    bool               profile_layers;
+    int                profile_layer_start;
+    int                profile_layer_stop;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1595,6 +1632,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .estimate_prompt = */ estp,
+                /* .profile_layers = */ params.profile_layers,
+                /* .profile_layer_start = */ params.profile_layer_start,
+                /* .profile_layer_stop = */ params.profile_layer_stop,
             };
             instances.push_back(instance);
         }
@@ -1632,6 +1672,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .estimate_prompt = */ estp,
+                /* .profile_layers = */ params.profile_layers,
+                /* .profile_layer_start = */ params.profile_layer_start,
+                /* .profile_layer_stop = */ params.profile_layer_stop,
             };
             instances.push_back(instance);
         }
@@ -1669,6 +1712,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .estimate_prompt = */ estp,
+                /* .profile_layers = */ params.profile_layers,
+                /* .profile_layer_start = */ params.profile_layer_start,
+                /* .profile_layer_stop = */ params.profile_layer_stop,
             };
             instances.push_back(instance);
         }
@@ -2672,16 +2718,20 @@ int main(int argc, char ** argv) {
 
         layer_debug_data layer_dbg;
         layer_dbg.print_layer01_debug = print_layer01_debug;
+        layer_dbg.profile_layers = inst.profile_layers;
+        layer_dbg.profile_layer_start = inst.profile_layer_start;
+        layer_dbg.profile_layer_stop  = inst.profile_layer_stop;
         layer_dbg.model_n_layer = llama_model_n_layer(lmodel);
 
         llama_context_params cparams = inst.to_llama_cparams();
-        // TODO(xsai): Only install these callbacks when prompt estimation or
-        // layer debug is explicitly requested. Ordinary benchmark runs on
-        // RISC-V currently still route through the profiler/NEMU hook path.
-        cparams.cb_eval = llama_bench_layer01_cb;
-        cparams.cb_eval_user_data = &layer_dbg;
-        cparams.abort_callback = llama_bench_abort_cb;
-        cparams.abort_callback_data = &layer_dbg;
+        if (inst.estimate_prompt || print_layer01_debug || inst.profile_layers) {
+            cparams.cb_eval = llama_bench_layer01_cb;
+            cparams.cb_eval_user_data = &layer_dbg;
+        }
+        if (inst.estimate_prompt) {
+            cparams.abort_callback = llama_bench_abort_cb;
+            cparams.abort_callback_data = &layer_dbg;
+        }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
