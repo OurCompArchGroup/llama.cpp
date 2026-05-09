@@ -120,6 +120,15 @@ struct layer_debug_data {
     uint64_t                        estimate_total_ns = 0;
     uint64_t                        estimate_total_cycles = 0;
     uint64_t                        estimate_total_instret = 0;
+    std::atomic<bool>               sample_active = false;
+    bool                            sample_started = false;
+    uint64_t                        sample_start_ns = 0;
+    uint64_t                        sample_start_cycle = 0;
+    uint64_t                        sample_start_instret = 0;
+    uint64_t                        sample_window_ns = 0;
+    uint64_t                        sample_window_cycles = 0;
+    uint64_t                        sample_window_instret = 0;
+    int                             sample_count = 0;
 };
 
 static bool layer_estimation_is_configured(const layer_debug_data * data) {
@@ -156,6 +165,57 @@ static void layer_debug_finish_estimate(layer_debug_data * data) {
 
     data->estimate_active.store(false, std::memory_order_relaxed);
     data->abort_requested.store(false, std::memory_order_relaxed);
+}
+
+static void layer_debug_prepare_sample(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    data->sample_started = false;
+    data->sample_start_ns = 0;
+    data->sample_start_cycle = 0;
+    data->sample_start_instret = 0;
+    data->sample_window_ns = 0;
+    data->sample_window_cycles = 0;
+    data->sample_window_instret = 0;
+    data->sample_count = 0;
+    data->sample_active.store(true, std::memory_order_relaxed);
+}
+
+static void layer_debug_finish_sample(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    data->sample_active.store(false, std::memory_order_relaxed);
+}
+
+static bool layer_debug_get_sample(layer_debug_data * data, uint64_t * sample_ns, uint64_t * sample_cycles, uint64_t * sample_instret, int * sample_count) {
+    if (data == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    if (data->sample_count <= 0) {
+        return false;
+    }
+
+    if (sample_ns != nullptr) {
+        *sample_ns = data->sample_window_ns;
+    }
+    if (sample_cycles != nullptr) {
+        *sample_cycles = data->sample_window_cycles;
+    }
+    if (sample_instret != nullptr) {
+        *sample_instret = data->sample_window_instret;
+    }
+    if (sample_count != nullptr) {
+        *sample_count = data->sample_count;
+    }
+
+    return true;
 }
 
 static bool layer_debug_get_estimate(layer_debug_data * data, uint64_t * estimated_ns, uint64_t * estimated_cycles, uint64_t * estimated_instret) {
@@ -235,10 +295,14 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
     const bool estimate_active = data != nullptr &&
                                  data->estimate_active.load(std::memory_order_relaxed) &&
                                  layer_estimation_is_configured(data);
+    const bool sample_active = data != nullptr &&
+                               data->sample_active.load(std::memory_order_relaxed) &&
+                               layer_estimation_is_configured(data);
     const bool profile_active = data != nullptr && data->profile_layers;
 
     if (ask) {
-        if (estimate_active && (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
+        if ((estimate_active || sample_active) &&
+                (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
             return true;
         }
         if (profile_active && (layer == data->profile_layer_start || layer == data->profile_layer_stop)) {
@@ -296,6 +360,36 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
                 data->estimate_valid = true;
                 data->abort_requested.store(true, std::memory_order_relaxed);
                 should_abort_estimate = true;
+            }
+        }
+    }
+
+    if (sample_active) {
+        if (l_out_layer == data->estimate_layer_start) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (!data->sample_started) {
+                data->sample_started = true;
+                data->sample_start_ns = get_time_ns();
+                data->sample_start_cycle = read_cycle();
+                data->sample_start_instret = read_instret();
+            }
+        } else if (l_out_layer == data->estimate_layer_stop) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (data->sample_started) {
+                const uint64_t end_ns = get_time_ns();
+                const uint64_t end_cycle = read_cycle();
+                const uint64_t end_instret = read_instret();
+                uint64_t window_cycles = end_cycle - data->sample_start_cycle;
+                uint64_t window_ns = end_ns - data->sample_start_ns;
+                if (window_cycles > 0) {
+                    window_ns = cycles_to_ns(window_cycles);
+                }
+
+                data->sample_window_ns += window_ns;
+                data->sample_window_cycles += window_cycles;
+                data->sample_window_instret += end_instret - data->sample_start_instret;
+                data->sample_count++;
+                data->sample_started = false;
             }
         }
     }
@@ -681,7 +775,8 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
-    std::vector<bool>                estimate_prompt;
+    std::vector<bool>                estimate_layers;
+    std::vector<int>                 estimate_decode_tokens;
     bool                             profile_layers;
     int                              profile_layer_start;
     int                              profile_layer_stop;
@@ -725,7 +820,8 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
-    /* estimate_prompt      */ { false },
+    /* estimate_layers      */ { false },
+    /* estimate_decode_tokens*/ { 0 },
     /* profile_layers       */ false,
     /* profile_layer_start  */ PROFILER_LAYER_START,
     /* profile_layer_stop   */ PROFILER_LAYER_STOP,
@@ -761,10 +857,12 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                             verbose output\n");
     printf("  --progress                                print test progress indicators\n");
     printf("  --no-warmup                               skip warmup runs before benchmarking\n");
-        printf("  --estimate-prompt <0|1>                   estimate prompt throughput from l_out layers [%d,%d)\n",
+    printf("  --estimate-layers <0|1>                   estimate throughput from l_out layers [%d,%d)\n",
             PROFILER_LAYER_START, PROFILER_LAYER_STOP);
-        printf("                                            only for prompt-only tests with n_prompt <= n_batch (default: %s)\n",
-            join(cmd_params_defaults.estimate_prompt, ",").c_str());
+    printf("                                            prompt-only or generation-only tests (default: %s)\n",
+            join(cmd_params_defaults.estimate_layers, ",").c_str());
+    printf("  --estimate-decode-tokens <n>              estimate generation-only tests from a full tg<n> sample (default: %s)\n",
+            join(cmd_params_defaults.estimate_decode_tokens, ",").c_str());
     printf("  --profile-layers <start,stop>             enable RISC-V/NEMU profiler hooks at layer window (default: disabled)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)\n");
@@ -1188,13 +1286,20 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
-            } else if (arg == "--estimate-prompt") {
+            } else if (arg == "--estimate-layers" || arg == "--estimate-prompt" || arg == "--estimate-decode") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
-                params.estimate_prompt.insert(params.estimate_prompt.end(), p.begin(), p.end());
+                params.estimate_layers.insert(params.estimate_layers.end(), p.begin(), p.end());
+            } else if (arg == "--estimate-decode-tokens") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<int>(argv[i], split_delim);
+                params.estimate_decode_tokens.insert(params.estimate_decode_tokens.end(), p.begin(), p.end());
             } else if (arg == "--profile-layers" || arg == "--profiler-layers") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1431,8 +1536,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
-    if (params.estimate_prompt.empty()) {
-        params.estimate_prompt = cmd_params_defaults.estimate_prompt;
+    if (params.estimate_layers.empty()) {
+        params.estimate_layers = cmd_params_defaults.estimate_layers;
+    }
+    if (params.estimate_decode_tokens.empty()) {
+        params.estimate_decode_tokens = cmd_params_defaults.estimate_decode_tokens;
+    }
+    for (const auto & n : params.estimate_decode_tokens) {
+        if (n < 0) {
+            fprintf(stderr, "error: --estimate-decode-tokens must be >= 0\n");
+            exit(1);
+        }
     }
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
@@ -1478,10 +1592,34 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
-    bool               estimate_prompt;
+    bool               estimate_layers;
+    int                estimate_decode_tokens;
     bool               profile_layers;
     int                profile_layer_start;
     int                profile_layer_stop;
+
+    bool prompt_estimate_requested_for_shape() const {
+        return estimate_layers && n_prompt > 0 && n_gen == 0 && n_prompt <= n_batch;
+    }
+
+    bool decode_estimate_requested_for_shape() const {
+        return estimate_layers && n_prompt == 0 && n_gen > 0;
+    }
+
+    bool decode_token_estimate_requested_for_shape() const {
+        return estimate_decode_tokens > 0 && n_prompt == 0 && n_gen > estimate_decode_tokens;
+    }
+
+    bool decode_layer_estimate_requested_for_shape() const {
+        return !decode_token_estimate_requested_for_shape() && decode_estimate_requested_for_shape();
+    }
+
+    int synthetic_alloc_layer_stop() const {
+        return use_synthetic_weights &&
+               (prompt_estimate_requested_for_shape() || decode_layer_estimate_requested_for_shape())
+            ? PROFILER_LAYER_STOP
+            : -1;
+    }
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1497,9 +1635,7 @@ struct cmd_params_instance {
         mparams.use_direct_io = use_direct_io;
         mparams.use_synthetic_weights = use_synthetic_weights;
         mparams.no_host       = no_host;
-        mparams.synthetic_alloc_layer_stop = estimate_prompt && use_synthetic_weights
-            ? PROFILER_LAYER_STOP
-            : -1;
+        mparams.synthetic_alloc_layer_stop = synthetic_alloc_layer_stop();
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1546,6 +1682,7 @@ struct cmd_params_instance {
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
              use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
              use_synthetic_weights == other.use_synthetic_weights &&
+               synthetic_alloc_layer_stop() == other.synthetic_alloc_layer_stop() &&
                devices == other.devices &&
                no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
@@ -1597,7 +1734,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
-    for (const auto & estp : params.estimate_prompt)
+    for (const auto & est : params.estimate_layers)
     for (const auto & pl : params.poll) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
@@ -1631,7 +1768,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
-                /* .estimate_prompt = */ estp,
+                /* .estimate_layers = */ est,
+                /* .estimate_decode_tokens = */ 0,
                 /* .profile_layers = */ params.profile_layers,
                 /* .profile_layer_start = */ params.profile_layer_start,
                 /* .profile_layer_stop = */ params.profile_layer_stop,
@@ -1643,40 +1781,43 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             if (n_gen == 0) {
                 continue;
             }
-            cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ 0,
-                /* .n_gen        = */ n_gen,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
-                /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .use_synthetic_weights = */ params.use_synthetic_weights,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .estimate_prompt = */ estp,
-                /* .profile_layers = */ params.profile_layers,
-                /* .profile_layer_start = */ params.profile_layer_start,
-                /* .profile_layer_stop = */ params.profile_layer_stop,
-            };
-            instances.push_back(instance);
+            for (const auto & edt : params.estimate_decode_tokens) {
+                cmd_params_instance instance = {
+                    /* .model        = */ m,
+                    /* .n_prompt     = */ 0,
+                    /* .n_gen        = */ n_gen,
+                    /* .n_depth      = */ nd,
+                    /* .n_batch      = */ nb,
+                    /* .n_ubatch     = */ nub,
+                    /* .type_k       = */ tk,
+                    /* .type_v       = */ tv,
+                    /* .n_threads    = */ nt,
+                    /* .cpu_mask     = */ cm,
+                    /* .cpu_strict   = */ cs,
+                    /* .poll         = */ pl,
+                    /* .n_gpu_layers = */ nl,
+                    /* .n_cpu_moe    = */ ncmoe,
+                    /* .split_mode   = */ sm,
+                    /* .main_gpu     = */ mg,
+                    /* .no_kv_offload= */ nkvo,
+                    /* .flash_attn   = */ fa,
+                    /* .devices      = */ devs,
+                    /* .tensor_split = */ ts,
+                    /* .tensor_buft_overrides = */ ot,
+                    /* .use_mmap     = */ mmp,
+                    /* .use_direct_io= */ dio,
+                    /* .use_synthetic_weights = */ params.use_synthetic_weights,
+                    /* .embeddings   = */ embd,
+                    /* .no_op_offload= */ nopo,
+                    /* .no_host      = */ noh,
+                    /* .estimate_layers = */ est,
+                    /* .estimate_decode_tokens = */ edt,
+                    /* .profile_layers = */ params.profile_layers,
+                    /* .profile_layer_start = */ params.profile_layer_start,
+                    /* .profile_layer_stop = */ params.profile_layer_stop,
+                };
+                instances.push_back(instance);
+            }
         }
 
         for (const auto & n_pg : params.n_pg) {
@@ -1711,7 +1852,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
-                /* .estimate_prompt = */ estp,
+                /* .estimate_layers = */ est,
+                /* .estimate_decode_tokens = */ 0,
                 /* .profile_layers = */ params.profile_layers,
                 /* .profile_layer_start = */ params.profile_layer_start,
                 /* .profile_layer_stop = */ params.profile_layer_stop,
@@ -1759,6 +1901,7 @@ struct test {
     int                      n_gen;
     int                      n_depth;
     bool                     estimated;
+    int                      estimate_decode_tokens;
     int                      model_n_layer;
     int                      estimate_layer_start;
     int                      estimate_layer_stop;
@@ -1802,7 +1945,8 @@ struct test {
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
-        estimated      = inst.estimate_prompt;
+        estimated      = inst.estimate_layers;
+        estimate_decode_tokens = inst.estimate_decode_tokens;
         model_n_layer  = llama_model_n_layer(lmodel);
         estimate_layer_start = PROFILER_LAYER_START;
         estimate_layer_stop  = PROFILER_LAYER_STOP;
@@ -2441,8 +2585,12 @@ struct markdown_printer : public printer {
                 }
                 if (t.estimated) {
                     int len = strlen(buf);
-                    snprintf(buf + len, sizeof(buf) - len, " e[%d,%d)/%d",
-                             t.estimate_layer_start, t.estimate_layer_stop, t.model_n_layer);
+                    if (t.estimate_decode_tokens > 0) {
+                        snprintf(buf + len, sizeof(buf) - len, " e[tg%d]", t.estimate_decode_tokens);
+                    } else {
+                        snprintf(buf + len, sizeof(buf) - len, " e[%d,%d)/%d",
+                                 t.estimate_layer_start, t.estimate_layer_stop, t.model_n_layer);
+                    }
                 }
                 value = buf;
             } else if (field == "cycles") {
@@ -2584,24 +2732,71 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
+static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_data * layer_dbg = nullptr, bool use_estimate = false, bool sample_layers = false) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+
+    if (use_estimate) {
+        if (!layer_estimation_is_configured(layer_dbg)) {
+            fprintf(stderr, "%s: decode estimate mode is not configured for this model/layer window\n", __func__);
+            return false;
+        }
+        layer_debug_prepare_estimate(layer_dbg);
+    }
+    if (sample_layers) {
+        if (!layer_estimation_is_configured(layer_dbg)) {
+            fprintf(stderr, "%s: decode layer sample mode is not configured for this model/layer window\n", __func__);
+            return false;
+        }
+        layer_debug_prepare_sample(layer_dbg);
+    }
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    const int n_decode = use_estimate ? 1 : n_gen;
 
-    for (int i = 0; i < n_gen; i++) {
+    for (int i = 0; i < n_decode; i++) {
         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
         if (res != 0) {
+            if (use_estimate && res == 2) {
+                break;
+            }
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
+            if (use_estimate) {
+                layer_debug_finish_estimate(layer_dbg);
+            }
+            if (sample_layers) {
+                layer_debug_finish_sample(layer_dbg);
+            }
             return false;
         }
         llama_synchronize(ctx);
         token = std::rand() % n_vocab;
     }
+
+    llama_synchronize(ctx);
+
+    if (use_estimate) {
+        const bool ok = layer_debug_get_estimate(layer_dbg, nullptr, nullptr, nullptr);
+        layer_debug_finish_estimate(layer_dbg);
+        if (!ok) {
+            fprintf(stderr, "%s: failed to capture decode estimate from l_out layers [%d,%d)\n",
+                    __func__, layer_dbg->estimate_layer_start, layer_dbg->estimate_layer_stop);
+            return false;
+        }
+    }
+    if (sample_layers) {
+        const bool ok = layer_debug_get_sample(layer_dbg, nullptr, nullptr, nullptr, nullptr);
+        layer_debug_finish_sample(layer_dbg);
+        if (!ok) {
+            fprintf(stderr, "%s: failed to capture decode sample from l_out layers [%d,%d)\n",
+                    __func__, layer_dbg->estimate_layer_start, layer_dbg->estimate_layer_stop);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -2724,11 +2919,18 @@ int main(int argc, char ** argv) {
         layer_dbg.model_n_layer = llama_model_n_layer(lmodel);
 
         llama_context_params cparams = inst.to_llama_cparams();
-        if (inst.estimate_prompt || print_layer01_debug || inst.profile_layers) {
+        const bool prompt_estimate_requested_for_shape = inst.prompt_estimate_requested_for_shape();
+        const bool decode_token_estimate_enabled = inst.decode_token_estimate_requested_for_shape();
+        const bool decode_token_layer_sample_enabled = decode_token_estimate_enabled && inst.estimate_layers;
+        const bool decode_layer_estimate_requested_for_shape = inst.decode_layer_estimate_requested_for_shape();
+        const bool layer_estimate_requested_for_shape = prompt_estimate_requested_for_shape ||
+                                                       decode_layer_estimate_requested_for_shape;
+        const bool layer_callback_requested = layer_estimate_requested_for_shape || decode_token_layer_sample_enabled;
+        if (layer_callback_requested || print_layer01_debug || inst.profile_layers) {
             cparams.cb_eval = llama_bench_layer01_cb;
             cparams.cb_eval_user_data = &layer_dbg;
         }
-        if (inst.estimate_prompt) {
+        if (layer_estimate_requested_for_shape) {
             cparams.abort_callback = llama_bench_abort_cb;
             cparams.abort_callback_data = &layer_dbg;
         }
@@ -2741,16 +2943,16 @@ int main(int argc, char ** argv) {
         }
 
         test t(inst, lmodel, ctx);
-        const bool prompt_estimate_enabled = inst.estimate_prompt &&
-                             t.n_prompt > 0 &&
-                             t.n_gen == 0 &&
-                             t.n_prompt <= t.n_batch &&
+        const bool prompt_estimate_enabled = prompt_estimate_requested_for_shape &&
                              layer_estimation_is_configured(&layer_dbg);
-        t.estimated = prompt_estimate_enabled;
+        const bool decode_layer_estimate_enabled = decode_layer_estimate_requested_for_shape &&
+                             layer_estimation_is_configured(&layer_dbg);
+        t.estimated = prompt_estimate_enabled || decode_layer_estimate_enabled || decode_token_estimate_enabled;
+        t.estimate_decode_tokens = decode_token_estimate_enabled ? inst.estimate_decode_tokens : 0;
 
-        if (inst.estimate_prompt && !prompt_estimate_enabled && (params.verbose || params.progress)) {
+        if (inst.estimate_layers && !prompt_estimate_enabled && !decode_layer_estimate_enabled && !decode_token_estimate_enabled && (params.verbose || params.progress)) {
             fprintf(stderr,
-                "llama-bench: prompt estimate mode disabled for this test (requires n_gen=0, n_prompt<=n_batch, and l_out layers [%d,%d) within model depth %d)\n",
+                "llama-bench: layer estimate mode disabled for this test (requires prompt-only with n_prompt<=n_batch or generation-only, and l_out layers [%d,%d) within model depth %d)\n",
                 layer_dbg.estimate_layer_start, layer_dbg.estimate_layer_stop, layer_dbg.model_n_layer);
         }
 
@@ -2801,7 +3003,7 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads);
+                bool res = test_gen(ctx, 1, t.n_threads, &layer_dbg, decode_layer_estimate_enabled, false);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
@@ -2854,7 +3056,7 @@ int main(int argc, char ** argv) {
             uint64_t t_start_ns = get_time_ns();
             uint64_t t_start_cycles = read_cycle();
             uint64_t t_start_instret = read_instret();
-            bool used_prompt_estimate = false;
+            bool used_estimate = false;
             uint64_t estimated_cycles = 0;
             uint64_t estimated_instret = 0;
 
@@ -2882,7 +3084,7 @@ int main(int argc, char ** argv) {
                     t.samples_ns.push_back(estimated_ns);
                     t.samples_cycles.push_back(estimated_cycles);
                     t.samples_insts.push_back(estimated_instret);
-                    used_prompt_estimate = true;
+                    used_estimate = true;
                 }
             }
             if (t.n_gen > 0) {
@@ -2890,17 +3092,79 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                const int n_gen_run = decode_token_estimate_enabled ? t.estimate_decode_tokens : t.n_gen;
+                bool res = test_gen(ctx, n_gen_run, t.n_threads, &layer_dbg,
+                                    decode_layer_estimate_enabled, decode_token_layer_sample_enabled);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
                     llama_model_free(lmodel);
                     exit(1);
                 }
+
+                if (decode_layer_estimate_enabled) {
+                    uint64_t estimated_ns = 0;
+                    if (!layer_debug_get_estimate(&layer_dbg, &estimated_ns, &estimated_cycles, &estimated_instret)) {
+                        fprintf(stderr, "%s: error: failed to read decode estimate\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        exit(1);
+                    }
+                    t.samples_ns.push_back(estimated_ns * (uint64_t) t.n_gen);
+                    t.samples_cycles.push_back(estimated_cycles * (uint64_t) t.n_gen);
+                    t.samples_insts.push_back(estimated_instret * (uint64_t) t.n_gen);
+                    used_estimate = true;
+                } else if (decode_token_estimate_enabled) {
+                    uint64_t sample_cycles = 0;
+                    uint64_t sample_instret = 0;
+                    const uint64_t sample_end_cycles = read_cycle();
+                    const uint64_t sample_end_instret = read_instret();
+                    if (sample_end_cycles >= t_start_cycles) {
+                        sample_cycles = sample_end_cycles - t_start_cycles;
+                    }
+                    if (sample_end_instret >= t_start_instret) {
+                        sample_instret = sample_end_instret - t_start_instret;
+                    }
+                    uint64_t sample_ns = get_time_ns() - t_start_ns;
+                    if (sample_cycles > 0) {
+                        sample_ns = cycles_to_ns(sample_cycles);
+                    }
+
+                    t.samples_ns.push_back((uint64_t) llround((double) sample_ns * t.n_gen / n_gen_run));
+                    t.samples_cycles.push_back((uint64_t) llround((double) sample_cycles * t.n_gen / n_gen_run));
+                    t.samples_insts.push_back((uint64_t) llround((double) sample_instret * t.n_gen / n_gen_run));
+                    used_estimate = true;
+
+                    if (decode_token_layer_sample_enabled && params.verbose) {
+                        uint64_t layer_sample_ns = 0;
+                        uint64_t layer_sample_cycles = 0;
+                        uint64_t layer_sample_instret = 0;
+                        int layer_sample_count = 0;
+                        if (!layer_debug_get_sample(&layer_dbg, &layer_sample_ns, &layer_sample_cycles, &layer_sample_instret, &layer_sample_count)) {
+                            fprintf(stderr, "%s: error: failed to read decode layer sample\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(lmodel);
+                            exit(1);
+                        }
+
+                        const int measured_layers = layer_dbg.estimate_layer_stop - layer_dbg.estimate_layer_start;
+                        const uint64_t layer_scaled_sample_ns = (uint64_t) llround((double) layer_sample_ns * t.model_n_layer / measured_layers);
+                        const uint64_t layer_scaled_token_ns = layer_scaled_sample_ns / (uint64_t) layer_sample_count;
+                        const uint64_t full_token_ns = sample_ns / (uint64_t) n_gen_run;
+                        const uint64_t tail_token_ns = full_token_ns > layer_scaled_token_ns ? full_token_ns - layer_scaled_token_ns : 0;
+                        const double layer_ratio = sample_ns > 0 ? (double) layer_scaled_sample_ns / (double) sample_ns : 0.0;
+                        fprintf(stderr,
+                                "llama-bench: sampled decode l_out layers [%d,%d) over %d/%d tokens: avg_layer_ns=%" PRIu64 ", layer_scaled_token_ns=%" PRIu64 ", tail_token_ns=%" PRIu64 ", full_token_ns=%" PRIu64 ", layer_ratio=%.3f\n",
+                                layer_dbg.estimate_layer_start, layer_dbg.estimate_layer_stop,
+                                layer_sample_count, n_gen_run,
+                                layer_sample_ns / (uint64_t) layer_sample_count,
+                                layer_scaled_token_ns, tail_token_ns, full_token_ns, layer_ratio);
+                    }
+                }
             }
 
             uint64_t t_ns = get_time_ns() - t_start_ns;
-            if (!used_prompt_estimate) {
+            if (!used_estimate) {
                 uint64_t t_cycles = 0;
                 uint64_t t_instret = 0;
                 const uint64_t t_end_cycles = read_cycle();
@@ -2930,9 +3194,14 @@ int main(int argc, char ** argv) {
             fflush(p_err->fout);
         }
 
-        if (t.estimated && params.verbose && !t.samples_cycles.empty()) {
+        if (decode_token_estimate_enabled && params.verbose && !t.samples_ns.empty()) {
             fprintf(stderr,
-                    "llama-bench: estimated prompt throughput from l_out layers [%d,%d) over %d model layers: avg_cycles=%" PRIu64 " ± %" PRIu64 ", avg_ipc=%.3f ± %.3f\n",
+                    "llama-bench: estimated decode throughput from full tg%d sample: avg_ns=%" PRIu64 " ± %" PRIu64 "\n",
+                    t.estimate_decode_tokens, t.avg_ns(), t.stdev_ns());
+        } else if (t.estimated && params.verbose && !t.samples_cycles.empty()) {
+            fprintf(stderr,
+                    "llama-bench: estimated %s throughput from l_out layers [%d,%d) over %d model layers: avg_cycles=%" PRIu64 " ± %" PRIu64 ", avg_ipc=%.3f ± %.3f\n",
+                    decode_layer_estimate_enabled ? "decode" : "prompt",
                     t.estimate_layer_start, t.estimate_layer_stop, t.model_n_layer, t.avg_cycles(), t.stdev_cycles(), t.avg_ipc(), t.stdev_ipc());
         }
 
