@@ -169,8 +169,17 @@ void *xsai_malloc(size_t size) {
     if (pool_base == NULL) {
         if (pool_init() != 0) {
             pthread_mutex_unlock(&pool_lock);
-            return NULL;
+            fprintf(stderr, "[xsai_alloc] fatal: failed to initialize allocator pool; aborting\n");
+            fflush(stderr);
+            abort();
         }
+    }
+
+    if (size > (size_t)-1 - ALLOC_HDR_SIZE) {
+        pthread_mutex_unlock(&pool_lock);
+        fprintf(stderr, "[xsai_alloc] fatal: allocation size overflow (requested %zu bytes); aborting\n", size);
+        fflush(stderr);
+        abort();
     }
 
     /* Reserve space for the alloc header and align. */
@@ -211,10 +220,12 @@ void *xsai_malloc(size_t size) {
         cur  = cur->next;
     }
 
-    fprintf(stderr, "[xsai_alloc] out of memory (requested %zu bytes, active=%zu, used=%zu MiB)\n",
-            size, xsai_alloc_count, xsai_alloc_bytes >> 20);
+    fprintf(stderr,
+            "[xsai_alloc] fatal: out of memory (requested %zu bytes, need=%zu bytes, active=%zu, used=%zu MiB, capacity=%zu MiB); aborting\n",
+            size, need, xsai_alloc_count, xsai_alloc_bytes >> 20, pool_size >> 20);
     pthread_mutex_unlock(&pool_lock);
-    return NULL;
+    fflush(stderr);
+    abort();
 }
 
 void xsai_free(void *ptr) {
