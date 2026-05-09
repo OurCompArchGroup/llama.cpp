@@ -120,6 +120,15 @@ struct layer_debug_data {
     uint64_t                        estimate_total_ns = 0;
     uint64_t                        estimate_total_cycles = 0;
     uint64_t                        estimate_total_instret = 0;
+    std::atomic<bool>               sample_active = false;
+    bool                            sample_started = false;
+    uint64_t                        sample_start_ns = 0;
+    uint64_t                        sample_start_cycle = 0;
+    uint64_t                        sample_start_instret = 0;
+    uint64_t                        sample_window_ns = 0;
+    uint64_t                        sample_window_cycles = 0;
+    uint64_t                        sample_window_instret = 0;
+    int                             sample_count = 0;
 };
 
 static bool layer_estimation_is_configured(const layer_debug_data * data) {
@@ -156,6 +165,57 @@ static void layer_debug_finish_estimate(layer_debug_data * data) {
 
     data->estimate_active.store(false, std::memory_order_relaxed);
     data->abort_requested.store(false, std::memory_order_relaxed);
+}
+
+static void layer_debug_prepare_sample(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    data->sample_started = false;
+    data->sample_start_ns = 0;
+    data->sample_start_cycle = 0;
+    data->sample_start_instret = 0;
+    data->sample_window_ns = 0;
+    data->sample_window_cycles = 0;
+    data->sample_window_instret = 0;
+    data->sample_count = 0;
+    data->sample_active.store(true, std::memory_order_relaxed);
+}
+
+static void layer_debug_finish_sample(layer_debug_data * data) {
+    if (data == nullptr) {
+        return;
+    }
+
+    data->sample_active.store(false, std::memory_order_relaxed);
+}
+
+static bool layer_debug_get_sample(layer_debug_data * data, uint64_t * sample_ns, uint64_t * sample_cycles, uint64_t * sample_instret, int * sample_count) {
+    if (data == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(data->lock);
+    if (data->sample_count <= 0) {
+        return false;
+    }
+
+    if (sample_ns != nullptr) {
+        *sample_ns = data->sample_window_ns;
+    }
+    if (sample_cycles != nullptr) {
+        *sample_cycles = data->sample_window_cycles;
+    }
+    if (sample_instret != nullptr) {
+        *sample_instret = data->sample_window_instret;
+    }
+    if (sample_count != nullptr) {
+        *sample_count = data->sample_count;
+    }
+
+    return true;
 }
 
 static bool layer_debug_get_estimate(layer_debug_data * data, uint64_t * estimated_ns, uint64_t * estimated_cycles, uint64_t * estimated_instret) {
@@ -235,10 +295,14 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
     const bool estimate_active = data != nullptr &&
                                  data->estimate_active.load(std::memory_order_relaxed) &&
                                  layer_estimation_is_configured(data);
+    const bool sample_active = data != nullptr &&
+                               data->sample_active.load(std::memory_order_relaxed) &&
+                               layer_estimation_is_configured(data);
     const bool profile_active = data != nullptr && data->profile_layers;
 
     if (ask) {
-        if (estimate_active && (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
+        if ((estimate_active || sample_active) &&
+                (l_out_layer == data->estimate_layer_start || l_out_layer == data->estimate_layer_stop)) {
             return true;
         }
         if (profile_active && (layer == data->profile_layer_start || layer == data->profile_layer_stop)) {
@@ -296,6 +360,36 @@ static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user
                 data->estimate_valid = true;
                 data->abort_requested.store(true, std::memory_order_relaxed);
                 should_abort_estimate = true;
+            }
+        }
+    }
+
+    if (sample_active) {
+        if (l_out_layer == data->estimate_layer_start) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (!data->sample_started) {
+                data->sample_started = true;
+                data->sample_start_ns = get_time_ns();
+                data->sample_start_cycle = read_cycle();
+                data->sample_start_instret = read_instret();
+            }
+        } else if (l_out_layer == data->estimate_layer_stop) {
+            std::lock_guard<std::mutex> guard(data->lock);
+            if (data->sample_started) {
+                const uint64_t end_ns = get_time_ns();
+                const uint64_t end_cycle = read_cycle();
+                const uint64_t end_instret = read_instret();
+                uint64_t window_cycles = end_cycle - data->sample_start_cycle;
+                uint64_t window_ns = end_ns - data->sample_start_ns;
+                if (window_cycles > 0) {
+                    window_ns = cycles_to_ns(window_cycles);
+                }
+
+                data->sample_window_ns += window_ns;
+                data->sample_window_cycles += window_cycles;
+                data->sample_window_instret += end_instret - data->sample_start_instret;
+                data->sample_count++;
+                data->sample_started = false;
             }
         }
     }
@@ -2638,7 +2732,7 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
-static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_data * layer_dbg = nullptr, bool use_estimate = false) {
+static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_data * layer_dbg = nullptr, bool use_estimate = false, bool sample_layers = false) {
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     if (use_estimate) {
@@ -2647,6 +2741,13 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_
             return false;
         }
         layer_debug_prepare_estimate(layer_dbg);
+    }
+    if (sample_layers) {
+        if (!layer_estimation_is_configured(layer_dbg)) {
+            fprintf(stderr, "%s: decode layer sample mode is not configured for this model/layer window\n", __func__);
+            return false;
+        }
+        layer_debug_prepare_sample(layer_dbg);
     }
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2666,6 +2767,9 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_
             if (use_estimate) {
                 layer_debug_finish_estimate(layer_dbg);
             }
+            if (sample_layers) {
+                layer_debug_finish_sample(layer_dbg);
+            }
             return false;
         }
         llama_synchronize(ctx);
@@ -2679,6 +2783,15 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_
         layer_debug_finish_estimate(layer_dbg);
         if (!ok) {
             fprintf(stderr, "%s: failed to capture decode estimate from l_out layers [%d,%d)\n",
+                    __func__, layer_dbg->estimate_layer_start, layer_dbg->estimate_layer_stop);
+            return false;
+        }
+    }
+    if (sample_layers) {
+        const bool ok = layer_debug_get_sample(layer_dbg, nullptr, nullptr, nullptr, nullptr);
+        layer_debug_finish_sample(layer_dbg);
+        if (!ok) {
+            fprintf(stderr, "%s: failed to capture decode sample from l_out layers [%d,%d)\n",
                     __func__, layer_dbg->estimate_layer_start, layer_dbg->estimate_layer_stop);
             return false;
         }
@@ -2808,10 +2921,12 @@ int main(int argc, char ** argv) {
         llama_context_params cparams = inst.to_llama_cparams();
         const bool prompt_estimate_requested_for_shape = inst.prompt_estimate_requested_for_shape();
         const bool decode_token_estimate_enabled = inst.decode_token_estimate_requested_for_shape();
+        const bool decode_token_layer_sample_enabled = decode_token_estimate_enabled && inst.estimate_layers;
         const bool decode_layer_estimate_requested_for_shape = inst.decode_layer_estimate_requested_for_shape();
         const bool layer_estimate_requested_for_shape = prompt_estimate_requested_for_shape ||
                                                        decode_layer_estimate_requested_for_shape;
-        if (layer_estimate_requested_for_shape || print_layer01_debug || inst.profile_layers) {
+        const bool layer_callback_requested = layer_estimate_requested_for_shape || decode_token_layer_sample_enabled;
+        if (layer_callback_requested || print_layer01_debug || inst.profile_layers) {
             cparams.cb_eval = llama_bench_layer01_cb;
             cparams.cb_eval_user_data = &layer_dbg;
         }
@@ -2888,7 +3003,7 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
                 }
-                bool res = test_gen(ctx, 1, t.n_threads, &layer_dbg, decode_layer_estimate_enabled);
+                bool res = test_gen(ctx, 1, t.n_threads, &layer_dbg, decode_layer_estimate_enabled, false);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                     llama_free(ctx);
@@ -2978,7 +3093,8 @@ int main(int argc, char ** argv) {
                             i + 1, params.reps);
                 }
                 const int n_gen_run = decode_token_estimate_enabled ? t.estimate_decode_tokens : t.n_gen;
-                bool res = test_gen(ctx, n_gen_run, t.n_threads, &layer_dbg, decode_layer_estimate_enabled);
+                bool res = test_gen(ctx, n_gen_run, t.n_threads, &layer_dbg,
+                                    decode_layer_estimate_enabled, decode_token_layer_sample_enabled);
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                     llama_free(ctx);
@@ -3018,6 +3134,32 @@ int main(int argc, char ** argv) {
                     t.samples_cycles.push_back((uint64_t) llround((double) sample_cycles * t.n_gen / n_gen_run));
                     t.samples_insts.push_back((uint64_t) llround((double) sample_instret * t.n_gen / n_gen_run));
                     used_estimate = true;
+
+                    if (decode_token_layer_sample_enabled && params.verbose) {
+                        uint64_t layer_sample_ns = 0;
+                        uint64_t layer_sample_cycles = 0;
+                        uint64_t layer_sample_instret = 0;
+                        int layer_sample_count = 0;
+                        if (!layer_debug_get_sample(&layer_dbg, &layer_sample_ns, &layer_sample_cycles, &layer_sample_instret, &layer_sample_count)) {
+                            fprintf(stderr, "%s: error: failed to read decode layer sample\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(lmodel);
+                            exit(1);
+                        }
+
+                        const int measured_layers = layer_dbg.estimate_layer_stop - layer_dbg.estimate_layer_start;
+                        const uint64_t layer_scaled_sample_ns = (uint64_t) llround((double) layer_sample_ns * t.model_n_layer / measured_layers);
+                        const uint64_t layer_scaled_token_ns = layer_scaled_sample_ns / (uint64_t) layer_sample_count;
+                        const uint64_t full_token_ns = sample_ns / (uint64_t) n_gen_run;
+                        const uint64_t tail_token_ns = full_token_ns > layer_scaled_token_ns ? full_token_ns - layer_scaled_token_ns : 0;
+                        const double layer_ratio = sample_ns > 0 ? (double) layer_scaled_sample_ns / (double) sample_ns : 0.0;
+                        fprintf(stderr,
+                                "llama-bench: sampled decode l_out layers [%d,%d) over %d/%d tokens: avg_layer_ns=%" PRIu64 ", layer_scaled_token_ns=%" PRIu64 ", tail_token_ns=%" PRIu64 ", full_token_ns=%" PRIu64 ", layer_ratio=%.3f\n",
+                                layer_dbg.estimate_layer_start, layer_dbg.estimate_layer_stop,
+                                layer_sample_count, n_gen_run,
+                                layer_sample_ns / (uint64_t) layer_sample_count,
+                                layer_scaled_token_ns, tail_token_ns, full_token_ns, layer_ratio);
+                    }
                 }
             }
 
