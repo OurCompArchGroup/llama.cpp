@@ -596,9 +596,7 @@ void ggml_ame_mul_mat_q8_0(
 
                 // Prepare Tile B (16 x 32)
                  prof_t0 = prof ? ame_read_cycle() : 0;
-                 if (jmax < AME_TILE_N) {
-                     memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-                 }
+                 memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
                  for (int j = 0; j < jmax; j++) {
                      const float * src1_col = (const float *)((const char *)src1 + (j0 + j) * src1_stride);
                      block_q8_0 tmp_block;
@@ -607,6 +605,10 @@ void ggml_ame_mul_mat_q8_0(
                      memcpy(&tile_b[j * AME_TILE_K], tmp_block.qs, qk);
                  }
                 if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
+
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
@@ -785,15 +787,17 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                if (jmax < AME_TILE_N) {
-                    memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-                }
+                memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
                 for (int j = 0; j < jmax; ++j) {
                     const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
                     y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
                     memcpy(&tile_b[j * AME_TILE_K], bx->qs, AME_Q8_PACK_K);
                 }
                 if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
+
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
