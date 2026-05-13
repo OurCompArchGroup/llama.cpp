@@ -657,7 +657,6 @@ void ggml_ame_mul_mat_q8_0(
 
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
-    const float * src0_scales,
     const void * src1_key,
     const void * src1,
     void * dst,
@@ -686,7 +685,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
     }
 
     const block_q8_ame64 * restrict x = (const block_q8_ame64 *) src0;
-    const float * restrict x_scales_q64 = src0_scales;
     float * restrict out = (float *) dst;
 
     const size_t required_wsize = ggml_ame_q8_workspace_size(N, nb64);
@@ -810,7 +808,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 for (int i = 0; i < imax; ++i) {
                     const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                    const float d_x = x_scales_q64 != NULL ? x_scales_q64[(i0 + i) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
+                    const float d_x = GGML_FP16_TO_FP32(bx->d);
                     ame_accumulate_scaled_row(
                         &acc_f32[i * AME_TILE_N],
                         &tile_c[i * AME_TILE_N],

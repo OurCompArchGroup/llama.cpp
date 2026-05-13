@@ -147,8 +147,6 @@ static bool ame_use_packed_q8() {
 struct ame_packed_q8_info {
     void * data = nullptr;
     size_t size = 0;
-    float * scales = nullptr;
-    size_t scales_count = 0;
 };
 
 struct ame_buffer_context {
@@ -260,22 +258,6 @@ static const block_q8_ame64 * ame_get_packed_q8_weight(const ggml_tensor * tenso
     return static_cast<const block_q8_ame64 *>(it->second.data);
 }
 
-static const float * ame_get_packed_q8_weight_scales(const ggml_tensor * tensor) {
-    if (!ame_use_packed_q8()) {
-        return nullptr;
-    }
-    if (tensor->buffer == nullptr || tensor->buffer->context == nullptr) {
-        return nullptr;
-    }
-
-    ame_buffer_context * ctx = ame_buffer_ctx(tensor->buffer);
-    const auto it = ctx->packed_q8.find(tensor);
-    if (it == ctx->packed_q8.end()) {
-        return nullptr;
-    }
-    return it->second.scales;
-}
-
 static void ame_store_packed_q8_weight(
     ggml_backend_buffer_t buffer,
     const ggml_tensor * tensor,
@@ -284,7 +266,6 @@ static void ame_store_packed_q8_weight(
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
     auto & entry = ctx->packed_q8[tensor];
     const size_t packed_size = ggml_ame_packed_q8_64_size(tensor);
-    const size_t scales_count = packed_size / sizeof(block_q8_ame64);
 
     if (entry.data == nullptr || entry.size != packed_size) {
         if (entry.data != nullptr) {
@@ -293,22 +274,9 @@ static void ame_store_packed_q8_weight(
         entry.data = ggml_aligned_malloc(packed_size);
         entry.size = packed_size;
     }
-    if (entry.scales == nullptr || entry.scales_count != scales_count) {
-        if (entry.scales != nullptr) {
-            ggml_aligned_free(entry.scales, entry.scales_count * sizeof(float));
-        }
-        entry.scales = static_cast<float *>(ggml_aligned_malloc(scales_count * sizeof(float)));
-        entry.scales_count = scales_count;
-    }
 
     if (entry.data != nullptr) {
         ggml_ame_repack_q8_0_to_ame64(entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
-        if (entry.scales != nullptr) {
-            const block_q8_ame64 * packed = static_cast<const block_q8_ame64 *>(entry.data);
-            for (size_t i = 0; i < scales_count; ++i) {
-                entry.scales[i] = GGML_FP16_TO_FP32(packed[i].d);
-            }
-        }
     }
 }
 
@@ -368,11 +336,9 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
 
     const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0);
     if (packed_w != nullptr) {
-        const float * packed_w_scales = ame_get_packed_q8_weight_scales(src0);
         AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel");
         ggml_ame_mul_mat_q8_0_ame64(
             packed_w,
-            packed_w_scales,
             src1,
             src1->data,
             dst->data,
@@ -481,9 +447,6 @@ static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     for (auto & it : ctx->packed_q8) {
         if (it.second.data != nullptr) {
             ggml_aligned_free(it.second.data, it.second.size);
-        }
-        if (it.second.scales != nullptr) {
-            ggml_aligned_free(it.second.scales, it.second.scales_count * sizeof(float));
         }
     }
     if (ctx->base != nullptr) {
