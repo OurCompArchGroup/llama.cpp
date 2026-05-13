@@ -26,7 +26,7 @@ static void ame_assert_phys_contiguous(void) {
     static int checked = 0;
     if (checked) return;
     checked = 1;
-    if (!xsai_pool_phys_contiguous()) {
+    if (!xsai_pool_phys_contiguous() && !xsai_alloc_host_test_mode()) {
         fprintf(stderr,
             "[AME] FATAL: xsai memory pool is not physically contiguous.\n"
             "             CUTE AMU row-address formula: PA_row = PA_base + row*stride\n"
@@ -36,6 +36,11 @@ static void ame_assert_phys_contiguous(void) {
             "             Fix: boot kernel with hugepages=512, or define\n"
             "             RESERVED_PHYS_BASE_ADDR for /dev/mem-backed pool.\n");
         abort();
+    }
+    if (!xsai_pool_phys_contiguous()) {
+        fprintf(stderr,
+            "[AME] WARNING: allowing non-physical xsai allocator in explicit host-test mode.\n"
+            "              This is intended for qemu-user correctness tests only.\n");
     }
 #endif
 }

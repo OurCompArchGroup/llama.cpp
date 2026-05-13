@@ -11,6 +11,12 @@
  *   RESERVED_MEMORY_SIZE      - total pool size in bytes (default 1 GiB)
  *   RESERVED_PHYS_BASE_ADDR   - if defined, mmap /dev/mem at this physical
  *                               address instead of anonymous mmap
+ *
+ * Runtime override for host-side correctness tests:
+ *   XSAI_ALLOC_MODE=malloc    - use aligned malloc/free; no pool
+ *   XSAI_ALLOC_MODE=anon      - use anonymous mmap pool even when
+ *                               RESERVED_PHYS_BASE_ADDR is defined
+ *   XSAI_ALLOC_POOL_SIZE_MB   - optional anon-host-test pool size override
  */
 
 #include "xsai_alloc.h"
@@ -22,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 
 #ifndef RESERVED_MEMORY_SIZE
@@ -58,6 +65,8 @@ static free_block_t  *free_list  = NULL;   /* sorted by address */
  * RESERVED_PHYS_BASE_ADDR).  The AMU may then use "single-TLB-base + PA
  * offset" addressing: PA = TLB(pool_base) + (ptr - pool_base). */
 static int            pool_phys_contiguous = 0;
+static int            alloc_malloc_mode = 0;
+static int            alloc_host_test_mode = 0;
 
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -75,9 +84,82 @@ static size_t align_up(size_t v, size_t a) {
     return (v + a - 1) & ~(a - 1);
 }
 
+static int xsai_env_is_one_of(const char * value, const char * a, const char * b, const char * c) {
+    return value && (strcmp(value, a) == 0 || strcmp(value, b) == 0 || strcmp(value, c) == 0);
+}
+
+static void *xsai_alloc_aligned_block(size_t size, size_t *need_out) {
+    if (size > (size_t)-1 - ALLOC_HDR_SIZE) {
+        fprintf(stderr, "[xsai_alloc] fatal: allocation size overflow (requested %zu bytes); aborting\n", size);
+        fflush(stderr);
+        abort();
+    }
+
+    const size_t need = align_up(size + ALLOC_HDR_SIZE, ALIGN);
+    void *raw = NULL;
+    if (posix_memalign(&raw, ALIGN, need) != 0 || raw == NULL) {
+        fprintf(stderr, "[xsai_alloc] fatal: malloc failed (requested %zu bytes, need=%zu bytes); aborting\n",
+                size, need);
+        fflush(stderr);
+        abort();
+    }
+
+    alloc_header_t *hdr = (alloc_header_t *) raw;
+    hdr->size = need - ALLOC_HDR_SIZE;
+    if (need_out) {
+        *need_out = need;
+    }
+    return (char *) hdr + ALLOC_HDR_SIZE;
+}
+
+static size_t xsai_alloc_pool_size_from_env(size_t default_size) {
+    const char *value = getenv("XSAI_ALLOC_POOL_SIZE_MB");
+    if (value == NULL || value[0] == '\0') {
+        return default_size;
+    }
+
+    char *end = NULL;
+    const unsigned long long mib = strtoull(value, &end, 0);
+    if (end == value || mib == 0 || mib > ((unsigned long long) SIZE_MAX >> 20)) {
+        fprintf(stderr,
+                "[xsai_alloc] warning: ignoring invalid XSAI_ALLOC_POOL_SIZE_MB=%s\n",
+                value);
+        return default_size;
+    }
+
+    return (size_t) mib << 20;
+}
+
 /* Must be called with pool_lock held. */
 static int pool_init(void) {
     pool_size = (size_t)RESERVED_MEMORY_SIZE;
+    const char *mode = getenv("XSAI_ALLOC_MODE");
+
+    if (xsai_env_is_one_of(mode, "malloc", "libc", "host")) {
+        alloc_malloc_mode = 1;
+        alloc_host_test_mode = 1;
+        pool_phys_contiguous = 0;
+        fprintf(stderr, "[xsai_alloc] ACTIVE mode=malloc-host-test  size=%zu MiB\n", pool_size >> 20);
+        return 0;
+    }
+
+    if (xsai_env_is_one_of(mode, "anon", "anonymous", "qemu")) {
+        alloc_host_test_mode = 1;
+        pool_size = xsai_alloc_pool_size_from_env(512ULL << 20);
+        fprintf(stderr,
+                "[xsai_alloc] ACTIVE mode=anon-host-test  size=%zu MiB"
+                "  (non-physical, qemu-user only)\n",
+                pool_size >> 20);
+        pool_base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pool_base != MAP_FAILED) {
+            pool_phys_contiguous = 0;
+            goto init_pool_metadata;
+        }
+        fprintf(stderr, "[xsai_alloc] anon-host-test mmap failed\n");
+        pool_base = NULL;
+        return -1;
+    }
 
 #ifdef RESERVED_PHYS_BASE_ADDR
     /* Map a pre-reserved physically-contiguous region via /dev/mem.
@@ -150,6 +232,7 @@ static int pool_init(void) {
         return -1;
     }
 
+init_pool_metadata:
     /* Single free block covering the whole pool. */
     free_list        = (free_block_t *)pool_base;
     free_list->size  = pool_size - FREE_HDR_SIZE;
@@ -166,13 +249,26 @@ void *xsai_malloc(size_t size) {
 
     pthread_mutex_lock(&pool_lock);
 
-    if (pool_base == NULL) {
+    if (pool_base == NULL && !alloc_malloc_mode) {
         if (pool_init() != 0) {
             pthread_mutex_unlock(&pool_lock);
             fprintf(stderr, "[xsai_alloc] fatal: failed to initialize allocator pool; aborting\n");
             fflush(stderr);
             abort();
         }
+    }
+
+    if (alloc_malloc_mode) {
+        size_t need = 0;
+        void *ptr = xsai_alloc_aligned_block(size, &need);
+        xsai_alloc_count++;
+        xsai_alloc_total_count++;
+        xsai_alloc_bytes += need;
+        if (xsai_alloc_bytes > xsai_alloc_peak_bytes) {
+            xsai_alloc_peak_bytes = xsai_alloc_bytes;
+        }
+        pthread_mutex_unlock(&pool_lock);
+        return ptr;
     }
 
     if (size > (size_t)-1 - ALLOC_HDR_SIZE) {
@@ -232,6 +328,16 @@ void xsai_free(void *ptr) {
     if (!ptr) return;
 
     pthread_mutex_lock(&pool_lock);
+
+    if (alloc_malloc_mode) {
+        alloc_header_t *hdr = (alloc_header_t *)((char *)ptr - ALLOC_HDR_SIZE);
+        const size_t need = hdr->size + ALLOC_HDR_SIZE;
+        xsai_alloc_count--;
+        xsai_alloc_bytes -= need;
+        pthread_mutex_unlock(&pool_lock);
+        free(hdr);
+        return;
+    }
 
     if (!pool_base ||
         (uintptr_t)ptr < (uintptr_t)pool_base ||
@@ -303,9 +409,13 @@ int xsai_pool_phys_contiguous(void) {
     return pool_phys_contiguous;
 }
 
+int xsai_alloc_host_test_mode(void) {
+    return alloc_host_test_mode;
+}
+
 void xsai_alloc_print_stats(void) {
     pthread_mutex_lock(&pool_lock);
-    if (pool_base == NULL) {
+    if (pool_base == NULL && !alloc_malloc_mode) {
         pthread_mutex_unlock(&pool_lock);
         return; /* allocator was never activated */
     }
@@ -314,16 +424,18 @@ void xsai_alloc_print_stats(void) {
     size_t live_count = xsai_alloc_count;
     size_t total      = xsai_alloc_total_count;
     size_t peak       = xsai_alloc_peak_bytes;
-    size_t cap        = pool_size;
+    size_t cap        = alloc_malloc_mode ? peak : pool_size;
 
     /* Walk free list to compute fragmentation / free space. */
     size_t free_bytes  = 0;
     size_t free_blocks = 0;
-    free_block_t *cur  = free_list;
-    while (cur) {
-        free_bytes  += cur->size + FREE_HDR_SIZE;
-        free_blocks++;
-        cur = cur->next;
+    if (!alloc_malloc_mode) {
+        free_block_t *cur  = free_list;
+        while (cur) {
+            free_bytes  += cur->size + FREE_HDR_SIZE;
+            free_blocks++;
+            cur = cur->next;
+        }
     }
 
     pthread_mutex_unlock(&pool_lock);

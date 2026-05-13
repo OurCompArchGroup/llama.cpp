@@ -29,6 +29,11 @@ int   xsai_in_pool(const void *ptr);
  * which only holds when pool_phys_contiguous == 1. */
 int   xsai_pool_phys_contiguous(void);
 
+/* Returns 1 when XSAI_ALLOC_MODE selects a host-test allocator mode such as
+ * malloc or anon.  These modes are intended for qemu-user correctness tests,
+ * not for real FPGA AMU execution. */
+int   xsai_alloc_host_test_mode(void);
+
 /* Print a human-readable statistics summary to stderr.
  * Reports: pool capacity, total alloc calls, live allocations,
  * live bytes, peak usage, peak/capacity ratio, free blocks. */
