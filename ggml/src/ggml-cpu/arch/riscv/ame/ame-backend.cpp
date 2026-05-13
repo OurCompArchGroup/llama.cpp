@@ -12,7 +12,9 @@
 #include "traits.h"
 
 #include <cassert>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -150,12 +152,89 @@ struct ame_packed_q8_info {
 struct ame_buffer_context {
     void * base = nullptr;
     size_t base_size = 0;
+    uint64_t generation = 1;
     std::unordered_map<const ggml_tensor *, ame_packed_q8_info> packed_q8;
     std::vector<ggml_tensor *> tensors;
 };
 
 static inline ame_buffer_context * ame_buffer_ctx(ggml_backend_buffer_t buffer) {
     return static_cast<ame_buffer_context *>(buffer->context);
+}
+
+struct ame_host_tensor_generation {
+    ggml_backend_buffer_t buffer = nullptr;
+    uint64_t generation = 0;
+};
+
+struct ame_host_generation_state {
+    uint64_t next_generation = 1;
+    std::unordered_map<const ggml_tensor *, ame_host_tensor_generation> tensors;
+    std::unordered_map<ggml_backend_buffer_t, uint64_t> buffers;
+};
+
+static ame_host_generation_state & ame_host_generations() {
+    static ame_host_generation_state state;
+    return state;
+}
+
+extern "C" void ggml_ame_host_buffer_on_write(
+    ggml_backend_buffer_t buffer,
+    struct ggml_tensor * tensor,
+    size_t offset,
+    size_t size
+) {
+    GGML_UNUSED(offset);
+    if (buffer == nullptr || size == 0) {
+        return;
+    }
+
+    ame_host_generation_state & state = ame_host_generations();
+    const uint64_t generation = ++state.next_generation;
+    state.buffers[buffer] = generation;
+    if (tensor != nullptr) {
+        state.tensors[tensor] = { buffer, generation };
+    }
+}
+
+extern "C" void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+
+    ame_host_generation_state & state = ame_host_generations();
+    state.buffers.erase(buffer);
+    for (auto it = state.tensors.begin(); it != state.tensors.end(); ) {
+        if (it->second.buffer == buffer) {
+            it = state.tensors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static uint64_t ame_tensor_content_generation(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return 0;
+    }
+
+    if (tensor->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type() &&
+        tensor->buffer->context != nullptr) {
+        return ame_buffer_ctx(tensor->buffer)->generation;
+    }
+
+    ame_host_generation_state & state = ame_host_generations();
+    uint64_t generation = 0;
+    const auto bit = state.buffers.find(tensor->buffer);
+    if (bit != state.buffers.end()) {
+        generation = bit->second;
+    }
+
+    const auto tit = state.tensors.find(tensor);
+    if (tit != state.tensors.end() && tit->second.buffer == tensor->buffer) {
+        generation = std::max(generation, tit->second.generation);
+    }
+
+    return generation;
 }
 
 static size_t ggml_ame_packed_q8_64_size(const ggml_tensor * tensor) {
@@ -267,6 +346,8 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
             ne10, ne11,
             src1->nb[1],
             ggml_threadpool_graph_id(params->threadpool),
+            params->threadpool,
+            ame_tensor_content_generation(src1),
             params->wdata,
             params->wsize
         );
@@ -395,7 +476,9 @@ static void ggml_backend_ame_buffer_memset_tensor(
     size_t size
 ) {
     memset((char *)tensor->data + offset, value, size);
-    GGML_UNUSED(buffer);
+    if (size != 0) {
+        ame_buffer_ctx(buffer)->generation++;
+    }
 }
 
 static void ggml_backend_ame_buffer_set_tensor(
@@ -406,6 +489,9 @@ static void ggml_backend_ame_buffer_set_tensor(
     size_t size
 ) {
     memcpy((char *) tensor->data + offset, data, size);
+    if (size != 0) {
+        ame_buffer_ctx(buffer)->generation++;
+    }
     if (ame_use_packed_q8() && tensor->type == GGML_TYPE_Q8_0 && offset == 0 && size == ggml_nbytes(tensor)) {
         ame_store_packed_q8_weight(buffer, tensor, data);
     }
@@ -425,6 +511,9 @@ static void ggml_backend_ame_buffer_get_tensor(
 static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
     memset(ctx->base, value, buffer->size);
+    if (buffer->size != 0) {
+        ctx->generation++;
+    }
 
     if (value == 0) {
         const size_t repacked = ame_refresh_packed_q8_weights(buffer);

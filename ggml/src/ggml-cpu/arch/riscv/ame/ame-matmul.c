@@ -199,7 +199,9 @@ static inline void ggml_ame_quantize_block_f32_to_q8_64(const float * x, int val
 
 struct ame_x_q64_cache {
     const void * key;
+    const void * graph_key;
     int graph_id;
+    uint64_t generation;
     size_t stride;
     int64_t K;
     int64_t N;
@@ -208,6 +210,7 @@ struct ame_x_q64_cache {
 };
 
 static struct ame_x_q64_cache g_ame_x_q64_cache = {0};
+static uint64_t g_ame_x_q64_oneshot_generation = 1;
 
 static const block_q8_ame64 * ame_prepare_x_q64_cache(
     const void * src1_key,
@@ -215,9 +218,11 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
     int64_t K,
     int64_t N,
     size_t src1_stride,
-    int graph_id
+    int graph_id,
+    const void * graph_key,
+    uint64_t src1_generation
 ) {
-    if (graph_id <= 0) {
+    if (src1_generation == 0 && (graph_id <= 0 || graph_key == NULL)) {
         return NULL;
     }
 
@@ -225,7 +230,9 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
     const size_t blocks_count = (size_t) N * (size_t) nb64;
 
     if (g_ame_x_q64_cache.key == src1_key &&
+        g_ame_x_q64_cache.graph_key == graph_key &&
         g_ame_x_q64_cache.graph_id == graph_id &&
+        g_ame_x_q64_cache.generation == src1_generation &&
         g_ame_x_q64_cache.stride == src1_stride &&
         g_ame_x_q64_cache.K == K &&
         g_ame_x_q64_cache.N == N &&
@@ -257,7 +264,9 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
     }
 
     g_ame_x_q64_cache.key = src1_key;
+    g_ame_x_q64_cache.graph_key = graph_key;
     g_ame_x_q64_cache.graph_id = graph_id;
+    g_ame_x_q64_cache.generation = src1_generation;
     g_ame_x_q64_cache.stride = src1_stride;
     g_ame_x_q64_cache.K = K;
     g_ame_x_q64_cache.N = N;
@@ -399,6 +408,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne11,
     size_t src1_stride,
     int graph_id,
+    const void * graph_key,
+    uint64_t src1_generation,
     void * work_data,
     size_t work_size
 ) {
@@ -447,11 +458,27 @@ void ggml_ame_mul_mat_q8_0_ame64(
     memset(tile_a, 0, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
     memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
 
-    const block_q8_ame64 * xq = ame_prepare_x_q64_cache(src1_key, src1, K, N, src1_stride, graph_id);
+    const block_q8_ame64 * xq = ame_prepare_x_q64_cache(
+        src1_key,
+        src1,
+        K,
+        N,
+        src1_stride,
+        graph_id,
+        graph_key,
+        src1_generation);
     if (xq == NULL) {
         // no graph-local cache id available; fall back to one-shot quantization by using
         // a temporary cache entry keyed to this call only
-        xq = ame_prepare_x_q64_cache(src1, src1, K, N, src1_stride, 1);
+        xq = ame_prepare_x_q64_cache(
+            src1,
+            src1,
+            K,
+            N,
+            src1_stride,
+            1,
+            NULL,
+            ++g_ame_x_q64_oneshot_generation);
         if (xq == NULL) {
             if (allocated_workspace) {
                 ggml_aligned_free(workspace, work_size);
@@ -459,7 +486,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
             return;
         }
         g_ame_x_q64_cache.key = NULL;
+        g_ame_x_q64_cache.graph_key = NULL;
         g_ame_x_q64_cache.graph_id = 0;
+        g_ame_x_q64_cache.generation = 0;
     }
 
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {

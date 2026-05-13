@@ -326,6 +326,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne11,
     size_t src1_stride,
     int graph_id,
+    const void * graph_key,
+    uint64_t src1_generation,
     void * work_data,
     size_t work_size
 );

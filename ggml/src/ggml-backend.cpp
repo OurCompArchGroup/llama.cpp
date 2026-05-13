@@ -27,6 +27,12 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(__GNUC__)
+extern "C" {
+void ggml_ame_host_buffer_on_write(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset, size_t size) __attribute__((weak));
+void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) __attribute__((weak));
+}
+#endif
 
 // backend buffer type
 
@@ -2125,6 +2131,11 @@ static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+#if defined(__GNUC__)
+    if (ggml_ame_host_buffer_on_free) {
+        ggml_ame_host_buffer_on_free(buffer);
+    }
+#endif
     ggml_aligned_free(buffer->context, buffer->size);
 }
 
@@ -2132,14 +2143,26 @@ static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, 
     GGML_ASSERT(tensor);
     memset((char *)tensor->data + offset, value, size);
 
+#if defined(__GNUC__)
+    if (ggml_ame_host_buffer_on_write && size != 0) {
+        ggml_ame_host_buffer_on_write(buffer, tensor, offset, size);
+    }
+#else
     GGML_UNUSED(buffer);
+#endif
 }
 
 static void ggml_backend_cpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     memcpy((char *)tensor->data + offset, data, size);
 
+#if defined(__GNUC__)
+    if (ggml_ame_host_buffer_on_write && size != 0) {
+        ggml_ame_host_buffer_on_write(buffer, tensor, offset, size);
+    }
+#else
     GGML_UNUSED(buffer);
+#endif
 }
 
 static void ggml_backend_cpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2163,6 +2186,11 @@ static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     GGML_ASSERT(buffer);
     memset(buffer->context, value, buffer->size);
+#if defined(__GNUC__)
+    if (ggml_ame_host_buffer_on_write && buffer->size != 0) {
+        ggml_ame_host_buffer_on_write(buffer, nullptr, 0, buffer->size);
+    }
+#endif
 }
 
 static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_i = {
