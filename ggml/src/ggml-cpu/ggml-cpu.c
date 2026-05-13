@@ -38,6 +38,9 @@
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -75,6 +78,419 @@
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
+
+struct ggml_xsai_op_profile_bucket {
+    uint64_t calls;
+    uint64_t cycles;
+};
+
+struct ggml_xsai_op_profile_named_bucket {
+    enum ggml_op op;
+    char name[GGML_MAX_NAME];
+    uint64_t calls;
+    uint64_t cycles;
+    int64_t M;
+    int64_t N;
+    int64_t K;
+    enum ggml_type src0_type;
+    enum ggml_type src1_type;
+    enum ggml_type dst_type;
+    int has_shape;
+    int mixed_shape;
+    int mixed_type;
+    int ame_candidate;
+    int ame_non_candidate;
+};
+
+#define GGML_XSAI_PROFILE_MAX_NAMES   1024
+#define GGML_XSAI_PROFILE_MAX_MODULES 128
+
+static struct {
+    uint64_t graphs;
+    uint64_t nodes;
+    uint64_t cycles;
+    uint64_t name_overflow;
+    uint64_t module_overflow;
+    struct ggml_xsai_op_profile_bucket op[GGML_OP_COUNT];
+    struct ggml_xsai_op_profile_named_bucket names[GGML_XSAI_PROFILE_MAX_NAMES];
+    struct ggml_xsai_op_profile_named_bucket modules[GGML_XSAI_PROFILE_MAX_MODULES];
+    int n_names;
+    int n_modules;
+} g_ggml_xsai_op_profile;
+
+static int ggml_xsai_op_profile_enabled(void);
+
+static const char * ggml_xsai_profile_timer_name(void) {
+#if defined(__riscv)
+    return "rdcycle";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "rdtscp";
+#else
+    return "ggml_cycles";
+#endif
+}
+
+static inline uint64_t ggml_xsai_profile_read_cycle(void) {
+#if defined(__riscv)
+    uint64_t cycles;
+    __asm__ volatile("rdcycle %0" : "=r"(cycles));
+    return cycles;
+#elif defined(__x86_64__) || defined(_M_X64)
+    unsigned int aux;
+    return __rdtscp(&aux);
+#else
+    return (uint64_t) ggml_cycles();
+#endif
+}
+
+static bool ggml_xsai_profile_env_on(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && value[0] != '\0' &&
+        strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 &&
+        strcmp(value, "off") != 0 &&
+        strcmp(value, "no") != 0;
+}
+
+static void ggml_xsai_profile_normalize_name(const char * name, char * out, size_t out_size) {
+    if (name == NULL || name[0] == '\0') {
+        snprintf(out, out_size, "(unnamed)");
+        return;
+    }
+
+    if (strncmp(name, "node_", 5) == 0) {
+        const char * p = name + 5;
+        bool is_default_node = *p != '\0';
+        while (*p != '\0') {
+            if (*p < '0' || *p > '9') {
+                is_default_node = false;
+                break;
+            }
+            p++;
+        }
+        if (is_default_node) {
+            snprintf(out, out_size, "(unnamed)");
+            return;
+        }
+    }
+
+    snprintf(out, out_size, "%s", name);
+
+    size_t len = strlen(out);
+    size_t end = len;
+    while (end > 0 && out[end - 1] >= '0' && out[end - 1] <= '9') {
+        end--;
+    }
+    if (end > 0 && end < len && out[end - 1] == '-') {
+        out[end - 1] = '\0';
+    }
+}
+
+static const char * ggml_xsai_profile_module_name(const char * name, enum ggml_op op) {
+    if (strcmp(name, "Qcur") == 0 || strcmp(name, "Kcur") == 0 || strcmp(name, "Vcur") == 0 ||
+        strcmp(name, "Qcur_normed") == 0 || strcmp(name, "Kcur_normed") == 0) {
+        return "attn_qkv";
+    }
+    if (strncmp(name, "kq", 2) == 0 || strncmp(name, "fattn", 5) == 0) {
+        return "attn_core";
+    }
+    if (strcmp(name, "attn_out") == 0) {
+        return "out_proj";
+    }
+    if (strcmp(name, "ffn_up") == 0 || strcmp(name, "ffn_moe_up") == 0) {
+        return "ffn_up";
+    }
+    if (strcmp(name, "ffn_gate") == 0 || strcmp(name, "ffn_moe_gate") == 0 ||
+        strcmp(name, "ffn_gate_par") == 0) {
+        return "ffn_gate";
+    }
+    if (strcmp(name, "ffn_down") == 0 || strcmp(name, "ffn_moe_down") == 0) {
+        return "ffn_down";
+    }
+    if (strncmp(name, "ffn_", 4) == 0) {
+        return "ffn_other";
+    }
+    if (strstr(name, "norm") != NULL) {
+        return "norm";
+    }
+    if (strcmp(name, "result_output") == 0) {
+        return "lm_head";
+    }
+    if (strcmp(name, "embd") == 0 || strstr(name, "embd") != NULL) {
+        return "embedding";
+    }
+    if (strcmp(name, "l_out") == 0 || strcmp(name, "ffn_out") == 0 || strcmp(name, "ffn_inp") == 0) {
+        return "residual";
+    }
+    if (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) {
+        return "matmul_other";
+    }
+    return "other";
+}
+
+static void ggml_xsai_profile_node_meta(
+        const struct ggml_tensor * node,
+        int64_t                  * M,
+        int64_t                  * N,
+        int64_t                  * K,
+        enum ggml_type           * src0_type,
+        enum ggml_type           * src1_type,
+        enum ggml_type           * dst_type,
+        int                      * has_shape,
+        int                      * ame_candidate) {
+    *M = 0;
+    *N = 0;
+    *K = 0;
+    *src0_type = GGML_TYPE_COUNT;
+    *src1_type = GGML_TYPE_COUNT;
+    *dst_type = node->type;
+    *has_shape = 0;
+    *ame_candidate = 0;
+
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            node->src[0] != NULL && node->src[1] != NULL) {
+        const struct ggml_tensor * src0 = node->src[0];
+        const struct ggml_tensor * src1 = node->src[1];
+        *M = src0->ne[1];
+        *N = src1->ne[1];
+        *K = src0->ne[0];
+        *src0_type = src0->type;
+        *src1_type = src1->type;
+        *has_shape = 1;
+        *ame_candidate = node->op == GGML_OP_MUL_MAT &&
+            src0->type == GGML_TYPE_Q8_0 &&
+            src1->type == GGML_TYPE_F32;
+    }
+}
+
+static void ggml_xsai_profile_add_named(
+        struct ggml_xsai_op_profile_named_bucket * buckets,
+        int                                      * n_buckets,
+        int                                        max_buckets,
+        uint64_t                                 * overflow,
+        const char                               * name,
+        const struct ggml_tensor                 * node,
+        enum ggml_op                               op,
+        uint64_t                                   cycles) {
+    int64_t M;
+    int64_t N;
+    int64_t K;
+    enum ggml_type src0_type;
+    enum ggml_type src1_type;
+    enum ggml_type dst_type;
+    int has_shape;
+    int ame_candidate;
+    ggml_xsai_profile_node_meta(node, &M, &N, &K, &src0_type, &src1_type, &dst_type, &has_shape, &ame_candidate);
+
+    for (int i = 0; i < *n_buckets; i++) {
+        if (buckets[i].op == op && strcmp(buckets[i].name, name) == 0) {
+            buckets[i].calls++;
+            buckets[i].cycles += cycles;
+            if (has_shape) {
+                if (!buckets[i].has_shape) {
+                    buckets[i].M = M;
+                    buckets[i].N = N;
+                    buckets[i].K = K;
+                    buckets[i].has_shape = 1;
+                } else if (buckets[i].M != M || buckets[i].N != N || buckets[i].K != K) {
+                    buckets[i].mixed_shape = 1;
+                }
+            }
+            if (buckets[i].src0_type != src0_type || buckets[i].src1_type != src1_type || buckets[i].dst_type != dst_type) {
+                buckets[i].mixed_type = 1;
+            }
+            if (ame_candidate) {
+                buckets[i].ame_candidate = 1;
+            } else {
+                buckets[i].ame_non_candidate = 1;
+            }
+            return;
+        }
+    }
+
+    if (*n_buckets >= max_buckets) {
+        (*overflow)++;
+        return;
+    }
+
+    struct ggml_xsai_op_profile_named_bucket * bucket = &buckets[*n_buckets];
+    bucket->op = op;
+    snprintf(bucket->name, sizeof(bucket->name), "%s", name);
+    bucket->calls = 1;
+    bucket->cycles = cycles;
+    bucket->M = M;
+    bucket->N = N;
+    bucket->K = K;
+    bucket->src0_type = src0_type;
+    bucket->src1_type = src1_type;
+    bucket->dst_type = dst_type;
+    bucket->has_shape = has_shape;
+    bucket->mixed_shape = 0;
+    bucket->mixed_type = 0;
+    bucket->ame_candidate = ame_candidate;
+    bucket->ame_non_candidate = !ame_candidate;
+    (*n_buckets)++;
+}
+
+static void ggml_xsai_op_profile_record(const struct ggml_tensor * node, uint64_t cycles) {
+    if (node->op < GGML_OP_COUNT) {
+        g_ggml_xsai_op_profile.op[node->op].calls++;
+        g_ggml_xsai_op_profile.op[node->op].cycles += cycles;
+    }
+
+    g_ggml_xsai_op_profile.nodes++;
+    g_ggml_xsai_op_profile.cycles += cycles;
+
+    char name[GGML_MAX_NAME];
+    ggml_xsai_profile_normalize_name(node->name, name, sizeof(name));
+    ggml_xsai_profile_add_named(
+            g_ggml_xsai_op_profile.names,
+            &g_ggml_xsai_op_profile.n_names,
+            GGML_XSAI_PROFILE_MAX_NAMES,
+            &g_ggml_xsai_op_profile.name_overflow,
+            name,
+            node,
+            node->op,
+            cycles);
+
+    const char * module = ggml_xsai_profile_module_name(name, node->op);
+    ggml_xsai_profile_add_named(
+            g_ggml_xsai_op_profile.modules,
+            &g_ggml_xsai_op_profile.n_modules,
+            GGML_XSAI_PROFILE_MAX_MODULES,
+            &g_ggml_xsai_op_profile.module_overflow,
+            module,
+            node,
+            node->op,
+            cycles);
+}
+
+static const char * ggml_xsai_profile_type_name(enum ggml_type type) {
+    return type < GGML_TYPE_COUNT ? ggml_type_name(type) : "none";
+}
+
+static const char * ggml_xsai_profile_ame_candidate_name(
+        const struct ggml_xsai_op_profile_named_bucket * bucket) {
+    if (bucket->ame_candidate && bucket->ame_non_candidate) {
+        return "mixed";
+    }
+    return bucket->ame_candidate ? "yes" : "no";
+}
+
+static void ggml_xsai_op_profile_dump_named(
+        const char * tag,
+        const struct ggml_xsai_op_profile_named_bucket * buckets,
+        int n_buckets,
+        int top_n) {
+    bool printed[GGML_XSAI_PROFILE_MAX_NAMES] = {0};
+    GGML_ASSERT(n_buckets <= GGML_XSAI_PROFILE_MAX_NAMES);
+    if (n_buckets > GGML_XSAI_PROFILE_MAX_NAMES) {
+        n_buckets = GGML_XSAI_PROFILE_MAX_NAMES;
+    }
+
+    for (int rank = 0; rank < top_n; rank++) {
+        int best = -1;
+        for (int i = 0; i < n_buckets; i++) {
+            if (!printed[i] && (best < 0 || buckets[i].cycles > buckets[best].cycles)) {
+                best = i;
+            }
+        }
+        if (best < 0 || buckets[best].cycles == 0) {
+            break;
+        }
+        printed[best] = true;
+        if (buckets[best].has_shape) {
+            char m_buf[32];
+            char n_buf[32];
+            char k_buf[32];
+            if (buckets[best].mixed_shape) {
+                snprintf(m_buf, sizeof(m_buf), "mixed");
+                snprintf(n_buf, sizeof(n_buf), "mixed");
+                snprintf(k_buf, sizeof(k_buf), "mixed");
+            } else {
+                snprintf(m_buf, sizeof(m_buf), "%" PRId64, buckets[best].M);
+                snprintf(n_buf, sizeof(n_buf), "%" PRId64, buckets[best].N);
+                snprintf(k_buf, sizeof(k_buf), "%" PRId64, buckets[best].K);
+            }
+            fprintf(stderr,
+                    "[GGML_XSAI_OP_PROFILE] %s rank=%d name=%s op=%s calls=%llu cycles=%llu M=%s N=%s K=%s src0=%s src1=%s dst=%s ame_candidate=%s\n",
+                    tag,
+                    rank + 1,
+                    buckets[best].name,
+                    buckets[best].op < GGML_OP_COUNT ? ggml_op_name(buckets[best].op) : "UNKNOWN",
+                    (unsigned long long) buckets[best].calls,
+                    (unsigned long long) buckets[best].cycles,
+                    m_buf,
+                    n_buf,
+                    k_buf,
+                    buckets[best].mixed_type ? "mixed" : ggml_xsai_profile_type_name(buckets[best].src0_type),
+                    buckets[best].mixed_type ? "mixed" : ggml_xsai_profile_type_name(buckets[best].src1_type),
+                    buckets[best].mixed_type ? "mixed" : ggml_xsai_profile_type_name(buckets[best].dst_type),
+                    ggml_xsai_profile_ame_candidate_name(&buckets[best]));
+        } else {
+            fprintf(stderr,
+                    "[GGML_XSAI_OP_PROFILE] %s rank=%d name=%s op=%s calls=%llu cycles=%llu\n",
+                    tag,
+                    rank + 1,
+                    buckets[best].name,
+                    buckets[best].op < GGML_OP_COUNT ? ggml_op_name(buckets[best].op) : "UNKNOWN",
+                    (unsigned long long) buckets[best].calls,
+                    (unsigned long long) buckets[best].cycles);
+        }
+    }
+}
+
+static void ggml_xsai_op_profile_dump(void) {
+    if (!ggml_xsai_op_profile_enabled() || g_ggml_xsai_op_profile.nodes == 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[GGML_XSAI_OP_PROFILE] summary timer=%s graphs=%llu nodes=%llu cycles=%llu name_overflow=%llu module_overflow=%llu\n",
+            ggml_xsai_profile_timer_name(),
+            (unsigned long long) g_ggml_xsai_op_profile.graphs,
+            (unsigned long long) g_ggml_xsai_op_profile.nodes,
+            (unsigned long long) g_ggml_xsai_op_profile.cycles,
+            (unsigned long long) g_ggml_xsai_op_profile.name_overflow,
+            (unsigned long long) g_ggml_xsai_op_profile.module_overflow);
+
+    bool printed[GGML_OP_COUNT] = {0};
+    for (int rank = 0; rank < 16; rank++) {
+        int best = -1;
+        for (int op = 0; op < GGML_OP_COUNT; op++) {
+            if (!printed[op] && (best < 0 || g_ggml_xsai_op_profile.op[op].cycles > g_ggml_xsai_op_profile.op[best].cycles)) {
+                best = op;
+            }
+        }
+        if (best < 0 || g_ggml_xsai_op_profile.op[best].cycles == 0) {
+            break;
+        }
+        printed[best] = true;
+        fprintf(stderr,
+                "[GGML_XSAI_OP_PROFILE] op rank=%d op=%s calls=%llu cycles=%llu\n",
+                rank + 1,
+                ggml_op_name((enum ggml_op) best),
+                (unsigned long long) g_ggml_xsai_op_profile.op[best].calls,
+                (unsigned long long) g_ggml_xsai_op_profile.op[best].cycles);
+    }
+
+    ggml_xsai_op_profile_dump_named("module", g_ggml_xsai_op_profile.modules, g_ggml_xsai_op_profile.n_modules, 24);
+    ggml_xsai_op_profile_dump_named("name", g_ggml_xsai_op_profile.names, g_ggml_xsai_op_profile.n_names, 32);
+    fflush(stderr);
+}
+
+static int ggml_xsai_op_profile_enabled(void) {
+    static int cached = -1;
+    static int registered = 0;
+    if (cached == -1) {
+        cached = ggml_xsai_profile_env_on("GGML_XSAI_OP_PROFILE") ? 1 : 0;
+    }
+    if (cached && !registered) {
+        atexit(ggml_xsai_op_profile_dump);
+        registered = 1;
+    }
+    return cached;
+}
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -2942,6 +3358,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
 
+    const int xsai_profile = state->ith == 0 ? ggml_xsai_op_profile_enabled() : 0;
+    if (xsai_profile) {
+        g_ggml_xsai_op_profile.graphs++;
+    }
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -2954,7 +3375,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const uint64_t xsai_profile_t0 = xsai_profile ? ggml_xsai_profile_read_cycle() : 0;
         ggml_compute_forward(&params, node);
+        if (xsai_profile) {
+            ggml_xsai_op_profile_record(node, ggml_xsai_profile_read_cycle() - xsai_profile_t0);
+        }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
