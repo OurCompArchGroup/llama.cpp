@@ -36,8 +36,7 @@ void ggml_ame_gemm_tile_i8_i32_bT(
 #if AME_MLOAD_FENCE
     asm volatile("fence rw, rw" ::: "memory");
 #endif
-    // tile_c is always zeroed by the caller; MZERO_ACC is sufficient.
-    // (Removed: MLCE32 was redundant and triggered a NEMU mlce32 coherence bug)
+    // tile_c is produced from a fresh accumulator for each exact Q8_0 scale block.
     
     // Load left matrix A tile: MxK
     const int8_t *addr_a = A;

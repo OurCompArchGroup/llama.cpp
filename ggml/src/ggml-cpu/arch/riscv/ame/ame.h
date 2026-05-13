@@ -317,6 +317,7 @@ void ggml_ame_mul_mat_q8_0(
 
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
+    const float * src0_scales,
     const void * src1_key,
     const void * src1,
     void * dst,
