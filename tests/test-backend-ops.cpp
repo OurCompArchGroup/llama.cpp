@@ -4087,6 +4087,7 @@ struct test_mul_mat : public test_case {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * a;
         ggml_tensor * b;
+        const bool allow_param_a = !(forced_buft_is_ame() && type_a == GGML_TYPE_BF16);
 
         const int npermuted = (per[0] != 0) + (per[1] != 1) + (per[2] != 2) + (per[3] != 3);
         if (npermuted > 0) {
@@ -4102,7 +4103,7 @@ struct test_mul_mat : public test_case {
             a = ggml_new_tensor_4d(ctx, type_a, ne_a[per[0]], ne_a[per[1]], ne_a[per[2]], ne_a[per[3]]);
             b = ggml_new_tensor_4d(ctx, type_b, ne_b[per[0]], ne_b[per[1]], ne_b[per[2]], ne_b[per[3]]);
             if (!ggml_is_quantized(type_a)) {
-                if (bs[1] == 1 && nr[1] == 1) {
+                if (allow_param_a && bs[1] == 1 && nr[1] == 1) {
                     ggml_set_param(a);
                 }
                 ggml_set_param(b);
@@ -4120,7 +4121,7 @@ struct test_mul_mat : public test_case {
             b = ggml_new_tensor_4d(ctx, type_b, k_physical, n, bs[0]*nr[0], bs[1]*nr[1]);
 
             if (!ggml_is_quantized(type_a)) {
-                if (bs[1] == 1 && nr[1] == 1) {
+                if (allow_param_a && bs[1] == 1 && nr[1] == 1) {
                     ggml_set_param(a);
                 }
                 ggml_set_param(b);
@@ -7967,6 +7968,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 768, {1, 1}, {1, 1}));
+    // AME BF16 support requires m,n >= 128. Under forced RISCV_AME we keep A as
+    // a regular tensor so the backend-op harness can exercise the BF16 forward
+    // path while still using FP32 params via B.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
