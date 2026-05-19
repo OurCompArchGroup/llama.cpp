@@ -328,6 +328,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne10,
     int64_t ne11,
     size_t src1_stride,
+    const int8_t * src0_tile_a,
+    const float * src0_tile_scales,
     int graph_id,
     const void * graph_key,
     uint64_t src1_generation,

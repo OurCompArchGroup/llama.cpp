@@ -889,6 +889,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne10,
     int64_t ne11,
     size_t src1_stride,
+    const int8_t * src0_tile_a,
+    const float * src0_tile_scales,
     int graph_id,
     const void * graph_key,
     uint64_t src1_generation,
@@ -993,6 +995,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     }
     if (prof) prof_local.cycles_prepare_cache += ame_read_cycle() - prof_t0;
 
+    const int use_packed_a_tiles = src0_tile_a != NULL && src0_tile_scales != NULL;
+
     if (use_packed_b_panel) {
         int8_t * packed_b_panel = tile_b;
         AME_PANEL_LOG("ame64 packed_b_panel: M=%lld N=%lld K=%lld nb64=%lld panel_bytes=%zu",
@@ -1016,6 +1020,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
             for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
                 const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+                const int64_t mt = i0 / AME_TILE_M;
                 float acc_f32[AME_TILE_M * AME_TILE_N];
                 memset(acc_f32, 0, sizeof(acc_f32));
                 AME_PANEL_PROGRESS_LOG(
@@ -1033,12 +1038,19 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     }
 
                     prof_t0 = prof ? ame_read_cycle() : 0;
-                    for (int i = 0; i < AME_TILE_M; ++i) {
-                        if (i < imax) {
-                            const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
-                            memcpy(&tile_a[i * AME_TILE_K], b->qs, AME_Q8_PACK_K);
-                        } else {
-                            memset(&tile_a[i * AME_TILE_K], 0, AME_Q8_PACK_K);
+                    const int8_t * tile_a_for_gemm = tile_a;
+                    if (use_packed_a_tiles) {
+                        const size_t tile_bytes = AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+                        tile_a_for_gemm =
+                            src0_tile_a + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_bytes;
+                    } else {
+                        for (int i = 0; i < AME_TILE_M; ++i) {
+                            if (i < imax) {
+                                const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
+                                memcpy(&tile_a[i * AME_TILE_K], b->qs, AME_Q8_PACK_K);
+                            } else {
+                                memset(&tile_a[i * AME_TILE_K], 0, AME_Q8_PACK_K);
+                            }
                         }
                     }
                     if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
@@ -1056,7 +1068,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
                     const int8_t * panel_tile_b = packed_b_panel + kb * tile_b_size;
                     prof_t0 = prof ? ame_read_cycle() : 0;
-                    ggml_ame_gemm_tile_i8_i32_bT(tile_a, panel_tile_b, tile_c);
+                    ggml_ame_gemm_tile_i8_i32_bT(tile_a_for_gemm, panel_tile_b, tile_c);
                     if (prof) {
                         prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
                         prof_local.tile_calls++;
@@ -1066,9 +1078,15 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     }
 
                     prof_t0 = prof ? ame_read_cycle() : 0;
-                    for (int i = 0; i < imax; ++i) {
-                        const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                        x_scales[i] = GGML_FP16_TO_FP32(bx->d);
+                    if (use_packed_a_tiles) {
+                        const float * restrict cached_scales =
+                            src0_tile_scales + ((size_t) mt * (size_t) nb64 + (size_t) kb) * AME_TILE_M;
+                        memcpy(x_scales, cached_scales, (size_t) imax * sizeof(float));
+                    } else {
+                        for (int i = 0; i < imax; ++i) {
+                            const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
+                            x_scales[i] = GGML_FP16_TO_FP32(bx->d);
+                        }
                     }
                     ame_accumulate_scaled_tile(
                         acc_f32,

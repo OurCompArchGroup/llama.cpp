@@ -147,6 +147,10 @@ static bool ame_use_packed_q8() {
 struct ame_packed_q8_info {
     void * data = nullptr;
     size_t size = 0;
+    void * tile_a = nullptr;
+    size_t tile_a_size = 0;
+    float * tile_scales = nullptr;
+    size_t tile_scales_count = 0;
 };
 
 struct ame_buffer_context {
@@ -242,7 +246,17 @@ static size_t ggml_ame_packed_q8_64_size(const ggml_tensor * tensor) {
     return (size_t) ggml_nrows(tensor) * (size_t) nb64 * sizeof(block_q8_ame64);
 }
 
-static const block_q8_ame64 * ame_get_packed_q8_weight(const ggml_tensor * tensor) {
+static const block_q8_ame64 * ame_get_packed_q8_weight(
+    const ggml_tensor * tensor,
+    const int8_t ** tile_a_out,
+    const float ** tile_scales_out
+) {
+    if (tile_a_out != nullptr) {
+        *tile_a_out = nullptr;
+    }
+    if (tile_scales_out != nullptr) {
+        *tile_scales_out = nullptr;
+    }
     if (!ame_use_packed_q8()) {
         return nullptr;
     }
@@ -255,7 +269,70 @@ static const block_q8_ame64 * ame_get_packed_q8_weight(const ggml_tensor * tenso
     if (it == ctx->packed_q8.end()) {
         return nullptr;
     }
+    if (tile_a_out != nullptr) {
+        *tile_a_out = static_cast<const int8_t *>(it->second.tile_a);
+    }
+    if (tile_scales_out != nullptr) {
+        *tile_scales_out = it->second.tile_scales;
+    }
     return static_cast<const block_q8_ame64 *>(it->second.data);
+}
+
+static void ame_build_packed_q8_tile_a_cache(
+    ame_packed_q8_info & entry,
+    const ggml_tensor * tensor
+) {
+    const int64_t K = tensor->ne[0];
+    const int64_t M = tensor->ne[1];
+    const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+    const int64_t m_tiles = (M + AME_TILE_M - 1) / AME_TILE_M;
+    const size_t tile_bytes = AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+    const size_t tile_a_size = (size_t) m_tiles * (size_t) nb64 * tile_bytes;
+    const size_t tile_scales_count = (size_t) m_tiles * (size_t) nb64 * AME_TILE_M;
+
+    if (entry.tile_a == nullptr || entry.tile_a_size != tile_a_size) {
+        if (entry.tile_a != nullptr) {
+            ggml_aligned_free(entry.tile_a, entry.tile_a_size);
+        }
+        entry.tile_a = ggml_aligned_malloc(tile_a_size);
+        entry.tile_a_size = tile_a_size;
+    }
+
+    if (entry.tile_scales == nullptr || entry.tile_scales_count != tile_scales_count) {
+        if (entry.tile_scales != nullptr) {
+            ggml_aligned_free(entry.tile_scales, entry.tile_scales_count * sizeof(float));
+        }
+        entry.tile_scales = static_cast<float *>(ggml_aligned_malloc(tile_scales_count * sizeof(float)));
+        entry.tile_scales_count = tile_scales_count;
+    }
+
+    if (entry.tile_a == nullptr || entry.tile_scales == nullptr || entry.data == nullptr) {
+        return;
+    }
+
+    const block_q8_ame64 * blocks = static_cast<const block_q8_ame64 *>(entry.data);
+    for (int64_t mt = 0; mt < m_tiles; ++mt) {
+        const int64_t i0 = mt * AME_TILE_M;
+        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+
+        for (int64_t kb = 0; kb < nb64; ++kb) {
+            int8_t * dst_tile =
+                static_cast<int8_t *>(entry.tile_a) + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_bytes;
+            float * dst_scales =
+                entry.tile_scales + ((size_t) mt * (size_t) nb64 + (size_t) kb) * AME_TILE_M;
+
+            for (int i = 0; i < AME_TILE_M; ++i) {
+                if (i < imax) {
+                    const block_q8_ame64 * b = &blocks[(i0 + i) * nb64 + kb];
+                    memcpy(&dst_tile[i * AME_TILE_K], b->qs, AME_Q8_PACK_K);
+                    dst_scales[i] = GGML_FP16_TO_FP32(b->d);
+                } else {
+                    memset(&dst_tile[i * AME_TILE_K], 0, AME_Q8_PACK_K);
+                    dst_scales[i] = 0.0f;
+                }
+            }
+        }
+    }
 }
 
 static void ame_store_packed_q8_weight(
@@ -277,6 +354,7 @@ static void ame_store_packed_q8_weight(
 
     if (entry.data != nullptr) {
         ggml_ame_repack_q8_0_to_ame64(entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+        ame_build_packed_q8_tile_a_cache(entry, tensor);
     }
 }
 
@@ -334,7 +412,9 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     GGML_ASSERT(ne00 == ne10);
     GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
 
-    const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0);
+    const int8_t * packed_w_tile_a = nullptr;
+    const float * packed_w_tile_scales = nullptr;
+    const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0, &packed_w_tile_a, &packed_w_tile_scales);
     if (packed_w != nullptr) {
         AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel");
         ggml_ame_mul_mat_q8_0_ame64(
@@ -345,6 +425,8 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
             ne00, ne01,
             ne10, ne11,
             src1->nb[1],
+            packed_w_tile_a,
+            packed_w_tile_scales,
             ggml_threadpool_graph_id(params->threadpool),
             params->threadpool,
             ame_tensor_content_generation(src1),
@@ -447,6 +529,12 @@ static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     for (auto & it : ctx->packed_q8) {
         if (it.second.data != nullptr) {
             ggml_aligned_free(it.second.data, it.second.size);
+        }
+        if (it.second.tile_a != nullptr) {
+            ggml_aligned_free(it.second.tile_a, it.second.tile_a_size);
+        }
+        if (it.second.tile_scales != nullptr) {
+            ggml_aligned_free(it.second.tile_scales, it.second.tile_scales_count * sizeof(float));
         }
     }
     if (ctx->base != nullptr) {

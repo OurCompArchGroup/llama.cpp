@@ -50,6 +50,14 @@
 
 #if defined(__riscv)
 void nemu_signal(int a){
+    const char * signal_enabled = getenv("XSAI_TEST_BACKEND_OPS_NEMU_SIGNAL");
+    if (signal_enabled != nullptr &&
+            (strcmp(signal_enabled, "0") == 0 || strcmp(signal_enabled, "false") == 0 ||
+             strcmp(signal_enabled, "FALSE") == 0 || strcmp(signal_enabled, "off") == 0 ||
+             strcmp(signal_enabled, "OFF") == 0)) {
+        return;
+    }
+
     const char * alloc_mode = getenv("XSAI_ALLOC_MODE");
     if (alloc_mode != nullptr &&
             (strcmp(alloc_mode, "malloc") == 0 || strcmp(alloc_mode, "anon-host-test") == 0)) {
@@ -141,6 +149,26 @@ static uint64_t effective_perf_target_flops_cpu() {
     const uint64_t GFLOP = 1000ULL * 1000ULL * 1000ULL;
     const uint64_t MFLOP = 1000ULL * 1000ULL;
     return forced_buft_is_ame() ? 512ULL * MFLOP : 8ULL * GFLOP;
+}
+
+static int forced_ame_perf_runs() {
+    if (!forced_buft_is_ame()) {
+        return 0;
+    }
+
+    const char * env = std::getenv("GGML_TEST_BACKEND_OPS_AME_N_RUNS");
+    if (env == nullptr || env[0] == '\0') {
+        return 1;
+    }
+
+    char * end = nullptr;
+    const long value = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0' || value <= 0 || value > INT32_MAX) {
+        fprintf(stderr, "warning: ignoring invalid GGML_TEST_BACKEND_OPS_AME_N_RUNS='%s'\n", env);
+        return 1;
+    }
+
+    return (int) value;
 }
 
 static void print_available_bufts() {
@@ -1778,9 +1806,11 @@ struct test_case {
         reset_ame_profile_if_available();
 
         // determine number of runs
-        int n_runs;
+        int n_runs = forced_ame_perf_runs();
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (n_runs > 0) {
+            n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), n_runs);
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu = effective_perf_target_flops_cpu();
