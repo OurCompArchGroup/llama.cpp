@@ -15,7 +15,10 @@ void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * B,      // Input matrix B (transposed): NxK
     int32_t * C            // Output matrix C: MxN
 ) {
-    asm volatile("msyncreset tok0" ::: "memory");
+    static unsigned long ame_token_target = 0;
+    if (ame_token_target == 0) {
+        asm volatile("msyncreset tok0" ::: "memory");
+    }
     // Fixed tile dimensions
     const int TILE_M = AME_TILE_M;
     const int TILE_K = AME_TILE_K;
@@ -53,7 +56,6 @@ void ggml_ame_gemm_tile_i8_i32_bT(
     MSCE32(acc0, addr_c, stride_c * 4);
 
     asm volatile("mrelease tok0" ::: "memory");
-    // 期望 tok0 >= 1，使用一个整型输入寄存器传入比较值
-    int acquire_target = 1;
-    asm volatile("macquire %0,tok0" :: "r"(acquire_target) : "memory"); // 等待 tok0 >= 1
+    unsigned long acquire_target = ++ame_token_target;
+    asm volatile("macquire %0,tok0" :: "r"(acquire_target) : "memory");
 }

@@ -283,6 +283,9 @@ void ggml_ame_gemm_q8_0(
     int N
 );
 
+void ggml_ame_profile_reset(void);
+void ggml_ame_profile_dump_now(void);
+
 // Quantize a row of F32 values to Q8_0 format
 void ggml_ame_quantize_row_f32_to_q8_0(const float * x, void * y, int k);
 

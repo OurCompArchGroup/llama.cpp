@@ -21,13 +21,14 @@ struct ame_profile_counters {
     uint64_t logical_macs;
     uint64_t tile_calls;
     uint64_t edge_tile_calls;
+    uint64_t output_tile_calls;
     uint64_t cycles_baseline_total;
     uint64_t cycles_packed_total;
     uint64_t cycles_prepare_cache;
     uint64_t cycles_pack_a;
     uint64_t cycles_pack_b;
     uint64_t cycles_zero_c;
-    uint64_t cycles_gemm;
+    uint64_t cycles_ame_tile_call;
     uint64_t cycles_scale;
     uint64_t cycles_store;
 };
@@ -46,6 +47,139 @@ static inline uint64_t ame_read_cycle(void) {
 
 static int ame_profile_enabled(void);
 
+static int ame_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 && strcmp(value, "off") != 0 && strcmp(value, "no") != 0;
+}
+
+static int64_t ame_env_i64(const char * name, int64_t fallback) {
+    const char * value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+
+    char * end = NULL;
+    const long long parsed = strtoll(value, &end, 0);
+    return end != value ? (int64_t) parsed : fallback;
+}
+
+static inline void ame_nemu_signal(int a) {
+#if defined(__riscv)
+    asm volatile ("mv a0, %0\n\t"
+                  ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
+                  :
+                  : "r"(a)
+                  : "a0");
+#else
+    GGML_UNUSED(a);
+#endif
+}
+
+static int ame_skip_tile_b_zero(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_SKIP_TILE_B_ZERO") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_skip_tile_c_zero(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_SKIP_TILE_C_ZERO") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_use_packed_b_panel(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_USE_PACKED_B_PANEL") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_panel_log_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_PANEL_LOG") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_panel_progress_log_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_PANEL_PROGRESS_LOG") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_ckpt_on_shape_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_env_enabled("GGML_AME_CKPT_ON_SHAPE") ? 1 : 0;
+    }
+    return cached;
+}
+
+static int ame_ckpt_shape_matches(int64_t M, int64_t N, int64_t K) {
+    if (!ame_ckpt_on_shape_enabled()) {
+        return 0;
+    }
+
+    const int64_t target_m = ame_env_i64("GGML_AME_CKPT_M", 2048);
+    const int64_t target_n = ame_env_i64("GGML_AME_CKPT_N", 128);
+    const int64_t target_k = ame_env_i64("GGML_AME_CKPT_K", 8192);
+    return M == target_m && N == target_n && K == target_k;
+}
+
+static void ame_ckpt_notify_start(int64_t M, int64_t N, int64_t K, int64_t j0) {
+    static int emitted = 0;
+    if (emitted || !ame_ckpt_shape_matches(M, N, K)) {
+        return;
+    }
+
+    emitted = 1;
+    fprintf(stderr,
+            "[AME_CKPT] start ROI before packed-B accumulation: M=%lld N=%lld K=%lld j0=%lld\n",
+            (long long) M, (long long) N, (long long) K, (long long) j0);
+    fflush(stderr);
+    ame_nemu_signal(0x100);
+    ame_nemu_signal(0x101);
+}
+
+static void ame_ckpt_notify_stop(int64_t M, int64_t N, int64_t K) {
+    static int emitted = 0;
+    if (emitted || !ame_ckpt_shape_matches(M, N, K)) {
+        return;
+    }
+
+    emitted = 1;
+    fprintf(stderr,
+            "[AME_CKPT] stop ROI after packed-B accumulation: M=%lld N=%lld K=%lld\n",
+            (long long) M, (long long) N, (long long) K);
+    fflush(stderr);
+    ame_nemu_signal(0x102);
+}
+
+#define AME_PANEL_LOG(...) do {                         \
+    if (ame_panel_log_enabled()) {                      \
+        fprintf(stderr, "[AME_PANEL] " __VA_ARGS__);    \
+        fprintf(stderr, "\n");                         \
+        fflush(stderr);                                 \
+    }                                                   \
+} while (0)
+
+#define AME_PANEL_PROGRESS_LOG(...) do {                         \
+    if (ame_panel_progress_log_enabled()) {                      \
+        fprintf(stderr, "[AME_PANEL_PROGRESS] " __VA_ARGS__);    \
+        fprintf(stderr, "\n");                                  \
+        fflush(stderr);                                         \
+    }                                                           \
+} while (0)
+
 static void ame_profile_dump(void) {
     if (!ame_profile_enabled()) {
         return;
@@ -58,25 +192,31 @@ static void ame_profile_dump(void) {
 
     const uint64_t ops = g_ame_profile.logical_macs * 2;
     const uint64_t cycles_total = g_ame_profile.cycles_baseline_total + g_ame_profile.cycles_packed_total;
-    const uint64_t bytes_min = g_ame_profile.tile_calls *
-        (AME_TILE_M * AME_TILE_K + AME_TILE_N * AME_TILE_K + AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(int32_t));
-    const uint64_t bytes_sw = bytes_min + g_ame_profile.tile_calls *
-        (AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(int32_t) + AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(float));
+    const uint64_t tile_a_bytes = AME_TILE_M * AME_TILE_K * (uint64_t) sizeof(int8_t);
+    const uint64_t tile_b_bytes = AME_TILE_N * AME_TILE_K * (uint64_t) sizeof(int8_t);
+    const uint64_t tile_c_i32_bytes = AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(int32_t);
+    const uint64_t output_tile_f32_bytes = AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(float);
+    const uint64_t ame_tile_bytes_model = g_ame_profile.tile_calls *
+        (tile_a_bytes + tile_b_bytes + tile_c_i32_bytes);
+    const uint64_t tile_c_cpu_read_bytes_model = g_ame_profile.tile_calls * tile_c_i32_bytes;
+    const uint64_t dst_f32_write_bytes_model = g_ame_profile.output_tile_calls * output_tile_f32_bytes;
+    const uint64_t sw_bytes_model = ame_tile_bytes_model + tile_c_cpu_read_bytes_model + dst_f32_write_bytes_model;
     const double ops_per_cycle = cycles_total ? (double) ops / (double) cycles_total : 0.0;
     const double macs_per_cycle = cycles_total ? (double) g_ame_profile.logical_macs / (double) cycles_total : 0.0;
-    const double min_bytes_per_cycle = cycles_total ? (double) bytes_min / (double) cycles_total : 0.0;
-    const double sw_bytes_per_cycle = cycles_total ? (double) bytes_sw / (double) cycles_total : 0.0;
+    const double ame_tile_bytes_per_cycle = cycles_total ? (double) ame_tile_bytes_model / (double) cycles_total : 0.0;
+    const double sw_bytes_per_cycle = cycles_total ? (double) sw_bytes_model / (double) cycles_total : 0.0;
 
     fprintf(stderr,
-        "[AME_PROFILE] calls baseline=%llu packed=%llu tiles=%llu edge_tiles=%llu logical_macs=%llu logical_ops=%llu\n",
+        "[AME_PROFILE] calls baseline=%llu packed=%llu tiles=%llu edge_tiles=%llu output_tiles=%llu logical_macs=%llu logical_ops=%llu\n",
         (unsigned long long) g_ame_profile.baseline_calls,
         (unsigned long long) g_ame_profile.packed_calls,
         (unsigned long long) g_ame_profile.tile_calls,
         (unsigned long long) g_ame_profile.edge_tile_calls,
+        (unsigned long long) g_ame_profile.output_tile_calls,
         (unsigned long long) g_ame_profile.logical_macs,
         (unsigned long long) ops);
     fprintf(stderr,
-        "[AME_PROFILE] cycles total=%llu baseline_total=%llu packed_total=%llu prepare_cache=%llu pack_a=%llu pack_b=%llu zero_c=%llu gemm=%llu scale=%llu store=%llu\n",
+        "[AME_PROFILE] cycles total=%llu baseline_total=%llu packed_total=%llu prepare_cache=%llu pack_a=%llu pack_b=%llu zero_c=%llu ame_tile_call=%llu scale=%llu store=%llu\n",
         (unsigned long long) cycles_total,
         (unsigned long long) g_ame_profile.cycles_baseline_total,
         (unsigned long long) g_ame_profile.cycles_packed_total,
@@ -84,30 +224,35 @@ static void ame_profile_dump(void) {
         (unsigned long long) g_ame_profile.cycles_pack_a,
         (unsigned long long) g_ame_profile.cycles_pack_b,
         (unsigned long long) g_ame_profile.cycles_zero_c,
-        (unsigned long long) g_ame_profile.cycles_gemm,
+        (unsigned long long) g_ame_profile.cycles_ame_tile_call,
         (unsigned long long) g_ame_profile.cycles_scale,
         (unsigned long long) g_ame_profile.cycles_store);
     fprintf(stderr,
-        "[AME_PROFILE] derived ops_per_cycle=%.2f macs_per_cycle=%.2f min_bytes=%llu sw_bytes_floor=%llu min_B_per_cycle=%.4f sw_B_per_cycle=%.4f\n",
+        "[AME_PROFILE] derived ops_per_cycle=%.2f macs_per_cycle=%.2f ame_tile_bytes_model=%llu tile_c_cpu_read_bytes_model=%llu dst_f32_write_bytes_model=%llu sw_bytes_model=%llu ame_tile_B_per_cycle=%.4f sw_B_per_cycle=%.4f\n",
         ops_per_cycle,
         macs_per_cycle,
-        (unsigned long long) bytes_min,
-        (unsigned long long) bytes_sw,
-        min_bytes_per_cycle,
+        (unsigned long long) ame_tile_bytes_model,
+        (unsigned long long) tile_c_cpu_read_bytes_model,
+        (unsigned long long) dst_f32_write_bytes_model,
+        (unsigned long long) sw_bytes_model,
+        ame_tile_bytes_per_cycle,
         sw_bytes_per_cycle);
     fflush(stderr);
+}
+
+void ggml_ame_profile_reset(void) {
+    memset(&g_ame_profile, 0, sizeof(g_ame_profile));
+}
+
+void ggml_ame_profile_dump_now(void) {
+    ame_profile_dump();
 }
 
 static int ame_profile_enabled(void) {
     static int cached = -1;
     static int registered = 0;
     if (cached == -1) {
-        const char * value = getenv("GGML_AME_PROFILE");
-        cached = 0;
-        if (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 &&
-            strcmp(value, "false") != 0 && strcmp(value, "off") != 0 && strcmp(value, "no") != 0) {
-            cached = 1;
-        }
+        cached = ame_env_enabled("GGML_AME_PROFILE") ? 1 : 0;
     }
     if (cached && !registered) {
         atexit(ame_profile_dump);
@@ -122,13 +267,14 @@ static void ame_profile_accumulate(const struct ame_profile_counters * local) {
     g_ame_profile.logical_macs         += local->logical_macs;
     g_ame_profile.tile_calls           += local->tile_calls;
     g_ame_profile.edge_tile_calls      += local->edge_tile_calls;
+    g_ame_profile.output_tile_calls    += local->output_tile_calls;
     g_ame_profile.cycles_baseline_total += local->cycles_baseline_total;
     g_ame_profile.cycles_packed_total  += local->cycles_packed_total;
     g_ame_profile.cycles_prepare_cache += local->cycles_prepare_cache;
     g_ame_profile.cycles_pack_a        += local->cycles_pack_a;
     g_ame_profile.cycles_pack_b        += local->cycles_pack_b;
     g_ame_profile.cycles_zero_c        += local->cycles_zero_c;
-    g_ame_profile.cycles_gemm          += local->cycles_gemm;
+    g_ame_profile.cycles_ame_tile_call += local->cycles_ame_tile_call;
     g_ame_profile.cycles_scale         += local->cycles_scale;
     g_ame_profile.cycles_store         += local->cycles_store;
 }
@@ -274,6 +420,20 @@ static size_t ggml_ame_q8_workspace_size(int64_t N, int64_t n_k_tiles) {
     size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
     size = ame_align_up_size(size, 64);
     size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up_size(size, 64);
+    size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
+    return size;
+}
+
+static size_t ggml_ame_q8_panel_workspace_size(int64_t N, int64_t n_k_tiles) {
+    GGML_UNUSED(N);
+
+    const size_t packed_b_panel_size = (size_t) n_k_tiles * AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    size_t size = 64;
+    size = ame_align_up_size(size, 64);
+    size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
+    size = ame_align_up_size(size, 64);
+    size += packed_b_panel_size;
     size = ame_align_up_size(size, 64);
     size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
     return size;
@@ -596,7 +756,9 @@ void ggml_ame_mul_mat_q8_0(
 
                 // Prepare Tile B (16 x 32)
                  prof_t0 = prof ? ame_read_cycle() : 0;
-                 memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+                 if (!ame_skip_tile_b_zero()) {
+                     memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+                 }
                  for (int j = 0; j < jmax; j++) {
                      const float * src1_col = (const float *)((const char *)src1 + (j0 + j) * src1_stride);
                      block_q8_0 tmp_block;
@@ -607,13 +769,15 @@ void ggml_ame_mul_mat_q8_0(
                 if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-                if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                if (!ame_skip_tile_c_zero()) {
+                    memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                    if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
                 if (prof) {
-                    prof_local.cycles_gemm += ame_read_cycle() - prof_t0;
+                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
                     prof_local.tile_calls++;
                     if (imax < AME_TILE_M || jmax < AME_TILE_N) {
                         prof_local.edge_tile_calls++;
@@ -643,7 +807,10 @@ void ggml_ame_mul_mat_q8_0(
                 M,
                 imax,
                 jmax);
-            if (prof) prof_local.cycles_store += ame_read_cycle() - prof_t0;
+            if (prof) {
+                prof_local.cycles_store += ame_read_cycle() - prof_t0;
+                prof_local.output_tile_calls++;
+            }
         }
     }
 
@@ -677,6 +844,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int64_t N = ne11;
     const int64_t K = ne00;
     const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+    const int use_packed_b_panel = ame_use_packed_b_panel();
+    const size_t tile_b_size = AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    const size_t packed_b_panel_size = (size_t) nb64 * tile_b_size;
     const int prof = ame_profile_enabled();
     struct ame_profile_counters prof_local = {0};
     uint64_t prof_total_start = 0;
@@ -689,7 +859,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const block_q8_ame64 * restrict x = (const block_q8_ame64 *) src0;
     float * restrict out = (float *) dst;
 
-    const size_t required_wsize = ggml_ame_q8_workspace_size(N, nb64);
+    const size_t required_wsize = use_packed_b_panel ?
+        ggml_ame_q8_panel_workspace_size(N, nb64) :
+        ggml_ame_q8_workspace_size(N, nb64);
     uint8_t * workspace = (uint8_t *) work_data;
     int allocated_workspace = 0;
 
@@ -709,7 +881,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
     ws_ptr = ame_align_up_size(ws_ptr, 64);
     int8_t * tile_b = (int8_t *) ws_ptr;
-    ws_ptr += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
+    ws_ptr += use_packed_b_panel ? packed_b_panel_size : tile_b_size;
 
     ws_ptr = ame_align_up_size(ws_ptr, 64);
     int32_t * tile_c = (int32_t *) ws_ptr;
@@ -724,7 +896,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
     ame_assert_phys_contiguous();
     memset(tile_a, 0, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-    memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    if (!use_packed_b_panel) {
+        memset(tile_b, 0, tile_b_size);
+    }
 
     uint64_t prof_t0 = prof ? ame_read_cycle() : 0;
     const float * xq_scales = NULL;
@@ -764,6 +938,123 @@ void ggml_ame_mul_mat_q8_0_ame64(
     }
     if (prof) prof_local.cycles_prepare_cache += ame_read_cycle() - prof_t0;
 
+    if (use_packed_b_panel) {
+        int8_t * packed_b_panel = tile_b;
+        AME_PANEL_LOG("ame64 packed_b_panel: M=%lld N=%lld K=%lld nb64=%lld panel_bytes=%zu",
+            (long long) M, (long long) N, (long long) K, (long long) nb64, packed_b_panel_size);
+
+        for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
+            const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
+
+            prof_t0 = prof ? ame_read_cycle() : 0;
+            memset(packed_b_panel, 0, packed_b_panel_size);
+            for (int64_t kb = 0; kb < nb64; ++kb) {
+                int8_t * panel_tile_b = packed_b_panel + kb * tile_b_size;
+                for (int j = 0; j < jmax; ++j) {
+                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
+                    memcpy(&panel_tile_b[j * AME_TILE_K], bx->qs, AME_Q8_PACK_K);
+                }
+            }
+            if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
+            AME_PANEL_LOG("ame64 packed_b_panel: j0=%lld jmax=%d packed", (long long) j0, jmax);
+            ame_ckpt_notify_start(M, N, K, j0);
+
+            for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
+                const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+                float acc_f32[AME_TILE_M * AME_TILE_N];
+                memset(acc_f32, 0, sizeof(acc_f32));
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld begin",
+                    (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
+
+                for (int64_t kb = 0; kb < nb64; ++kb) {
+                    float y_scales[AME_TILE_N];
+                    if ((kb & 7) == 0 || kb + 1 == nb64) {
+                        AME_PANEL_PROGRESS_LOG(
+                            "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld",
+                            (long long) M, (long long) N, (long long) K,
+                            (long long) j0, (long long) i0, (long long) kb, (long long) nb64);
+                    }
+
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    for (int i = 0; i < AME_TILE_M; ++i) {
+                        if (i < imax) {
+                            const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
+                            memcpy(&tile_a[i * AME_TILE_K], b->qs, AME_Q8_PACK_K);
+                        } else {
+                            memset(&tile_a[i * AME_TILE_K], 0, AME_Q8_PACK_K);
+                        }
+                    }
+                    if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
+
+                    for (int j = 0; j < jmax; ++j) {
+                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
+                        y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
+                    }
+
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    if (!ame_skip_tile_c_zero()) {
+                        memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                        if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                    }
+
+                    const int8_t * panel_tile_b = packed_b_panel + kb * tile_b_size;
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    ggml_ame_gemm_tile_i8_i32_bT(tile_a, panel_tile_b, tile_c);
+                    if (prof) {
+                        prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
+                        prof_local.tile_calls++;
+                        if (imax < AME_TILE_M || jmax < AME_TILE_N || (kb + 1) * AME_Q8_PACK_K > K) {
+                            prof_local.edge_tile_calls++;
+                        }
+                    }
+
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    for (int i = 0; i < imax; ++i) {
+                        const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
+                        const float d_x = GGML_FP16_TO_FP32(bx->d);
+                        ame_accumulate_scaled_row(
+                            &acc_f32[i * AME_TILE_N],
+                            &tile_c[i * AME_TILE_N],
+                            d_x,
+                            y_scales,
+                            jmax);
+                    }
+                    if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
+                }
+
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                ame_store_acc_tile(
+                    out + j0 * M + i0,
+                    acc_f32,
+                    M,
+                    imax,
+                    jmax);
+                if (prof) {
+                    prof_local.cycles_store += ame_read_cycle() - prof_t0;
+                    prof_local.output_tile_calls++;
+                }
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld done",
+                    (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
+            }
+            AME_PANEL_LOG("ame64 packed_b_panel: j0=%lld done", (long long) j0);
+        }
+        ame_ckpt_notify_stop(M, N, K);
+
+        if (prof) {
+            prof_local.cycles_packed_total = ame_read_cycle() - prof_total_start;
+            ame_profile_accumulate(&prof_local);
+        }
+
+        if (allocated_workspace) {
+            ggml_aligned_free(workspace, work_size);
+        }
+
+        GGML_UNUSED(ne10);
+        return;
+    }
+
     for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
         const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
 
@@ -787,7 +1078,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+                if (!ame_skip_tile_b_zero()) {
+                    memset(tile_b, 0, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+                }
                 for (int j = 0; j < jmax; ++j) {
                     const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
                     y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
@@ -796,13 +1089,15 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-                if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                if (!ame_skip_tile_c_zero()) {
+                    memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                    if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
                 if (prof) {
-                    prof_local.cycles_gemm += ame_read_cycle() - prof_t0;
+                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
                     prof_local.tile_calls++;
                     if (imax < AME_TILE_M || jmax < AME_TILE_N || (kb + 1) * AME_Q8_PACK_K > K) {
                         prof_local.edge_tile_calls++;
@@ -830,7 +1125,10 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 M,
                 imax,
                 jmax);
-            if (prof) prof_local.cycles_store += ame_read_cycle() - prof_t0;
+            if (prof) {
+                prof_local.cycles_store += ame_read_cycle() - prof_t0;
+                prof_local.output_tile_calls++;
+            }
         }
     }
 
