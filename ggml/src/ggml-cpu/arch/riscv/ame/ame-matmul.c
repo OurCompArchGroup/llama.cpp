@@ -546,6 +546,45 @@ static inline void ame_accumulate_scaled_row(
 #endif
 }
 
+static inline void ame_accumulate_scaled_tile(
+    float * restrict acc,
+    const int32_t * restrict c,
+    const float * restrict x_scales,
+    const float * restrict y_scales,
+    const int imax,
+    const int jmax
+) {
+#if defined(__riscv_v)
+    int j = 0;
+    while (j < jmax) {
+        const size_t vl = __riscv_vsetvl_e32m8((size_t) (jmax - j));
+        const vfloat32m8_t vy = __riscv_vle32_v_f32m8(y_scales + j, vl);
+
+        for (int i = 0; i < imax; ++i) {
+            float * restrict acc_row = acc + i * AME_TILE_N + j;
+            const int32_t * restrict c_row = c + i * AME_TILE_N + j;
+
+            const vint32m8_t vc_i32 = __riscv_vle32_v_i32m8(c_row, vl);
+            const vfloat32m8_t vc_f32 = __riscv_vfcvt_f_x_v_f32m8(vc_i32, vl);
+            const vfloat32m8_t vscale = __riscv_vfmul_vf_f32m8(vy, x_scales[i], vl);
+            vfloat32m8_t vacc = __riscv_vle32_v_f32m8(acc_row, vl);
+
+            vacc = __riscv_vfmacc_vv_f32m8(vacc, vc_f32, vscale, vl);
+            __riscv_vse32_v_f32m8(acc_row, vacc, vl);
+        }
+
+        j += (int) vl;
+    }
+#else
+    for (int i = 0; i < imax; ++i) {
+        const float d_x = x_scales[i];
+        for (int j = 0; j < jmax; ++j) {
+            acc[i * AME_TILE_N + j] += c[i * AME_TILE_N + j] * (d_x * y_scales[j]);
+        }
+    }
+#endif
+}
+
 static inline void ame_store_acc_tile(
     float * restrict out,
     const float * restrict acc,
@@ -553,11 +592,24 @@ static inline void ame_store_acc_tile(
     const int imax,
     const int jmax
 ) {
-    for (int i = 0; i < imax; ++i) {
-        for (int j = 0; j < jmax; ++j) {
+#if defined(__riscv_v)
+    const ptrdiff_t acc_stride = (ptrdiff_t) AME_TILE_N * (ptrdiff_t) sizeof(float);
+    for (int j = 0; j < jmax; ++j) {
+        int i = 0;
+        while (i < imax) {
+            const size_t vl = __riscv_vsetvl_e32m8((size_t) (imax - i));
+            const vfloat32m8_t v = __riscv_vlse32_v_f32m8(acc + i * AME_TILE_N + j, acc_stride, vl);
+            __riscv_vse32_v_f32m8(out + (int64_t) j * M + i, v, vl);
+            i += (int) vl;
+        }
+    }
+#else
+    for (int j = 0; j < jmax; ++j) {
+        for (int i = 0; i < imax; ++i) {
             out[(int64_t) j * M + i] = acc[i * AME_TILE_N + j];
         }
     }
+#endif
 }
 
 struct ame_x_q64_cache {
@@ -740,7 +792,9 @@ void ggml_ame_mul_mat_q8_0(
 
             for (int64_t kb = 0; kb < nb_x; kb++) {
                 float y_scales[AME_TILE_N];
+                float x_scales[AME_TILE_M];
                 memset(y_scales, 0, sizeof(y_scales));
+                memset(x_scales, 0, sizeof(x_scales));
 
                 // Prepare Tile A (16 x 32)
                 uint64_t prof_t0 = prof ? ame_read_cycle() : 0;
@@ -788,14 +842,15 @@ void ggml_ame_mul_mat_q8_0(
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 for (int i = 0; i < imax; i++) {
                      const block_q8_0 * bx = &x[(i0 + i) * nb_x + kb];
-                     const float d_x = GGML_FP16_TO_FP32(bx->d);
-                     ame_accumulate_scaled_row(
-                         &acc_f32[i * AME_TILE_N],
-                         &tile_c[i * AME_TILE_N],
-                         d_x,
-                         y_scales,
-                         jmax);
+                     x_scales[i] = GGML_FP16_TO_FP32(bx->d);
                 }
+                ame_accumulate_scaled_tile(
+                    acc_f32,
+                    tile_c,
+                    x_scales,
+                    y_scales,
+                    imax,
+                    jmax);
                 if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
             }
 
@@ -969,6 +1024,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
                 for (int64_t kb = 0; kb < nb64; ++kb) {
                     float y_scales[AME_TILE_N];
+                    float x_scales[AME_TILE_M];
                     if ((kb & 7) == 0 || kb + 1 == nb64) {
                         AME_PANEL_PROGRESS_LOG(
                             "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld",
@@ -1012,14 +1068,15 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     prof_t0 = prof ? ame_read_cycle() : 0;
                     for (int i = 0; i < imax; ++i) {
                         const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                        const float d_x = GGML_FP16_TO_FP32(bx->d);
-                        ame_accumulate_scaled_row(
-                            &acc_f32[i * AME_TILE_N],
-                            &tile_c[i * AME_TILE_N],
-                            d_x,
-                            y_scales,
-                            jmax);
+                        x_scales[i] = GGML_FP16_TO_FP32(bx->d);
                     }
+                    ame_accumulate_scaled_tile(
+                        acc_f32,
+                        tile_c,
+                        x_scales,
+                        y_scales,
+                        imax,
+                        jmax);
                     if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
                 }
 
@@ -1065,6 +1122,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
             for (int64_t kb = 0; kb < nb64; ++kb) {
                 float y_scales[AME_TILE_N];
+                float x_scales[AME_TILE_M];
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 for (int i = 0; i < AME_TILE_M; ++i) {
@@ -1107,14 +1165,15 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 for (int i = 0; i < imax; ++i) {
                     const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                    const float d_x = GGML_FP16_TO_FP32(bx->d);
-                    ame_accumulate_scaled_row(
-                        &acc_f32[i * AME_TILE_N],
-                        &tile_c[i * AME_TILE_N],
-                        d_x,
-                        y_scales,
-                        jmax);
+                    x_scales[i] = GGML_FP16_TO_FP32(bx->d);
                 }
+                ame_accumulate_scaled_tile(
+                    acc_f32,
+                    tile_c,
+                    x_scales,
+                    y_scales,
+                    imax,
+                    jmax);
                 if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
             }
 
