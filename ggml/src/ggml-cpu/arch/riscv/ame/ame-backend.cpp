@@ -12,7 +12,6 @@
 #include "traits.h"
 
 #include <cassert>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
@@ -111,43 +110,6 @@ static void reference_mul_mat_q8_0_f32(
     free(y);
 }
 
-static float reference_dot_bf16(const ggml_bf16_t * a, const ggml_bf16_t * b, int64_t K) {
-    float sum = 0.0f;
-    for (int64_t k = 0; k < K; ++k) {
-        sum += GGML_BF16_TO_FP32(a[k]) * GGML_BF16_TO_FP32(b[k]);
-    }
-    return sum;
-}
-
-static void reference_mul_mat_bf16_f32(
-    const void * src0_data,
-    ggml_type src1_type,
-    const void * src1_data,
-    float * dst_data,
-    int64_t M, int64_t N, int64_t K,
-    size_t src1_stride_bytes
-) {
-    const ggml_bf16_t * a = (const ggml_bf16_t *) src0_data;
-    std::vector<ggml_bf16_t> src1_bf16;
-
-    if (src1_type == GGML_TYPE_F32) {
-        src1_bf16.resize((size_t) N * (size_t) K);
-        for (int64_t n = 0; n < N; ++n) {
-            const float * src1_col = (const float *) ((const char *) src1_data + n * src1_stride_bytes);
-            ggml_cpu_fp32_to_bf16(src1_col, src1_bf16.data() + n * K, K);
-        }
-    }
-
-    for (int64_t n = 0; n < N; ++n) {
-        const ggml_bf16_t * b_col = src1_type == GGML_TYPE_BF16
-            ? (const ggml_bf16_t *) ((const char *) src1_data + n * src1_stride_bytes)
-            : src1_bf16.data() + n * K;
-        for (int64_t m = 0; m < M; ++m) {
-            dst_data[n * M + m] = reference_dot_bf16(a + m * K, b_col, K);
-        }
-    }
-}
-
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16;
@@ -169,58 +131,6 @@ static bool ame_parse_env_bool(const char * name) {
         return false;
     }
     return true;
-}
-
-static bool ame_diff_enabled() {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_parse_env_bool("GGML_AME_DIFF") ? 1 : 0;
-    }
-    return cached == 1;
-}
-
-static void ame_report_diff(
-    const char * tag,
-    const float * got,
-    const float * ref,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    float threshold
-) {
-    float max_abs = 0.0f;
-    int64_t max_i = 0;
-    int64_t max_j = 0;
-    float got_v = 0.0f;
-    float ref_v = 0.0f;
-
-    for (int64_t j = 0; j < N; ++j) {
-        for (int64_t i = 0; i < M; ++i) {
-            const float cur_got = got[j * M + i];
-            const float cur_ref = ref[j * M + i];
-            const float cur_abs = fabsf(cur_got - cur_ref);
-            if (cur_abs > max_abs) {
-                max_abs = cur_abs;
-                max_i = i;
-                max_j = j;
-                got_v = cur_got;
-                ref_v = cur_ref;
-            }
-        }
-    }
-
-    fprintf(stderr,
-            "[AME-DIFF] %s M=%lld N=%lld K=%lld max_abs=%.6f at (%lld,%lld) got=%.6f ref=%.6f%s\n",
-            tag,
-            (long long) M,
-            (long long) N,
-            (long long) K,
-            max_abs,
-            (long long) max_i,
-            (long long) max_j,
-            got_v,
-            ref_v,
-            max_abs > threshold ? " <!>" : "");
 }
 
 static bool ame_use_packed_q8() {
@@ -392,23 +302,6 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
         );
     }
 
-    if (ame_diff_enabled()) {
-        std::vector<float> ref((size_t) ne01 * (size_t) ne11, 0.0f);
-        const float threshold = 0.01f;
-
-        if (src0->type == GGML_TYPE_BF16) {
-            reference_mul_mat_bf16_f32(
-                src0->data,
-                src1->type,
-                src1->data,
-                ref.data(),
-                ne01, ne11, ne00,
-                src1->nb[1]
-            );
-            ame_report_diff("bf16", (const float *) dst->data, ref.data(), ne01, ne11, ne00, threshold);
-        }
-    }
-
     GGML_UNUSED(params);
 }
 
@@ -471,18 +364,9 @@ public:
                 );
                 return true;
             }
-            if (src0->type == GGML_TYPE_BF16 &&
-                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16)) {
-                reference_mul_mat_bf16_f32(
-                    src0->data,
-                    src1->type,
-                    src1->data,
-                    (float *) op->data,
-                    M, N, K,
-                    src1->nb[1]
-                );
-                return true;
-            }
+            GGML_UNUSED(M);
+            GGML_UNUSED(N);
+            GGML_UNUSED(K);
             return false;
         }
 
