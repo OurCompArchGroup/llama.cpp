@@ -722,14 +722,11 @@ function gg_run_riscv_ame {
         -DGGML_RV_ZVFH=ON \
         -DGGML_RVV=ON \
         -DGGML_OPENMP=OFF \
-        -DLLAMA_BUILD_EXAMPLES=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_BUILD_TESTS=ON) 2>&1 | tee -a $OUT/${ci}-cmake.log
 
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
-
-    (time bash -lc "${qemu_run} ./bin/llama-simple-xsai -m \"${GG_RV_AME_MODEL_BF16}\" --bf16-smoke-once") \
-        2>&1 | tee -a $OUT/${ci}-smoke.log
 
     (time bash -lc "${qemu_run} ./bin/test-backend-ops support -b CPU --buft RISCV_AME -o MUL_MAT --output csv") \
         2>&1 | tee -a $OUT/${ci}-support.csv
@@ -797,7 +794,6 @@ function gg_sum_riscv_ame {
 
     gg_printf 'RISC-V AME local integration:\n'
     gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '- smoke:\n```\n%s\n```\n' "$(tail -n 20 $OUT/${ci}-smoke.log)"
     gg_printf '- support focus:\n```\n%s\n```\n' "$(cat $OUT/${ci}-support-focus.csv)"
     gg_printf '- ppl summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-summary.log)"
     gg_printf '- backend q8:\n```\n%s\n```\n' "$(tail -n 30 $OUT/${ci}-backend-q8.log)"

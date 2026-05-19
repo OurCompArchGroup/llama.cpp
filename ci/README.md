@@ -46,7 +46,6 @@ bash ./ci/run.sh ./tmp/results ./tmp/mnt
 When `GG_BUILD_RV_AME=1` is set, `ci/run.sh` switches to an AME-specific integration flow instead of the default native CI suite. The AME mode:
 
 - cross-builds llama.cpp with `GGML_RV_AME=ON`
-- runs the BF16 smoke test via `llama-simple-xsai --bf16-smoke-once`
 - runs `test-backend-ops` support and correctness checks for representative `RISCV_AME` `MUL_MAT` cases
 - runs `llama-perplexity` on `wikitext-2`
 - checks the BF16/F16 perplexity delta when both model paths are provided

@@ -465,7 +465,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/arch/riscv/ame/ame_gemm_tile_i8_i32_bT.c
                 ggml-cpu/arch/riscv/ame/ame_gemm_tile_bf16_fp32_bT.c
-                ggml-cpu/arch/riscv/ame/ame-bf16-smoke.c
                 ggml-cpu/arch/riscv/ame/ame-matmul.c
                 ggml-cpu/arch/riscv/ame/ame-helper.c
                 ggml-cpu/arch/riscv/ame/ame-backend.cpp

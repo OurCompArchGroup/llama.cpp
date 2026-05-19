@@ -426,8 +426,6 @@ void ggml_ame_mul_mat_q4_0(
     size_t src1_stride
 );
 
-int ggml_ame_bf16_smoke_once(void);
-
 #ifdef __cplusplus
 }
 #endif
