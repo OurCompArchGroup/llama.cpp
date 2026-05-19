@@ -50,6 +50,11 @@
 
 #if defined(__riscv)
 void nemu_signal(int a){
+    const char * alloc_mode = getenv("XSAI_ALLOC_MODE");
+    if (alloc_mode != nullptr &&
+            (strcmp(alloc_mode, "malloc") == 0 || strcmp(alloc_mode, "anon-host-test") == 0)) {
+        return;
+    }
     asm volatile ("mv a0, %0\n\t"
                   ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
                   :
@@ -87,6 +92,18 @@ static inline uint64_t read_instret(void) {
     return c;
 #else
     return 0;
+#endif
+}
+
+#if defined(__GNUC__)
+extern "C" void ggml_ame_profile_reset(void) __attribute__((weak));
+#endif
+
+static void reset_ame_profile_if_available(void) {
+#if defined(__GNUC__)
+    if (ggml_ame_profile_reset != nullptr) {
+        ggml_ame_profile_reset();
+    }
 #endif
 }
 
@@ -1758,6 +1775,7 @@ struct test_case {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
+        reset_ame_profile_if_available();
 
         // determine number of runs
         int n_runs;
@@ -7962,6 +7980,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
@@ -8676,8 +8695,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 128, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 8192, {1, 1}, {1, 1}));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
