@@ -25,15 +25,6 @@
 # # with KLEIDIAI support
 # GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
-# # with RISC-V AME support
-# GG_BUILD_RV_AME=1 \
-# GG_RV_AME_LLVM_HOME=/path/to/llvm \
-# GG_RV_AME_SYSROOT=/path/to/sysroot \
-# GG_RV_AME_QEMU_BIN=/path/to/qemu-riscv64 \
-# GG_RV_AME_MODEL_BF16=/path/to/model-bf16.gguf \
-# GG_RV_AME_MODEL_BASELINE=/path/to/model-baseline.gguf \
-# bash ./ci/run.sh ./tmp/results ./tmp/mnt
-#
 
 if [ -z "$2" ]; then
     echo "usage: $0 <output-dir> <mnt-dir>"
@@ -49,8 +40,6 @@ MNT=$(realpath "$2")
 rm -f $OUT/*.log
 rm -f $OUT/*.exit
 rm -f $OUT/*.md
-rm -f $OUT/*.csv
-rm -f $OUT/*.jsonl
 
 sd=`dirname $0`
 cd $sd/../
@@ -632,291 +621,6 @@ function gg_sum_rerank_tiny {
     gg_printf '- f16: \n```\n%s\n```\n' "$(cat $OUT/${ci}-rk-f16.log)"
 }
 
-# riscv_ame
-
-function gg_require_rv_ame_env {
-    if [ -z "${GG_RV_AME_LLVM_HOME}" ]; then
-        echo >&2 "Missing GG_RV_AME_LLVM_HOME"
-        exit 1
-    fi
-
-    if [ -z "${GG_RV_AME_SYSROOT}" ]; then
-        echo >&2 "Missing GG_RV_AME_SYSROOT"
-        exit 1
-    fi
-
-    if [ -z "${GG_RV_AME_QEMU_BIN}" ]; then
-        echo >&2 "Missing GG_RV_AME_QEMU_BIN"
-        exit 1
-    fi
-
-    if [ -z "${GG_RV_AME_MODEL_BF16}" ]; then
-        echo >&2 "Missing GG_RV_AME_MODEL_BF16"
-        exit 1
-    fi
-
-    if [ -z "${GG_RV_AME_MODEL_BASELINE}" ] && [ ! -z "${GG_RV_AME_MODEL_F16}" ]; then
-        GG_RV_AME_MODEL_BASELINE="${GG_RV_AME_MODEL_F16}"
-    fi
-
-    if [ -z "${GG_RV_AME_MODEL_BASELINE}" ]; then
-        echo >&2 "Missing GG_RV_AME_MODEL_BASELINE"
-        exit 1
-    fi
-
-    if [ ! -d "${GG_RV_AME_LLVM_HOME}" ]; then
-        echo >&2 "LLVM dir not found: ${GG_RV_AME_LLVM_HOME}"
-        exit 1
-    fi
-
-    if [ ! -d "${GG_RV_AME_SYSROOT}" ]; then
-        echo >&2 "Sysroot dir not found: ${GG_RV_AME_SYSROOT}"
-        exit 1
-    fi
-
-    if [ ! -x "${GG_RV_AME_QEMU_BIN}" ]; then
-        echo >&2 "QEMU binary not executable: ${GG_RV_AME_QEMU_BIN}"
-        exit 1
-    fi
-
-    if [ ! -f "${GG_RV_AME_MODEL_BF16}" ]; then
-        echo >&2 "BF16 model not found: ${GG_RV_AME_MODEL_BF16}"
-        exit 1
-    fi
-
-    if [ ! -f "${GG_RV_AME_MODEL_BASELINE}" ]; then
-        echo >&2 "Baseline model not found: ${GG_RV_AME_MODEL_BASELINE}"
-        exit 1
-    fi
-
-    GG_RV_AME_LLVM_HOME=$(realpath "${GG_RV_AME_LLVM_HOME}")
-    GG_RV_AME_SYSROOT=$(realpath "${GG_RV_AME_SYSROOT}")
-    GG_RV_AME_QEMU_BIN=$(realpath "${GG_RV_AME_QEMU_BIN}")
-    GG_RV_AME_MODEL_BF16=$(realpath "${GG_RV_AME_MODEL_BF16}")
-    GG_RV_AME_MODEL_BASELINE=$(realpath "${GG_RV_AME_MODEL_BASELINE}")
-}
-
-function gg_extract_rv_ame_ppl {
-    local log_file="$1"
-    grep 'Final estimate: PPL =' "${log_file}" | tail -n 1 | sed -E 's/.*PPL = ([0-9.]+).*/\1/'
-}
-
-function gg_extract_rv_ame_bench_ts {
-    local log_file="$1"
-    grep -m 1 '"avg_ts"' "${log_file}" | sed -E 's/.*"avg_ts": ([0-9.]+).*/\1/'
-}
-
-function gg_run_riscv_ame {
-    cd ${SRC}
-
-    gg_require_rv_ame_env
-
-    command -v wget >/dev/null 2>&1
-    command -v unzip >/dev/null 2>&1
-
-    local qemu_cpu="${GG_RV_AME_QEMU_CPU:-rv64,v=true,vlen=128,h=true,zvfh=true,zvfhmin=true,zvfbfwma=true,zvfbfmin=true,zfbfmin=true,x-matrix=true,rlen=512,mlen=65536,melen=32}"
-    local qemu_run="${GG_RV_AME_QEMU_BIN} -cpu ${qemu_cpu} -L ${GG_RV_AME_SYSROOT}"
-    local ppl_ctx="${GG_RV_AME_PPL_CTX:-64}"
-    local ppl_batch="${GG_RV_AME_PPL_BATCH:-64}"
-    local ppl_chunks="${GG_RV_AME_PPL_CHUNKS:-8}"
-    local ppl_delta_max="${GG_RV_AME_PPL_MAX_DELTA:-20.0}"
-    local ppl_rel_delta_max="${GG_RV_AME_PPL_MAX_REL_DELTA:-0.01}"
-    local bench_prompt="${GG_RV_AME_BENCH_PROMPT:-64}"
-    local bench_batch="${GG_RV_AME_BENCH_BATCH:-64}"
-    local bench_ubatch="${GG_RV_AME_BENCH_UBATCH:-64}"
-    local bench_repetitions="${GG_RV_AME_BENCH_REPETITIONS:-3}"
-    local bench_min_ratio="${GG_RV_AME_BENCH_MIN_RATIO:-0.50}"
-    local wiki_dir="${MNT}/wikitext"
-    local wiki_zip="${wiki_dir}/wikitext-2-raw-v1.zip"
-    local wiki_test="${wiki_dir}/wikitext-2-raw/wiki.test.raw"
-    local rv_ame_status=0
-
-    mkdir -p "${wiki_dir}"
-    gg_wget "${wiki_dir}" https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-    unzip -o "${wiki_zip}" -d "${wiki_dir}" 2>&1 | tee -a $OUT/${ci}-data.log
-
-    rm -rf build-ci-rv-ame && mkdir build-ci-rv-ame && cd build-ci-rv-ame
-
-    set -e
-
-    (time cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE=../cmake/riscv64-toolchain.cmake \
-        -DRISCV_ROOT_PATH="${GG_RV_AME_LLVM_HOME}" \
-        -DRISCV_SYSROOT="${GG_RV_AME_SYSROOT}" \
-        -DRISCV_TRIPLE="riscv64-unknown-linux-gnu" \
-        -DRISCV_MARCH="rv64gc_zba_zicbop" \
-        -DRISCV_MABI="lp64d" \
-        -DRISCV_USE_LLVM=ON \
-        -DGGML_CCACHE=OFF \
-        -DLLAMA_CURL=OFF \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DGGML_RV_AME=ON \
-        -DGGML_RV_ZFH=ON \
-        -DGGML_RV_ZVFH=ON \
-        -DGGML_RVV=ON \
-        -DGGML_OPENMP=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        -DLLAMA_BUILD_TOOLS=ON \
-        -DLLAMA_BUILD_TESTS=ON) 2>&1 | tee -a $OUT/${ci}-cmake.log
-
-    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
-
-    local ame_backend_params='type_a=(q8_0|bf16),type_b=(f32|bf16),m=(288|768),n=128,k=(288|768),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1'
-
-    (time bash -lc "${qemu_run} ./bin/test-backend-ops support -b CPU --buft RISCV_AME -o MUL_MAT -p '${ame_backend_params}' --output csv") \
-        2>&1 | tee -a $OUT/${ci}-support.csv
-
-    grep -E 'type_a=(q8_0|bf16)' $OUT/${ci}-support.csv | tee -a $OUT/${ci}-support-focus.csv
-
-    grep -q '"support","1","yes"' $OUT/${ci}-support-focus.csv
-    awk -F, '
-        /"support","1","yes"/ { n++ }
-        END {
-            if (n < 12) {
-                printf("Expected at least 12 AME MUL_MAT support cases, got %d\n", n) > "/dev/stderr";
-                exit 1;
-            }
-        }
-    ' $OUT/${ci}-support-focus.csv
-
-    (time bash -lc "${qemu_run} ./bin/test-backend-ops test -b CPU --buft RISCV_AME -o MUL_MAT -p '${ame_backend_params}' --output console") \
-        2>&1 | tee -a $OUT/${ci}-backend-ops.log
-
-    (time bash -lc "${qemu_run} ./bin/llama-perplexity --model \"${GG_RV_AME_MODEL_BF16}\" -f \"${wiki_test}\" -c ${ppl_ctx} -b ${ppl_batch} --chunks ${ppl_chunks}") \
-        2>&1 | tee -a $OUT/${ci}-ppl-bf16.log
-
-    local ppl_bf16
-    ppl_bf16=$(gg_extract_rv_ame_ppl $OUT/${ci}-ppl-bf16.log)
-    if [ -z "${ppl_bf16}" ]; then
-        echo >&2 "Failed to parse BF16 perplexity"
-        exit 1
-    fi
-
-    (time bash -lc "${qemu_run} ./bin/llama-perplexity --model \"${GG_RV_AME_MODEL_BASELINE}\" -f \"${wiki_test}\" -c ${ppl_ctx} -b ${ppl_batch} --chunks ${ppl_chunks}") \
-        2>&1 | tee -a $OUT/${ci}-ppl-baseline.log
-
-    local ppl_baseline
-    ppl_baseline=$(gg_extract_rv_ame_ppl $OUT/${ci}-ppl-baseline.log)
-    if [ -z "${ppl_baseline}" ]; then
-        echo >&2 "Failed to parse baseline perplexity"
-        exit 1
-    fi
-
-    printf 'PPL_CTX=%s\n' "${ppl_ctx}" | tee -a $OUT/${ci}-ppl-summary.log
-    printf 'PPL_BATCH=%s\n' "${ppl_batch}" | tee -a $OUT/${ci}-ppl-summary.log
-    printf 'PPL_CHUNKS=%s\n' "${ppl_chunks}" | tee -a $OUT/${ci}-ppl-summary.log
-    printf 'PPL_BASELINE_MODEL=%s\n' "${GG_RV_AME_MODEL_BASELINE}" | tee -a $OUT/${ci}-ppl-summary.log
-    printf 'PPL_BF16=%s\n' "${ppl_bf16}" | tee -a $OUT/${ci}-ppl-summary.log
-    printf 'PPL_BASELINE=%s\n' "${ppl_baseline}" | tee -a $OUT/${ci}-ppl-summary.log
-
-    set +e
-    awk -v a="${ppl_bf16}" -v b="${ppl_baseline}" -v t_abs="${ppl_delta_max}" -v t_rel="${ppl_rel_delta_max}" '
-        BEGIN {
-            d = a - b;
-            if (d < 0) d = -d;
-            rel = b == 0 ? 0 : d / b;
-            fail = (b == 0 && d > t_abs) || (b != 0 && d > t_abs && rel > t_rel);
-            printf("PPL_DELTA=%.6f\n", d);
-            printf("PPL_REL_DELTA=%.6f\n", rel);
-            printf("PPL_DELTA_MAX=%.6f\n", t_abs);
-            printf("PPL_REL_DELTA_MAX=%.6f\n", t_rel);
-            printf("PPL_STATUS=%s\n", fail ? "FAIL" : "OK");
-            if (fail) {
-                printf("PPL_CHECK=FAIL: PPL drift exceeds the configured absolute and relative thresholds\n");
-                printf("PPL delta %.6f and relative delta %.6f exceed thresholds %.6f / %.6f\n", d, rel, t_abs, t_rel) > "/dev/stderr";
-                exit 1;
-            }
-            printf("PPL_CHECK=OK: PPL drift is within the configured thresholds\n");
-        }
-    ' | tee -a $OUT/${ci}-ppl-summary.log
-    local ppl_status=${PIPESTATUS[0]}
-    set -e
-    if [ "${ppl_status}" -ne 0 ]; then
-        rv_ame_status=1
-    fi
-
-    (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_BASELINE}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
-        2>&1 | tee -a $OUT/${ci}-bench-baseline.jsonl
-    (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_BF16}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
-        2>&1 | tee -a $OUT/${ci}-bench-bf16.jsonl
-
-    local bench_baseline_ts
-    local bench_bf16_ts
-    bench_baseline_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-baseline.jsonl)
-    bench_bf16_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-bf16.jsonl)
-    if [ -z "${bench_baseline_ts}" ] || [ -z "${bench_bf16_ts}" ]; then
-        echo >&2 "Failed to parse llama-bench throughput"
-        exit 1
-    fi
-
-    printf 'BENCH_PROMPT=%s\n' "${bench_prompt}" | tee -a $OUT/${ci}-bench-summary.log
-    printf 'BENCH_BATCH=%s\n' "${bench_batch}" | tee -a $OUT/${ci}-bench-summary.log
-    printf 'BENCH_UBATCH=%s\n' "${bench_ubatch}" | tee -a $OUT/${ci}-bench-summary.log
-    printf 'BENCH_REPETITIONS=%s\n' "${bench_repetitions}" | tee -a $OUT/${ci}-bench-summary.log
-    printf 'BENCH_BASELINE_AVG_TS=%s\n' "${bench_baseline_ts}" | tee -a $OUT/${ci}-bench-summary.log
-    printf 'BENCH_BF16_AVG_TS=%s\n' "${bench_bf16_ts}" | tee -a $OUT/${ci}-bench-summary.log
-    set +e
-    awk -v a="${bench_bf16_ts}" -v b="${bench_baseline_ts}" -v t="${bench_min_ratio}" '
-        BEGIN {
-            ratio = b == 0 ? 0 : a / b;
-            fail = ratio < t;
-            printf("BENCH_BF16_TO_BASELINE_RATIO=%.6f\n", ratio);
-            printf("BENCH_MIN_RATIO=%.6f\n", t);
-            printf("BENCH_STATUS=%s\n", fail ? "FAIL" : "OK");
-            if (fail) {
-                printf("BENCH_CHECK=FAIL: BF16 throughput ratio is below the configured threshold\n");
-                printf("BF16 bench ratio %.6f is below threshold %.6f\n", ratio, t) > "/dev/stderr";
-                exit 1;
-            }
-            printf("BENCH_CHECK=OK: BF16 throughput ratio is within the configured threshold\n");
-        }
-    ' | tee -a $OUT/${ci}-bench-summary.log
-    local bench_status=${PIPESTATUS[0]}
-    set -e
-    if [ "${bench_status}" -ne 0 ]; then
-        rv_ame_status=1
-    fi
-
-    {
-        if [ "${rv_ame_status}" -eq 0 ]; then
-            printf 'AME_CI_STATUS=OK\n'
-            printf 'AME_CI_CHECK=OK: backend ops, PPL, and bench checks all passed\n'
-        else
-            printf 'AME_CI_STATUS=FAIL\n'
-            printf 'AME_CI_CHECK=FAIL: one or more AME CI checks failed\n'
-        fi
-        printf '\n'
-        printf '[backend-ops]\n'
-        printf 'BACKEND_OPS_STATUS=OK\n'
-        printf 'BACKEND_OPS_CHECK=OK: AME MUL_MAT support and correctness checks passed\n'
-        printf '\n'
-        printf '[ppl]\n'
-        cat $OUT/${ci}-ppl-summary.log
-        printf '\n'
-        printf '[bench]\n'
-        cat $OUT/${ci}-bench-summary.log
-    } > $OUT/${ci}-checks.log
-
-    if [ "${rv_ame_status}" -ne 0 ]; then
-        exit "${rv_ame_status}"
-    fi
-
-    set +e
-}
-
-function gg_sum_riscv_ame {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'RISC-V AME local integration:\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '- support focus:\n```\n%s\n```\n' "$(cat $OUT/${ci}-support-focus.csv)"
-    gg_printf '- ppl summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-summary.log)"
-    gg_printf '- bench summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-bench-summary.log 2>/dev/null || true)"
-    gg_printf '- combined checks:\n```\n%s\n```\n' "$(cat $OUT/${ci}-checks.log 2>/dev/null || true)"
-    gg_printf '- backend ops:\n```\n%s\n```\n' "$(tail -n 40 $OUT/${ci}-backend-ops.log)"
-}
-
 function gg_check_build_requirements {
     if ! command -v cmake &> /dev/null; then
         gg_printf 'cmake not found, please install'
@@ -936,7 +640,7 @@ function gg_check_build_requirements {
 export LLAMA_LOG_PREFIX=1
 export LLAMA_LOG_TIMESTAMPS=1
 
-if [ -z "${GG_BUILD_LOW_PERF}" ] && [ -z "${GG_BUILD_RV_AME}" ]; then
+if [ -z ${GG_BUILD_LOW_PERF} ]; then
     # Create symlink: ./llama.cpp/models-mnt -> $MNT/models
     rm -rf ${SRC}/models-mnt
     mnt_models=${MNT}/models
@@ -956,25 +660,21 @@ fi
 
 ret=0
 
-if [ ! -z "${GG_BUILD_RV_AME}" ]; then
-    test $ret -eq 0 && gg_run riscv_ame
-else
-    test $ret -eq 0 && gg_run ctest_debug
-    test $ret -eq 0 && gg_run ctest_release
+test $ret -eq 0 && gg_run ctest_debug
+test $ret -eq 0 && gg_run ctest_release
 
-    if [ -z ${GG_BUILD_LOW_PERF} ]; then
-        test $ret -eq 0 && gg_run embd_bge_small
-        test $ret -eq 0 && gg_run rerank_tiny
+if [ -z ${GG_BUILD_LOW_PERF} ]; then
+    test $ret -eq 0 && gg_run embd_bge_small
+    test $ret -eq 0 && gg_run rerank_tiny
 
-        if [ -z ${GG_BUILD_CLOUD} ] || [ ${GG_BUILD_EXTRA_TESTS_0} ]; then
-            test $ret -eq 0 && gg_run test_scripts
-        fi
-
-        test $ret -eq 0 && gg_run qwen3_0_6b
-
-        test $ret -eq 0 && gg_run ctest_with_model_debug
-        test $ret -eq 0 && gg_run ctest_with_model_release
+    if [ -z ${GG_BUILD_CLOUD} ] || [ ${GG_BUILD_EXTRA_TESTS_0} ]; then
+        test $ret -eq 0 && gg_run test_scripts
     fi
+
+    test $ret -eq 0 && gg_run qwen3_0_6b
+
+    test $ret -eq 0 && gg_run ctest_with_model_debug
+    test $ret -eq 0 && gg_run ctest_with_model_release
 fi
 
 cat $OUT/README.md
