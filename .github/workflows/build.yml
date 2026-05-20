@@ -2085,6 +2085,98 @@ jobs:
           cd build
           ctest -L main --verbose
 
+  ggml-ci-x64-riscv-ame:
+    # Use the default labels from a local x86_64 Linux self-hosted runner.
+    runs-on: [self-hosted, Linux, X64]
+
+    env:
+      # Local-only defaults for the current development host. Switch these back
+      # to repo variables before proposing the workflow upstream.
+      GG_RV_AME_LLVM_HOME: /nfs/home/share/jiaxiaoyu/triton-cpu-llvm-install-self-define
+      GG_RV_AME_SYSROOT: /nfs/share/riscv-toolchain-gcc15-250103/sysroot
+      GG_RV_AME_QEMU_BIN: ../../../../../qemu/build/qemu-riscv64
+      GG_RV_AME_QEMU_CPU: rv64,v=true,vlen=128,h=true,zvfh=true,zvfhmin=true,zvfbfwma=true,zvfbfmin=true,zfbfmin=true,x-matrix=true,rlen=512,mlen=65536,melen=32
+      GG_RV_AME_MODEL_BF16: ../models/stories15M/stories15M-BF16.gguf
+      GG_RV_AME_MODEL_BASELINE: ../models/stories15M/stories15M.gguf
+      GG_RV_AME_PPL_CTX: '64'
+      GG_RV_AME_PPL_BATCH: '64'
+      GG_RV_AME_PPL_CHUNKS: '8'
+      GG_RV_AME_PPL_MAX_DELTA: '20.0'
+      GG_RV_AME_PPL_MAX_REL_DELTA: '0.01'
+      GG_RV_AME_BENCH_PROMPT: '64'
+      GG_RV_AME_BENCH_BATCH: '64'
+      GG_RV_AME_BENCH_UBATCH: '64'
+      GG_RV_AME_BENCH_REPETITIONS: '3'
+      GG_RV_AME_BENCH_MIN_RATIO: '0.50'
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Check AME environment
+        run: |
+          set -euxo pipefail
+
+          test -n "${GG_RV_AME_LLVM_HOME}"
+          test -n "${GG_RV_AME_SYSROOT}"
+          test -n "${GG_RV_AME_QEMU_BIN}"
+          test -n "${GG_RV_AME_MODEL_BF16}"
+          test -n "${GG_RV_AME_MODEL_BASELINE}"
+
+          test -d "${GG_RV_AME_LLVM_HOME}"
+          test -d "${GG_RV_AME_SYSROOT}"
+          test -x "${GG_RV_AME_QEMU_BIN}"
+          test -f "${GG_RV_AME_MODEL_BF16}"
+          test -f "${GG_RV_AME_MODEL_BASELINE}"
+
+          test -x "${GG_RV_AME_LLVM_HOME}/bin/clang"
+          test -x "${GG_RV_AME_LLVM_HOME}/bin/clang++"
+
+          command -v cmake
+          command -v wget
+          command -v unzip
+          command -v bc
+
+      - name: Run AME local integration CI
+        run: |
+          set -euxo pipefail
+
+          mkdir -p tmp
+
+          GG_BUILD_RV_AME=1 \
+          GG_RV_AME_LLVM_HOME="${GG_RV_AME_LLVM_HOME}" \
+          GG_RV_AME_SYSROOT="${GG_RV_AME_SYSROOT}" \
+          GG_RV_AME_QEMU_BIN="${GG_RV_AME_QEMU_BIN}" \
+          GG_RV_AME_QEMU_CPU="${GG_RV_AME_QEMU_CPU}" \
+          GG_RV_AME_MODEL_BF16="${GG_RV_AME_MODEL_BF16}" \
+          GG_RV_AME_MODEL_BASELINE="${GG_RV_AME_MODEL_BASELINE}" \
+          GG_RV_AME_PPL_CTX="${GG_RV_AME_PPL_CTX}" \
+          GG_RV_AME_PPL_BATCH="${GG_RV_AME_PPL_BATCH}" \
+          GG_RV_AME_PPL_CHUNKS="${GG_RV_AME_PPL_CHUNKS}" \
+          GG_RV_AME_PPL_MAX_DELTA="${GG_RV_AME_PPL_MAX_DELTA}" \
+          GG_RV_AME_PPL_MAX_REL_DELTA="${GG_RV_AME_PPL_MAX_REL_DELTA}" \
+          GG_RV_AME_BENCH_PROMPT="${GG_RV_AME_BENCH_PROMPT}" \
+          GG_RV_AME_BENCH_BATCH="${GG_RV_AME_BENCH_BATCH}" \
+          GG_RV_AME_BENCH_UBATCH="${GG_RV_AME_BENCH_UBATCH}" \
+          GG_RV_AME_BENCH_REPETITIONS="${GG_RV_AME_BENCH_REPETITIONS}" \
+          GG_RV_AME_BENCH_MIN_RATIO="${GG_RV_AME_BENCH_MIN_RATIO}" \
+          bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
+      - name: Publish AME summary
+        if: always()
+        run: |
+          if [ -f ./tmp/results/README.md ]; then
+            cat ./tmp/results/README.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload AME artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ggml-ci-x64-riscv-ame
+          path: ./tmp/results
+
   ggml-ci-arm64-graviton4-kleidiai:
      runs-on: ah-ubuntu_22_04-c8g_8x
 
