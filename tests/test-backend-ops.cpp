@@ -7962,18 +7962,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768,   1, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 768, {1, 1}, {1, 1}));
-    // AME BF16 support requires m,n >= 128. Under forced RISCV_AME we keep A as
-    // a regular tensor so the backend-op harness can exercise the BF16 forward
-    // path while still using FP32 params via B.
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+    {
+        // RISC-V AME MUL_MAT coverage. These shapes match the AME tile
+        // constraints and are used directly by the AME CI backend-op check.
+        const std::vector<std::array<int64_t, 3>> prefill_shapes = {
+            { 288, 128, 288 },
+            { 768, 128, 288 },
+            { 288, 128, 768 },
+            { 768, 128, 768 },
+        };
+
+        for (const auto & shape : prefill_shapes) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+        }
+    }
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.

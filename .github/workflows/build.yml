@@ -2097,11 +2097,17 @@ jobs:
       GG_RV_AME_QEMU_BIN: ../../../../../qemu/build/qemu-riscv64
       GG_RV_AME_QEMU_CPU: rv64,v=true,vlen=128,h=true,zvfh=true,zvfhmin=true,zvfbfwma=true,zvfbfmin=true,zfbfmin=true,x-matrix=true,rlen=512,mlen=65536,melen=32
       GG_RV_AME_MODEL_BF16: ../models/stories15M/stories15M-BF16.gguf
-      GG_RV_AME_MODEL_F16: ''
+      GG_RV_AME_MODEL_BASELINE: ../models/stories15M/stories15M.gguf
       GG_RV_AME_PPL_CTX: '64'
       GG_RV_AME_PPL_BATCH: '64'
-      GG_RV_AME_PPL_CHUNKS: '2'
-      GG_RV_AME_PPL_MAX_DELTA: '500.0'
+      GG_RV_AME_PPL_CHUNKS: '8'
+      GG_RV_AME_PPL_MAX_DELTA: '20.0'
+      GG_RV_AME_PPL_MAX_REL_DELTA: '0.01'
+      GG_RV_AME_BENCH_PROMPT: '64'
+      GG_RV_AME_BENCH_BATCH: '64'
+      GG_RV_AME_BENCH_UBATCH: '64'
+      GG_RV_AME_BENCH_REPETITIONS: '3'
+      GG_RV_AME_BENCH_MIN_RATIO: '0.50'
 
     steps:
       - name: Clone
@@ -2116,15 +2122,13 @@ jobs:
           test -n "${GG_RV_AME_SYSROOT}"
           test -n "${GG_RV_AME_QEMU_BIN}"
           test -n "${GG_RV_AME_MODEL_BF16}"
+          test -n "${GG_RV_AME_MODEL_BASELINE}"
 
           test -d "${GG_RV_AME_LLVM_HOME}"
           test -d "${GG_RV_AME_SYSROOT}"
           test -x "${GG_RV_AME_QEMU_BIN}"
           test -f "${GG_RV_AME_MODEL_BF16}"
-
-          if [ -n "${GG_RV_AME_MODEL_F16}" ]; then
-            test -f "${GG_RV_AME_MODEL_F16}"
-          fi
+          test -f "${GG_RV_AME_MODEL_BASELINE}"
 
           test -x "${GG_RV_AME_LLVM_HOME}/bin/clang"
           test -x "${GG_RV_AME_LLVM_HOME}/bin/clang++"
@@ -2146,11 +2150,17 @@ jobs:
           GG_RV_AME_QEMU_BIN="${GG_RV_AME_QEMU_BIN}" \
           GG_RV_AME_QEMU_CPU="${GG_RV_AME_QEMU_CPU}" \
           GG_RV_AME_MODEL_BF16="${GG_RV_AME_MODEL_BF16}" \
-          GG_RV_AME_MODEL_F16="${GG_RV_AME_MODEL_F16}" \
+          GG_RV_AME_MODEL_BASELINE="${GG_RV_AME_MODEL_BASELINE}" \
           GG_RV_AME_PPL_CTX="${GG_RV_AME_PPL_CTX}" \
           GG_RV_AME_PPL_BATCH="${GG_RV_AME_PPL_BATCH}" \
           GG_RV_AME_PPL_CHUNKS="${GG_RV_AME_PPL_CHUNKS}" \
           GG_RV_AME_PPL_MAX_DELTA="${GG_RV_AME_PPL_MAX_DELTA}" \
+          GG_RV_AME_PPL_MAX_REL_DELTA="${GG_RV_AME_PPL_MAX_REL_DELTA}" \
+          GG_RV_AME_BENCH_PROMPT="${GG_RV_AME_BENCH_PROMPT}" \
+          GG_RV_AME_BENCH_BATCH="${GG_RV_AME_BENCH_BATCH}" \
+          GG_RV_AME_BENCH_UBATCH="${GG_RV_AME_BENCH_UBATCH}" \
+          GG_RV_AME_BENCH_REPETITIONS="${GG_RV_AME_BENCH_REPETITIONS}" \
+          GG_RV_AME_BENCH_MIN_RATIO="${GG_RV_AME_BENCH_MIN_RATIO}" \
           bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
       - name: Publish AME summary
