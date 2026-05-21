@@ -28,6 +28,7 @@ GG_RV_AME_LLVM_HOME=/path/to/llvm \
 GG_RV_AME_SYSROOT=/path/to/sysroot \
 GG_RV_AME_QEMU_BIN=/path/to/qemu-riscv64 \
 GG_RV_AME_MODEL_BF16=/path/to/model-bf16.gguf \
+GG_RV_AME_MODEL_Q4_0=/path/to/model-q4_0.gguf \
 GG_RV_AME_MODEL_BASELINE=/path/to/model-baseline.gguf \
 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
@@ -47,10 +48,10 @@ When `GG_BUILD_RV_AME=1` is set, `ci/run.sh` switches to an AME-specific integra
 
 - cross-builds llama.cpp with `GGML_RV_AME=ON`
 - runs `test-backend-ops` support and correctness checks for the representative `RISCV_AME` `MUL_MAT` cases in `tests/test-backend-ops.cpp`
-- runs `llama-perplexity` on `wikitext-2` for both the BF16 AME model and a required baseline model
-- reports `PPL_BF16`, `PPL_BASELINE`, absolute `PPL_DELTA`, relative `PPL_REL_DELTA`, and explicit `PPL_STATUS` / `PPL_CHECK` lines
-- fails if both `PPL_DELTA` exceeds `GG_RV_AME_PPL_MAX_DELTA` and `PPL_REL_DELTA` exceeds `GG_RV_AME_PPL_MAX_REL_DELTA`
-- runs `llama-bench` for the same BF16 and baseline models and reports explicit `BENCH_STATUS` / `BENCH_CHECK` lines for the throughput ratio
+- runs `llama-perplexity` on `wikitext-2` for the BF16 and Q4_0 AME models against a required baseline model
+- writes separate `*-bf16-summary.log` and `*-q4_0-summary.log` reports with each model's PPL and bench checks
+- fails each PPL check if both its absolute and relative drift exceed the configured thresholds
+- runs `llama-bench` for the same BF16, Q4_0, and baseline models and reports throughput-ratio checks for BF16 and Q4_0
 
 Required environment variables:
 
@@ -58,6 +59,7 @@ Required environment variables:
 - `GG_RV_AME_SYSROOT`
 - `GG_RV_AME_QEMU_BIN`
 - `GG_RV_AME_MODEL_BF16`
+- `GG_RV_AME_MODEL_Q4_0`
 - `GG_RV_AME_MODEL_BASELINE`
 
 Optional environment variables:
@@ -68,8 +70,11 @@ Optional environment variables:
 - `GG_RV_AME_PPL_CHUNKS`
 - `GG_RV_AME_PPL_MAX_DELTA`
 - `GG_RV_AME_PPL_MAX_REL_DELTA`
+- `GG_RV_AME_Q4_PPL_MAX_DELTA` (defaults to `GG_RV_AME_PPL_MAX_DELTA`)
+- `GG_RV_AME_Q4_PPL_MAX_REL_DELTA` (defaults to `0.10`)
 - `GG_RV_AME_BENCH_PROMPT`
 - `GG_RV_AME_BENCH_BATCH`
 - `GG_RV_AME_BENCH_UBATCH`
 - `GG_RV_AME_BENCH_REPETITIONS`
 - `GG_RV_AME_BENCH_MIN_RATIO`
+- `GG_RV_AME_Q4_BENCH_MIN_RATIO`

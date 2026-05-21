@@ -46,8 +46,8 @@ void ggml_ame_repack_q4_0(
 
         for (int j = 0; j < 16; j++) {
             uint8_t v = src_blocks[i].qs[j];
-            dst_blocks[i].qs[2 * j]     = (int8_t) (v & 0x0F) - 8;
-            dst_blocks[i].qs[2 * j + 1] = (int8_t) ((v >> 4) & 0x0F) - 8;
+            dst_blocks[i].qs[j]      = (int8_t) (v & 0x0F) - 8;
+            dst_blocks[i].qs[j + 16] = (int8_t) ((v >> 4) & 0x0F) - 8;
         }
     }
 }
