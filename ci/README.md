@@ -22,16 +22,6 @@ GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 # with MUSA support
 GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
-# with RISC-V AME support
-GG_BUILD_RV_AME=1 \
-GG_RV_AME_LLVM_HOME=/path/to/llvm \
-GG_RV_AME_SYSROOT=/path/to/sysroot \
-GG_RV_AME_QEMU_BIN=/path/to/qemu-riscv64 \
-GG_RV_AME_MODEL_BF16=/path/to/model-bf16.gguf \
-GG_RV_AME_MODEL_Q4_0=/path/to/model-q4_0.gguf \
-GG_RV_AME_MODEL_BASELINE=/path/to/model-baseline.gguf \
-bash ./ci/run.sh ./tmp/results ./tmp/mnt
-
 # etc.
 ```
 
@@ -41,40 +31,3 @@ bash ./ci/run.sh ./tmp/results ./tmp/mnt
 - Request a runner token from `ggml-org` (for example, via a comment in the PR or email)
 - Set-up a machine using the received token ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners))
 - Optionally update [ci/run.sh](https://github.com/ggml-org/llama.cpp/blob/master/ci/run.sh) to build and run on the target platform by gating the implementation with a `GG_BUILD_...` env
-
-## RISC-V AME local integration mode
-
-When `GG_BUILD_RV_AME=1` is set, `ci/run.sh` switches to an AME-specific integration flow instead of the default native CI suite. The AME mode:
-
-- cross-builds llama.cpp with `GGML_RV_AME=ON`
-- runs `test-backend-ops` support and correctness checks for the representative `RISCV_AME` `MUL_MAT` cases in `tests/test-backend-ops.cpp`
-- runs `llama-perplexity` on `wikitext-2` for the BF16 and Q4_0 AME models against a required baseline model
-- writes separate `*-bf16-summary.log` and `*-q4_0-summary.log` reports with each model's PPL and bench checks
-- fails each PPL check if both its absolute and relative drift exceed the configured thresholds
-- runs `llama-bench` for the same BF16, Q4_0, and baseline models and reports throughput-ratio checks for BF16 and Q4_0
-
-Required environment variables:
-
-- `GG_RV_AME_LLVM_HOME`
-- `GG_RV_AME_SYSROOT`
-- `GG_RV_AME_QEMU_BIN`
-- `GG_RV_AME_MODEL_BF16`
-- `GG_RV_AME_MODEL_Q4_0`
-- `GG_RV_AME_MODEL_BASELINE`
-
-Optional environment variables:
-
-- `GG_RV_AME_QEMU_CPU`
-- `GG_RV_AME_PPL_CTX`
-- `GG_RV_AME_PPL_BATCH`
-- `GG_RV_AME_PPL_CHUNKS`
-- `GG_RV_AME_PPL_MAX_DELTA`
-- `GG_RV_AME_PPL_MAX_REL_DELTA`
-- `GG_RV_AME_Q4_PPL_MAX_DELTA` (defaults to `GG_RV_AME_PPL_MAX_DELTA`)
-- `GG_RV_AME_Q4_PPL_MAX_REL_DELTA` (defaults to `0.10`)
-- `GG_RV_AME_BENCH_PROMPT`
-- `GG_RV_AME_BENCH_BATCH`
-- `GG_RV_AME_BENCH_UBATCH`
-- `GG_RV_AME_BENCH_REPETITIONS`
-- `GG_RV_AME_BENCH_MIN_RATIO`
-- `GG_RV_AME_Q4_BENCH_MIN_RATIO`
