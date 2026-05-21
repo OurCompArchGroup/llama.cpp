@@ -32,6 +32,7 @@
 # GG_RV_AME_QEMU_BIN=/path/to/qemu-riscv64 \
 # GG_RV_AME_MODEL_BF16=/path/to/model-bf16.gguf \
 # GG_RV_AME_MODEL_Q4_0=/path/to/model-q4_0.gguf \
+# GG_RV_AME_MODEL_MXFP4=/path/to/model-mxfp4.gguf \
 # GG_RV_AME_MODEL_BASELINE=/path/to/model-baseline.gguf \
 # bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
@@ -661,6 +662,11 @@ function gg_require_rv_ame_env {
         exit 1
     fi
 
+    if [ -z "${GG_RV_AME_MODEL_MXFP4}" ]; then
+        echo >&2 "Missing GG_RV_AME_MODEL_MXFP4"
+        exit 1
+    fi
+
     if [ -z "${GG_RV_AME_MODEL_BASELINE}" ] && [ ! -z "${GG_RV_AME_MODEL_F16}" ]; then
         GG_RV_AME_MODEL_BASELINE="${GG_RV_AME_MODEL_F16}"
     fi
@@ -695,6 +701,11 @@ function gg_require_rv_ame_env {
         exit 1
     fi
 
+    if [ ! -f "${GG_RV_AME_MODEL_MXFP4}" ]; then
+        echo >&2 "MXFP4 model not found: ${GG_RV_AME_MODEL_MXFP4}"
+        exit 1
+    fi
+
     if [ ! -f "${GG_RV_AME_MODEL_BASELINE}" ]; then
         echo >&2 "Baseline model not found: ${GG_RV_AME_MODEL_BASELINE}"
         exit 1
@@ -705,6 +716,7 @@ function gg_require_rv_ame_env {
     GG_RV_AME_QEMU_BIN=$(realpath "${GG_RV_AME_QEMU_BIN}")
     GG_RV_AME_MODEL_BF16=$(realpath "${GG_RV_AME_MODEL_BF16}")
     GG_RV_AME_MODEL_Q4_0=$(realpath "${GG_RV_AME_MODEL_Q4_0}")
+    GG_RV_AME_MODEL_MXFP4=$(realpath "${GG_RV_AME_MODEL_MXFP4}")
     GG_RV_AME_MODEL_BASELINE=$(realpath "${GG_RV_AME_MODEL_BASELINE}")
 }
 
@@ -735,12 +747,15 @@ function gg_run_riscv_ame {
     local ppl_rel_delta_max="${GG_RV_AME_PPL_MAX_REL_DELTA:-0.01}"
     local q4_ppl_delta_max="${GG_RV_AME_Q4_PPL_MAX_DELTA:-${ppl_delta_max}}"
     local q4_ppl_rel_delta_max="${GG_RV_AME_Q4_PPL_MAX_REL_DELTA:-0.10}"
+    local mxfp4_ppl_delta_max="${GG_RV_AME_MXFP4_PPL_MAX_DELTA:-${ppl_delta_max}}"
+    local mxfp4_ppl_rel_delta_max="${GG_RV_AME_MXFP4_PPL_MAX_REL_DELTA:-0.10}"
     local bench_prompt="${GG_RV_AME_BENCH_PROMPT:-64}"
     local bench_batch="${GG_RV_AME_BENCH_BATCH:-64}"
     local bench_ubatch="${GG_RV_AME_BENCH_UBATCH:-64}"
     local bench_repetitions="${GG_RV_AME_BENCH_REPETITIONS:-3}"
     local bench_min_ratio="${GG_RV_AME_BENCH_MIN_RATIO:-0.50}"
     local q4_bench_min_ratio="${GG_RV_AME_Q4_BENCH_MIN_RATIO:-${bench_min_ratio}}"
+    local mxfp4_bench_min_ratio="${GG_RV_AME_MXFP4_BENCH_MIN_RATIO:-${bench_min_ratio}}"
     local wiki_dir="${MNT}/wikitext"
     local wiki_zip="${wiki_dir}/wikitext-2-raw-v1.zip"
     local wiki_test="${wiki_dir}/wikitext-2-raw/wiki.test.raw"
@@ -777,19 +792,19 @@ function gg_run_riscv_ame {
 
     (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    local ame_backend_params='type_a=(q4_0|q8_0|bf16),type_b=(f32|bf16),m=(288|768),n=128,k=(288|768),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1'
+    local ame_backend_params='type_a=(q4_0|q8_0|bf16|mxfp4),type_b=(f32|bf16),m=(288|768),n=128,k=(288|768),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1'
 
     (time bash -lc "${qemu_run} ./bin/test-backend-ops support -b CPU --buft RISCV_AME -o MUL_MAT -p '${ame_backend_params}' --output csv") \
         2>&1 | tee -a $OUT/${ci}-support.csv
 
-    grep -E 'type_a=(q4_0|q8_0|bf16)' $OUT/${ci}-support.csv | tee -a $OUT/${ci}-support-focus.csv
+    grep -E 'type_a=(q4_0|q8_0|bf16|mxfp4)' $OUT/${ci}-support.csv | tee -a $OUT/${ci}-support-focus.csv
 
     grep -q '"support","1","yes"' $OUT/${ci}-support-focus.csv
     awk -F, '
         /"support","1","yes"/ { n++ }
         END {
-            if (n < 16) {
-                printf("Expected at least 16 AME MUL_MAT support cases, got %d\n", n) > "/dev/stderr";
+            if (n < 20) {
+                printf("Expected at least 20 AME MUL_MAT support cases, got %d\n", n) > "/dev/stderr";
                 exit 1;
             }
         }
@@ -815,6 +830,16 @@ function gg_run_riscv_ame {
     ppl_q4_0=$(gg_extract_rv_ame_ppl $OUT/${ci}-ppl-q4_0.log)
     if [ -z "${ppl_q4_0}" ]; then
         echo >&2 "Failed to parse Q4_0 perplexity"
+        exit 1
+    fi
+
+    (time bash -lc "${qemu_run} ./bin/llama-perplexity --model \"${GG_RV_AME_MODEL_MXFP4}\" -f \"${wiki_test}\" -c ${ppl_ctx} -b ${ppl_batch} --chunks ${ppl_chunks}") \
+        2>&1 | tee -a $OUT/${ci}-ppl-mxfp4.log
+
+    local ppl_mxfp4
+    ppl_mxfp4=$(gg_extract_rv_ame_ppl $OUT/${ci}-ppl-mxfp4.log)
+    if [ -z "${ppl_mxfp4}" ]; then
+        echo >&2 "Failed to parse MXFP4 perplexity"
         exit 1
     fi
 
@@ -849,6 +874,17 @@ function gg_run_riscv_ame {
         printf 'PPL_Q4_0=%s\n' "${ppl_q4_0}"
         printf 'PPL_BASELINE=%s\n' "${ppl_baseline}"
     } | tee -a $OUT/${ci}-q4_0-summary.log
+
+    {
+        printf '[ppl]\n'
+        printf 'PPL_CTX=%s\n' "${ppl_ctx}"
+        printf 'PPL_BATCH=%s\n' "${ppl_batch}"
+        printf 'PPL_CHUNKS=%s\n' "${ppl_chunks}"
+        printf 'PPL_BASELINE_MODEL=%s\n' "${GG_RV_AME_MODEL_BASELINE}"
+        printf 'PPL_MXFP4_MODEL=%s\n' "${GG_RV_AME_MODEL_MXFP4}"
+        printf 'PPL_MXFP4=%s\n' "${ppl_mxfp4}"
+        printf 'PPL_BASELINE=%s\n' "${ppl_baseline}"
+    } | tee -a $OUT/${ci}-mxfp4-summary.log
 
     set +e
     awk -v a="${ppl_bf16}" -v b="${ppl_baseline}" -v t_abs="${ppl_delta_max}" -v t_rel="${ppl_rel_delta_max}" '
@@ -902,20 +938,50 @@ function gg_run_riscv_ame {
         rv_ame_status=1
     fi
 
+    set +e
+    awk -v a="${ppl_mxfp4}" -v b="${ppl_baseline}" -v t_abs="${mxfp4_ppl_delta_max}" -v t_rel="${mxfp4_ppl_rel_delta_max}" '
+        BEGIN {
+            d = a - b;
+            if (d < 0) d = -d;
+            rel = b == 0 ? 0 : d / b;
+            fail = (b == 0 && d > t_abs) || (b != 0 && d > t_abs && rel > t_rel);
+            printf("PPL_MXFP4_DELTA=%.6f\n", d);
+            printf("PPL_MXFP4_REL_DELTA=%.6f\n", rel);
+            printf("PPL_MXFP4_DELTA_MAX=%.6f\n", t_abs);
+            printf("PPL_MXFP4_REL_DELTA_MAX=%.6f\n", t_rel);
+            printf("PPL_MXFP4_STATUS=%s\n", fail ? "FAIL" : "OK");
+            if (fail) {
+                printf("PPL_MXFP4_CHECK=FAIL: MXFP4 PPL drift exceeds the configured absolute and relative thresholds\n");
+                printf("MXFP4 PPL delta %.6f and relative delta %.6f exceed thresholds %.6f / %.6f\n", d, rel, t_abs, t_rel) > "/dev/stderr";
+                exit 1;
+            }
+            printf("PPL_MXFP4_CHECK=OK: MXFP4 PPL drift is within the configured thresholds\n");
+        }
+    ' | tee -a $OUT/${ci}-mxfp4-summary.log
+    local mxfp4_ppl_status=${PIPESTATUS[0]}
+    set -e
+    if [ "${mxfp4_ppl_status}" -ne 0 ]; then
+        rv_ame_status=1
+    fi
+
     (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_BASELINE}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
         2>&1 | tee -a $OUT/${ci}-bench-baseline.jsonl
     (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_BF16}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
         2>&1 | tee -a $OUT/${ci}-bench-bf16.jsonl
     (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_Q4_0}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
         2>&1 | tee -a $OUT/${ci}-bench-q4_0.jsonl
+    (time bash -lc "${qemu_run} ./bin/llama-bench --model \"${GG_RV_AME_MODEL_MXFP4}\" -p ${bench_prompt} -n 0 -b ${bench_batch} -ub ${bench_ubatch} -t 1 -r ${bench_repetitions} --no-warmup -o jsonl") \
+        2>&1 | tee -a $OUT/${ci}-bench-mxfp4.jsonl
 
     local bench_baseline_ts
     local bench_bf16_ts
     local bench_q4_0_ts
+    local bench_mxfp4_ts
     bench_baseline_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-baseline.jsonl)
     bench_bf16_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-bf16.jsonl)
     bench_q4_0_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-q4_0.jsonl)
-    if [ -z "${bench_baseline_ts}" ] || [ -z "${bench_bf16_ts}" ] || [ -z "${bench_q4_0_ts}" ]; then
+    bench_mxfp4_ts=$(gg_extract_rv_ame_bench_ts $OUT/${ci}-bench-mxfp4.jsonl)
+    if [ -z "${bench_baseline_ts}" ] || [ -z "${bench_bf16_ts}" ] || [ -z "${bench_q4_0_ts}" ] || [ -z "${bench_mxfp4_ts}" ]; then
         echo >&2 "Failed to parse llama-bench throughput"
         exit 1
     fi
@@ -939,6 +1005,16 @@ function gg_run_riscv_ame {
         printf 'BENCH_BASELINE_AVG_TS=%s\n' "${bench_baseline_ts}"
         printf 'BENCH_Q4_0_AVG_TS=%s\n' "${bench_q4_0_ts}"
     } | tee -a $OUT/${ci}-q4_0-summary.log
+
+    {
+        printf '\n[bench]\n'
+        printf 'BENCH_PROMPT=%s\n' "${bench_prompt}"
+        printf 'BENCH_BATCH=%s\n' "${bench_batch}"
+        printf 'BENCH_UBATCH=%s\n' "${bench_ubatch}"
+        printf 'BENCH_REPETITIONS=%s\n' "${bench_repetitions}"
+        printf 'BENCH_BASELINE_AVG_TS=%s\n' "${bench_baseline_ts}"
+        printf 'BENCH_MXFP4_AVG_TS=%s\n' "${bench_mxfp4_ts}"
+    } | tee -a $OUT/${ci}-mxfp4-summary.log
     set +e
     awk -v a="${bench_bf16_ts}" -v b="${bench_baseline_ts}" -v t="${bench_min_ratio}" '
         BEGIN {
@@ -983,6 +1059,28 @@ function gg_run_riscv_ame {
         rv_ame_status=1
     fi
 
+    set +e
+    awk -v a="${bench_mxfp4_ts}" -v b="${bench_baseline_ts}" -v t="${mxfp4_bench_min_ratio}" '
+        BEGIN {
+            ratio = b == 0 ? 0 : a / b;
+            fail = ratio < t;
+            printf("BENCH_MXFP4_TO_BASELINE_RATIO=%.6f\n", ratio);
+            printf("BENCH_MXFP4_MIN_RATIO=%.6f\n", t);
+            printf("BENCH_MXFP4_STATUS=%s\n", fail ? "FAIL" : "OK");
+            if (fail) {
+                printf("BENCH_MXFP4_CHECK=FAIL: MXFP4 throughput ratio is below the configured threshold\n");
+                printf("MXFP4 bench ratio %.6f is below threshold %.6f\n", ratio, t) > "/dev/stderr";
+                exit 1;
+            }
+            printf("BENCH_MXFP4_CHECK=OK: MXFP4 throughput ratio is within the configured threshold\n");
+        }
+    ' | tee -a $OUT/${ci}-mxfp4-summary.log
+    local mxfp4_bench_status=${PIPESTATUS[0]}
+    set -e
+    if [ "${mxfp4_bench_status}" -ne 0 ]; then
+        rv_ame_status=1
+    fi
+
     {
         if [ "${rv_ame_status}" -eq 0 ]; then
             printf 'AME_CI_STATUS=OK\n'
@@ -1001,6 +1099,9 @@ function gg_run_riscv_ame {
         printf '\n'
         printf '[q4_0]\n'
         cat $OUT/${ci}-q4_0-summary.log
+        printf '\n'
+        printf '[mxfp4]\n'
+        cat $OUT/${ci}-mxfp4-summary.log
     } > $OUT/${ci}-checks.log
 
     if [ "${rv_ame_status}" -ne 0 ]; then
@@ -1018,6 +1119,7 @@ function gg_sum_riscv_ame {
     gg_printf '- support focus:\n```\n%s\n```\n' "$(cat $OUT/${ci}-support-focus.csv)"
     gg_printf '- BF16 summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-bf16-summary.log 2>/dev/null || true)"
     gg_printf '- Q4_0 summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-q4_0-summary.log 2>/dev/null || true)"
+    gg_printf '- MXFP4 summary:\n```\n%s\n```\n' "$(cat $OUT/${ci}-mxfp4-summary.log 2>/dev/null || true)"
     gg_printf '- combined checks:\n```\n%s\n```\n' "$(cat $OUT/${ci}-checks.log 2>/dev/null || true)"
     gg_printf '- backend ops:\n```\n%s\n```\n' "$(tail -n 40 $OUT/${ci}-backend-ops.log)"
 }

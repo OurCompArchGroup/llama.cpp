@@ -112,7 +112,7 @@ static void reference_mul_mat_q8_0_f32(
 
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
-    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16;
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 || type == GGML_TYPE_MXFP4;
 }
 
 static size_t ame_align_up(size_t value, size_t alignment) {
@@ -151,6 +151,7 @@ struct ame_buffer_context {
     size_t base_size = 0;
     std::unordered_map<const ggml_tensor *, ame_packed_weight_info> packed_q4;
     std::unordered_map<const ggml_tensor *, ame_packed_weight_info> packed_q8;
+    std::unordered_map<const ggml_tensor *, ame_packed_weight_info> packed_mxfp4;
     std::vector<ggml_tensor *> tensors;
 };
 
@@ -209,6 +210,63 @@ static size_t ame_refresh_packed_q4_weights(ggml_backend_buffer_t buffer) {
         }
 
         ame_store_packed_q4_weight(buffer, tensor, tensor->data);
+        ++repacked;
+    }
+
+    return repacked;
+}
+
+static size_t ggml_ame_packed_mxfp4_size(const ggml_tensor * tensor) {
+    const int64_t nblocks = tensor->ne[0] / QK_MXFP4;
+    return (size_t) ggml_nrows(tensor) * (size_t) nblocks * sizeof(block_mxfp4_ame);
+}
+
+static const block_mxfp4_ame * ame_get_packed_mxfp4_weight(const ggml_tensor * tensor) {
+    if (tensor->buffer == nullptr || tensor->buffer->context == nullptr) {
+        return nullptr;
+    }
+
+    ame_buffer_context * ctx = ame_buffer_ctx(tensor->buffer);
+    const auto it = ctx->packed_mxfp4.find(tensor);
+    if (it == ctx->packed_mxfp4.end()) {
+        return nullptr;
+    }
+    return static_cast<const block_mxfp4_ame *>(it->second.data);
+}
+
+static void ame_store_packed_mxfp4_weight(
+    ggml_backend_buffer_t buffer,
+    const ggml_tensor * tensor,
+    const void * data
+) {
+    ame_buffer_context * ctx = ame_buffer_ctx(buffer);
+    auto & entry = ctx->packed_mxfp4[tensor];
+    const size_t packed_size = ggml_ame_packed_mxfp4_size(tensor);
+
+    if (entry.data == nullptr || entry.size != packed_size) {
+        if (entry.data != nullptr) {
+            ggml_aligned_free(entry.data, entry.size);
+        }
+        entry.data = ggml_aligned_malloc(packed_size);
+        entry.size = packed_size;
+    }
+
+    if (entry.data != nullptr) {
+        const int64_t nblocks = ggml_nrows(tensor) * (tensor->ne[0] / QK_MXFP4);
+        ggml_ame_repack_mxfp4(entry.data, data, nblocks);
+    }
+}
+
+static size_t ame_refresh_packed_mxfp4_weights(ggml_backend_buffer_t buffer) {
+    ame_buffer_context * ctx = ame_buffer_ctx(buffer);
+    size_t repacked = 0;
+
+    for (ggml_tensor * tensor : ctx->tensors) {
+        if (tensor == nullptr || tensor->data == nullptr || tensor->type != GGML_TYPE_MXFP4) {
+            continue;
+        }
+
+        ame_store_packed_mxfp4_weight(buffer, tensor, tensor->data);
         ++repacked;
     }
 
@@ -361,6 +419,25 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
                 params->wsize
             );
         }
+    } else if (src0->type == GGML_TYPE_MXFP4) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        const block_mxfp4_ame * packed_w = ame_get_packed_mxfp4_weight(src0);
+        if (packed_w == nullptr) {
+            ame_store_packed_mxfp4_weight(src0->buffer, src0, src0->data);
+            packed_w = ame_get_packed_mxfp4_weight(src0);
+        }
+
+        GGML_ASSERT(packed_w != nullptr);
+        AME_LOG("backend_ame_mul_mat: dispatching to MXFP4 kernel");
+        ggml_ame_mul_mat_mxfp4(
+            packed_w,
+            src1->data,
+            dst->data,
+            ne00, ne01,
+            ne10, ne11,
+            src1->nb[1]
+        );
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_BF16);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
@@ -397,6 +474,17 @@ public:
                 return false;
             }
             if (!ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+                return false;
+            }
+            size = ggml_backend_ame_desired_wsize(op);
+            return true;
+        }
+
+        if (op->src[0]->type == GGML_TYPE_MXFP4) {
+            if (op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_mxfp4(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
                 return false;
             }
             size = ggml_backend_ame_desired_wsize(op);
@@ -456,6 +544,13 @@ public:
             if (!ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0])) {
                 return false;
             }
+        } else if (src0->type == GGML_TYPE_MXFP4) {
+            if (src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_mxfp4(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
         } else if (src0->type == GGML_TYPE_BF16) {
             if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16) {
                 return false;
@@ -494,6 +589,11 @@ static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
             ggml_aligned_free(it.second.data, it.second.size);
         }
     }
+    for (auto & it : ctx->packed_mxfp4) {
+        if (it.second.data != nullptr) {
+            ggml_aligned_free(it.second.data, it.second.size);
+        }
+    }
     if (ctx->base != nullptr) {
         ggml_aligned_free(ctx->base, ctx->base_size);
     }
@@ -524,6 +624,9 @@ static void ggml_backend_ame_buffer_memset_tensor(
     if (tensor->type == GGML_TYPE_Q4_0) {
         ame_store_packed_q4_weight(buffer, tensor, tensor->data);
     }
+    if (tensor->type == GGML_TYPE_MXFP4) {
+        ame_store_packed_mxfp4_weight(buffer, tensor, tensor->data);
+    }
 }
 
 static void ggml_backend_ame_buffer_set_tensor(
@@ -536,6 +639,9 @@ static void ggml_backend_ame_buffer_set_tensor(
     memcpy((char *) tensor->data + offset, data, size);
     if (tensor->type == GGML_TYPE_Q4_0) {
         ame_store_packed_q4_weight(buffer, tensor, tensor->data);
+    }
+    if (tensor->type == GGML_TYPE_MXFP4 && offset == 0 && size == ggml_nbytes(tensor)) {
+        ame_store_packed_mxfp4_weight(buffer, tensor, data);
     }
     if (ame_use_packed_q8() && tensor->type == GGML_TYPE_Q8_0 && offset == 0 && size == ggml_nbytes(tensor)) {
         ame_store_packed_q8_weight(buffer, tensor, data);
@@ -560,6 +666,11 @@ static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     const size_t repacked_q4 = ame_refresh_packed_q4_weights(buffer);
     if (repacked_q4 > 0) {
         AME_LOG("buffer_clear: synthesized %zu packed Q4_0 tensors after fill", repacked_q4);
+    }
+
+    const size_t repacked_mxfp4 = ame_refresh_packed_mxfp4_weights(buffer);
+    if (repacked_mxfp4 > 0) {
+        AME_LOG("buffer_clear: synthesized %zu packed MXFP4 tensors after fill", repacked_mxfp4);
     }
 
     if (value == 0) {
@@ -668,6 +779,8 @@ public:
         const bool shape_supported =
             op->src[0]->type == GGML_TYPE_Q4_0 || op->src[0]->type == GGML_TYPE_Q8_0
                 ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
+                : op->src[0]->type == GGML_TYPE_MXFP4
+                ? ggml_ame_can_use_mxfp4(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
                 : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
@@ -683,6 +796,7 @@ public:
         const bool src1_supported =
             (op->src[0]->type == GGML_TYPE_Q4_0 && op->src[1]->type == GGML_TYPE_F32) ||
             (op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32) ||
+            (op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_F32) ||
             (op->src[0]->type == GGML_TYPE_BF16 && (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16));
         if (src1_supported) {
             AME_LOG("supports_op: accept M=%lld N=%lld K=%lld", (long long) op->src[0]->ne[1], (long long) op->src[1]->ne[1], (long long) op->src[0]->ne[0]);

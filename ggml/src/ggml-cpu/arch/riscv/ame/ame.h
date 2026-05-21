@@ -70,6 +70,14 @@ static inline int ggml_ame_can_use_bf16(int M, int N, int K) {
     return 1;
 }
 
+static inline int ggml_ame_can_use_mxfp4(int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return 0;
+    if (K % 32 != 0) return 0;
+    if (M < AME_TILE_M) return 0;
+    if (N < AME_TILE_N) return 0;
+    return 1;
+}
+
 static inline int ggml_ame_can_use(int M, int N, int K) {
     return ggml_ame_can_use_q8(M, N, K);
 }
@@ -85,6 +93,17 @@ typedef struct {
     uint16_t d;
     int8_t qs[AME_Q8_PACK_K];
 } block_q8_ame64;
+
+// Repacked MXFP4 format for AME (pre-unpacked to int8)
+// block_mxfp4 stores 32 E2M1 values packed into 16 bytes + uint8 shared exponent.
+// The repacked format unpacks the 4-bit values through kvalues_mxfp4 lookup,
+// yielding int8 values, and stores the combined scale as FP16.
+typedef struct {
+    uint16_t d;         // scale factor FP16: GGML_E8M0_TO_FP32_HALF(e)
+    int8_t qs[32];      // pre-unpacked E2M1 values via kvalues_mxfp4 lookup (int8)
+    // Note: kvalues_mxfp4 values are doubled E2M1, combined with the scale d they
+    // produce the correct floating point value = kvalues_mxfp4[index] * d
+} block_mxfp4_ame;
 
 // Matrix configuration instructions
 #ifdef STC
@@ -416,6 +435,25 @@ void ggml_ame_mul_mat_q8_0_ame64(
 
 // GGML integration wrapper for Q4_0 quantized matrix multiplication
 void ggml_ame_mul_mat_q4_0(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride
+);
+
+// MXFP4 weight repacking (called once during set_tensor)
+void ggml_ame_repack_mxfp4(
+    void * dst,              // Output: block_mxfp4_ame array
+    const void * src,        // Input: block_mxfp4 array
+    int64_t nblocks          // Number of MXFP4 blocks
+);
+
+// GGML integration wrapper for MXFP4 quantized matrix multiplication
+void ggml_ame_mul_mat_mxfp4(
     const void * src0,
     const void * src1,
     void * dst,
