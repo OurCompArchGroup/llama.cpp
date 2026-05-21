@@ -807,3 +807,106 @@ void ggml_ame_mul_mat_q4_0(
     ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
     free(y_q8);
 }
+
+// Wrapper for AME-accelerated MXFP4 GEMM
+// Assumes REPACKED block_mxfp4_ame inputs for src0
+void ggml_ame_mul_mat_mxfp4(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride
+) {
+    const int64_t M = ne01;
+    const int64_t N = ne11;
+    const int64_t K = ne00;
+    const int qk = QK_MXFP4;
+    const int64_t nb_x = K / qk;
+
+    const block_mxfp4_ame * restrict x = (const block_mxfp4_ame *)src0;
+    float * restrict out = (float *)dst;
+
+    const int64_t y_q8_size = N * nb_x;
+    block_q8_0 * y_q8 = (block_q8_0 *)malloc(y_q8_size * sizeof(block_q8_0));
+    if (!y_q8) return;
+
+    for (int64_t j = 0; j < N; j++) {
+        const float * src1_col = (const float *)((const char *)src1 + j * src1_stride);
+        ggml_ame_quantize_row_f32_to_q8_0(src1_col, y_q8 + j * nb_x, K);
+    }
+    const block_q8_0 * restrict y = y_q8;
+
+    int8_t * tile_a = (int8_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    int8_t * tile_b = (int8_t *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    int32_t * tile_c = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+    if (!tile_a || !tile_b || !tile_c) {
+        ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+        ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+        free(y_q8);
+        return;
+    }
+
+    ame_assert_phys_contiguous();
+
+    for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
+        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
+
+        for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
+            const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (N - j0);
+
+            float acc_f32[AME_TILE_M * AME_TILE_N];
+            memset(acc_f32, 0, sizeof(acc_f32));
+
+            for (int64_t kb = 0; kb < nb_x; kb++) {
+
+                // Prepare Tile A (128 x 64)
+                for (int i = 0; i < AME_TILE_M; i++) {
+                     memset(&tile_a[i * AME_TILE_K], 0, AME_TILE_K);
+                     if (i < imax) {
+                         const block_mxfp4_ame * b = &x[(i0 + i) * nb_x + kb];
+                         memcpy(&tile_a[i * AME_TILE_K], b->qs, qk);
+                     }
+                }
+
+                // Prepare Tile B (128 x 64)
+                for (int j = 0; j < AME_TILE_N; j++) {
+                     memset(&tile_b[j * AME_TILE_K], 0, AME_TILE_K);
+                     if (j < jmax) {
+                         const block_q8_0 * b = &y[(j0 + j) * nb_x + kb];
+                         memcpy(&tile_b[j * AME_TILE_K], b->qs, qk);
+                     }
+                }
+
+                memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+                ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
+
+                for (int i = 0; i < imax; i++) {
+                     const block_mxfp4_ame * bx = &x[(i0 + i) * nb_x + kb];
+                     const float d_x = GGML_FP16_TO_FP32(bx->d);
+                     for (int j = 0; j < jmax; j++) {
+                         const block_q8_0 * by = &y[(j0 + j) * nb_x + kb];
+                         const float d_y = GGML_FP16_TO_FP32(by->d);
+                         acc_f32[i * AME_TILE_N + j] += tile_c[i * AME_TILE_N + j] * (d_x * d_y);
+                     }
+                }
+            }
+
+            for (int i = 0; i < imax; i++) {
+                for (int j = 0; j < jmax; j++) {
+                    out[(j0 + j) * M + (i0 + i)] = acc_f32[i * AME_TILE_N + j];
+                }
+            }
+        }
+    }
+
+    ggml_aligned_free(tile_a, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_b, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
+    ggml_aligned_free(tile_c, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
+    free(y_q8);
+
+    GGML_UNUSED(ne10);
+}

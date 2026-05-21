@@ -46,8 +46,8 @@ void ggml_ame_repack_q4_0(
 
         for (int j = 0; j < 16; j++) {
             uint8_t v = src_blocks[i].qs[j];
-            dst_blocks[i].qs[2 * j]     = (int8_t) (v & 0x0F) - 8;
-            dst_blocks[i].qs[2 * j + 1] = (int8_t) ((v >> 4) & 0x0F) - 8;
+            dst_blocks[i].qs[j]      = (int8_t) (v & 0x0F) - 8;
+            dst_blocks[i].qs[j + 16] = (int8_t) ((v >> 4) & 0x0F) - 8;
         }
     }
 }
@@ -67,6 +67,32 @@ static inline void ggml_ame_quantize_64_f32_to_q8(const float * x, block_q8_ame6
 
     for (int j = 0; j < AME_Q8_PACK_K; ++j) {
         y->qs[j] = roundf(x[j] * inv_delta);
+    }
+}
+
+// Repacks MXFP4 blocks into AME-optimized format
+// block_mxfp4 stores 32 E2M1 values packed into 16 bytes + uint8 shared exponent.
+// The repacked format unpacks the 4-bit values through E2M1-to-int8 lookup,
+// yielding int8 values, and stores the combined scale as FP16.
+void ggml_ame_repack_mxfp4(
+    void * dst,
+    const void * src,
+    int64_t nblocks
+) {
+    // E2M1 doubled values (mirrors kvalues_mxfp4 in ggml-common.h)
+    static const int8_t kvalues[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+    const block_mxfp4 * restrict src_blocks = (const block_mxfp4 *) src;
+    block_mxfp4_ame * restrict dst_blocks = (block_mxfp4_ame *) dst;
+
+    for (int64_t i = 0; i < nblocks; i++) {
+        const float d = GGML_E8M0_TO_FP32_HALF(src_blocks[i].e);
+        dst_blocks[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK_MXFP4 / 2; j++) {
+            dst_blocks[i].qs[j]                = kvalues[src_blocks[i].qs[j] & 0x0F];
+            dst_blocks[i].qs[j + QK_MXFP4 / 2] = kvalues[src_blocks[i].qs[j] >>   4];
+        }
     }
 }
 

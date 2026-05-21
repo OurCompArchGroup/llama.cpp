@@ -7973,9 +7973,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         };
 
         for (const auto & shape : prefill_shapes) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
         }
     }
 
