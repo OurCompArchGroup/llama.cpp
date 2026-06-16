@@ -21,6 +21,28 @@
 #include <vector>
 
 // AME_DEBUG/AME_LOG now defined in ame.h
+static bool ame_backend_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 && strcmp(value, "off") != 0 && strcmp(value, "no") != 0;
+}
+
+static int64_t ame_backend_env_i64(const char * name, int64_t fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    char * end = nullptr;
+    const long long parsed = strtoll(value, &end, 0);
+    return end != value ? (int64_t) parsed : fallback;
+}
+
+static bool ame_backend_packed_b_panel_allowed_for_m(int64_t M) {
+    const int64_t max_m = ame_backend_env_i64("GGML_AME_PACKED_B_PANEL_MAX_M", 0);
+    return max_m <= 0 || M <= max_m;
+}
+
 // Simple scalar reference implementation for Q8_0 x F32 matmul
 // Now using tiled approach with ggml_ame_gemm_tile_i8_i32_bT SCALAR version
 static void reference_mul_mat_q8_0_f32(
@@ -55,6 +77,7 @@ static void reference_mul_mat_q8_0_f32(
     }
 
     memset(dst_data, 0, M * N * sizeof(float));
+    ggml_ame_sync_begin_op();
 
     for (int64_t m0 = 0; m0 < M; m0 += AME_TILE_M) {
         for (int64_t n0 = 0; n0 < N; n0 += AME_TILE_N) {
@@ -382,17 +405,13 @@ static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
 }
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
-    GGML_UNUSED(op);
-
-    size_t size = 64;
-    size = ame_align_up(size, 64);
-    size += AME_TILE_M * AME_TILE_K * sizeof(int8_t);
-    size = ame_align_up(size, 64);
-    size += AME_TILE_N * AME_TILE_K * sizeof(int8_t);
-    size = ame_align_up(size, 64);
-    size += AME_TILE_M * AME_TILE_N * sizeof(int32_t);
-
-    return size;
+    const int64_t K = op->src[0]->ne[0];
+    const int64_t M = op->src[0]->ne[1];
+    const int64_t N = op->src[1]->ne[1];
+    const bool use_packed_b_panel = ame_backend_env_enabled("GGML_AME_USE_PACKED_B_PANEL") &&
+        ame_backend_packed_b_panel_allowed_for_m(M);
+    const ggml_ame_i8_kernel * kernel = ggml_ame_select_i8_kernel(M, N, K);
+    return ggml_ame_i8_kernel_workspace_size(kernel, N, K, use_packed_b_panel ? 1 : 0);
 }
 
 // Compute forward for AME operations
@@ -474,13 +493,13 @@ public:
             return false;
         }
 
+        if (params->ith != 0) {
+            return true;
+        }
+
         static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
 
         if (scalar_mode) {
-            if (params->ith != 0) {
-                return true;
-            }
-
             const ggml_tensor * src0 = op->src[0];
             const ggml_tensor * src1 = op->src[1];
             const int64_t M = src0->ne[1];
@@ -741,8 +760,17 @@ public:
 // Runtime AME availability check
 static bool ggml_ame_available() {
 #ifdef GGML_USE_RV_AME
-    // TODO: Add runtime detection by trying to execute an AME instruction
-    AME_LOG("ggml_ame_available: returning true (build has GGML_USE_RV_AME)");
+    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
+    if (ggml_ame_select_i8_kernel(64, 64, 64) == NULL) {
+        AME_LOG("ggml_ame_available: returning false (hw probe valid=%d tlenb=%llu trlenb=%llu alenb=%llu capacity=%s)",
+            cfg->valid,
+            (unsigned long long) cfg->tlenb,
+            (unsigned long long) cfg->trlenb,
+            (unsigned long long) cfg->alenb,
+            ggml_ame_i8_capacity_name(cfg));
+        return false;
+    }
+    AME_LOG("ggml_ame_available: returning true (capacity=%s)", ggml_ame_i8_capacity_name(cfg));
     return true;
 #else
     AME_LOG("ggml_ame_available: returning false (GGML_USE_RV_AME not set)");

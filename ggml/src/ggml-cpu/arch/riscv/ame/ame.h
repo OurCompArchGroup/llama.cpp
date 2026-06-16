@@ -38,11 +38,237 @@ static inline int ame_log_enabled(void) {
         }                                             \
     } while (0)
 
-#define AME_TILE_M 128
+#define AME_TILE_M 64
 #define AME_TILE_K 64
-#define AME_TILE_N 128
+#define AME_TILE_N 64
+#define AME_TILE_M_MAX 128
+#define AME_TILE_N_MAX 128
 
+#define AME_Q8_BLOCK_K 32
 #define AME_Q8_PACK_K 64
+
+typedef struct {
+    uint64_t tlenb;
+    uint64_t trlenb;
+    uint64_t alenb;
+    uint64_t rows;
+    uint64_t melen_bits;
+    uint64_t arlenb;
+    int int8_m_max;
+    int int8_k_max;
+    int int32_n_max;
+    int valid;
+    int fixed_tile_supported;
+} ggml_ame_hw_config;
+
+typedef enum {
+    GGML_AME_I8_KERNEL_NONE = 0,
+    GGML_AME_I8_KERNEL_64_64_64,
+    GGML_AME_I8_KERNEL_128_64_128,
+} ggml_ame_i8_kernel_kind;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void ggml_ame_gemm_tile_i8_i32_bT(
+    const int8_t * A,
+    const int8_t * B,
+    int32_t * C);
+
+void ggml_ame_gemm_tile_i8_i32_bT_128_64_128(
+    const int8_t * A,
+    const int8_t * B,
+    int32_t * C);
+
+typedef struct {
+    unsigned long tok0_release_target;
+} ggml_ame_sync_state;
+
+typedef void (*ggml_ame_gemm_tile_i8_i32_bT_fn)(
+    const int8_t * A,
+    const int8_t * B,
+    int32_t * C);
+
+extern ggml_ame_sync_state ggml_ame_sync_state_global;
+
+#ifdef __cplusplus
+}
+#endif
+
+typedef struct {
+    ggml_ame_i8_kernel_kind kind;
+    int tile_m;
+    int tile_k;
+    int tile_n;
+    const char * name;
+    ggml_ame_gemm_tile_i8_i32_bT_fn gemm;
+} ggml_ame_i8_kernel;
+
+static inline const char * ggml_ame_i8_capacity_name(const ggml_ame_hw_config * cfg) {
+    if (cfg->int8_m_max >= 128 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 128) {
+        return "m128n128k64.i8i32";
+    }
+    if (cfg->int8_m_max >= 64 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 64) {
+        return "m64n64k64.i8i32";
+    }
+    return "none";
+}
+
+static inline const ggml_ame_i8_kernel * ggml_ame_i8_kernel_for_kind(ggml_ame_i8_kernel_kind kind) {
+    static const ggml_ame_i8_kernel kernel_64_64_64 = {
+        GGML_AME_I8_KERNEL_64_64_64,
+        64,
+        64,
+        64,
+        "m64n64k64.i8i32",
+        ggml_ame_gemm_tile_i8_i32_bT,
+    };
+    static const ggml_ame_i8_kernel kernel_128_64_128 = {
+        GGML_AME_I8_KERNEL_128_64_128,
+        128,
+        64,
+        128,
+        "m128n128k64.i8i32",
+        ggml_ame_gemm_tile_i8_i32_bT_128_64_128,
+    };
+
+    switch (kind) {
+        case GGML_AME_I8_KERNEL_64_64_64:
+            return &kernel_64_64_64;
+        case GGML_AME_I8_KERNEL_128_64_128:
+            return &kernel_128_64_128;
+        case GGML_AME_I8_KERNEL_NONE:
+        default:
+            return NULL;
+    }
+}
+
+static inline const ggml_ame_hw_config * ggml_ame_hw_config_get(void) {
+    static ggml_ame_hw_config cfg;
+    static int initialized = 0;
+    if (initialized) {
+        return &cfg;
+    }
+    initialized = 1;
+
+#if defined(__riscv)
+    __asm__ volatile("csrr %0, 0xcc1" : "=r"(cfg.tlenb));
+    __asm__ volatile("csrr %0, 0xcc2" : "=r"(cfg.trlenb));
+    __asm__ volatile("csrr %0, 0xcc3" : "=r"(cfg.alenb));
+#endif
+
+    if (cfg.tlenb == 0 || cfg.trlenb == 0 || cfg.alenb == 0 ||
+            cfg.tlenb == UINT64_MAX || cfg.trlenb == UINT64_MAX || cfg.alenb == UINT64_MAX ||
+            cfg.tlenb % cfg.trlenb != 0) {
+        AME_LOG("hw probe invalid: tlenb=%llu trlenb=%llu alenb=%llu",
+            (unsigned long long) cfg.tlenb,
+            (unsigned long long) cfg.trlenb,
+            (unsigned long long) cfg.alenb);
+        return &cfg;
+    }
+
+    cfg.rows = cfg.tlenb / cfg.trlenb;
+    if (cfg.rows == 0 || cfg.alenb % cfg.rows != 0 || cfg.rows > UINT64_MAX / cfg.rows || cfg.alenb > UINT64_MAX / 8) {
+        AME_LOG("hw probe invalid: tlenb=%llu trlenb=%llu alenb=%llu rows=%llu",
+            (unsigned long long) cfg.tlenb,
+            (unsigned long long) cfg.trlenb,
+            (unsigned long long) cfg.alenb,
+            (unsigned long long) cfg.rows);
+        return &cfg;
+    }
+
+    cfg.arlenb = cfg.alenb / cfg.rows;
+    const uint64_t elems = cfg.rows * cfg.rows;
+    const uint64_t alen_bits = cfg.alenb * 8;
+    if (elems == 0 || alen_bits % elems != 0) {
+        AME_LOG("hw probe invalid: tlenb=%llu trlenb=%llu alenb=%llu rows=%llu",
+            (unsigned long long) cfg.tlenb,
+            (unsigned long long) cfg.trlenb,
+            (unsigned long long) cfg.alenb,
+            (unsigned long long) cfg.rows);
+        return &cfg;
+    }
+
+    cfg.melen_bits = alen_bits / elems;
+    cfg.int8_m_max = (int) cfg.rows;
+    cfg.int8_k_max = (int) cfg.trlenb;
+    cfg.int32_n_max = (int) (cfg.arlenb / sizeof(int32_t));
+    cfg.valid = 1;
+    cfg.fixed_tile_supported =
+        cfg.int8_m_max >= AME_TILE_M &&
+        cfg.int8_k_max >= AME_TILE_K &&
+        cfg.int32_n_max >= AME_TILE_N;
+
+    AME_LOG("hw probe: tlenb=%llu trlenb=%llu alenb=%llu rows=%llu melen_bits=%llu arlenb=%llu capacity=%s fixed_tile=%d",
+        (unsigned long long) cfg.tlenb,
+        (unsigned long long) cfg.trlenb,
+        (unsigned long long) cfg.alenb,
+        (unsigned long long) cfg.rows,
+        (unsigned long long) cfg.melen_bits,
+        (unsigned long long) cfg.arlenb,
+        ggml_ame_i8_capacity_name(&cfg),
+        cfg.fixed_tile_supported);
+
+    return &cfg;
+}
+
+static inline const ggml_ame_i8_kernel * ggml_ame_select_i8_kernel(int64_t M, int64_t N, int64_t K) {
+    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
+    if (!cfg->valid || K % AME_Q8_BLOCK_K != 0) {
+        return NULL;
+    }
+    if (M >= 128 && N >= 128 &&
+            cfg->int8_m_max >= 128 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 128) {
+        return ggml_ame_i8_kernel_for_kind(GGML_AME_I8_KERNEL_128_64_128);
+    }
+    if (M >= 64 && N >= 64 &&
+            cfg->int8_m_max >= 64 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 64) {
+        return ggml_ame_i8_kernel_for_kind(GGML_AME_I8_KERNEL_64_64_64);
+    }
+    return NULL;
+}
+
+static inline size_t ggml_ame_i8_kernel_workspace_size(const ggml_ame_i8_kernel * kernel, int64_t N, int64_t K, int use_packed_b_panel) {
+    (void) N;
+    if (kernel == NULL) {
+        return 0;
+    }
+
+    const int tile_m = kernel->tile_m;
+    const int tile_n = kernel->tile_n;
+    const int tile_k = kernel->tile_k;
+    const int64_t n_k_tiles = (K + tile_k - 1) / tile_k;
+
+    size_t size = 64;
+    size = (size + 63) / 64 * 64;
+    size += (size_t) tile_m * tile_k * sizeof(int8_t);
+    size = (size + 63) / 64 * 64;
+    size += use_packed_b_panel ?
+        (size_t) n_k_tiles * tile_n * tile_k * sizeof(int8_t) :
+        (size_t) tile_n * tile_k * sizeof(int8_t);
+    size = (size + 63) / 64 * 64;
+    size += (size_t) tile_m * tile_n * sizeof(int32_t);
+    return size;
+}
+
+static inline void ggml_ame_sync_begin_op(void) {
+#if defined(__riscv)
+    asm volatile("msyncreset tok0" ::: "memory");
+#endif
+    ggml_ame_sync_state_global.tok0_release_target = 0;
+}
+
+static inline unsigned long ggml_ame_sync_release_acquire_store(void) {
+#if defined(__riscv)
+    asm volatile("mrelease tok0" ::: "memory");
+    const unsigned long acquire_target = ++ggml_ame_sync_state_global.tok0_release_target;
+    asm volatile("macquire %0,tok0" :: "r"(acquire_target) : "memory");
+#else
+    const unsigned long acquire_target = ++ggml_ame_sync_state_global.tok0_release_target;
+#endif
+    return acquire_target;
+}
 
 // Helper function to check if AME can be used for given dimensions.
 //
@@ -52,10 +278,7 @@ static inline int ame_log_enabled(void) {
 // accounted for.
 static inline int ggml_ame_can_use(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
-    if (K % 32 != 0) return 0;
-    if (M < AME_TILE_M) return 0;
-    if (N < AME_TILE_N) return 0;
-    return 1;
+    return ggml_ame_select_i8_kernel(M, N, K) != NULL;
 }
 
 // Repacked Q4_0 format for AME (pre-unpacked to int8)
