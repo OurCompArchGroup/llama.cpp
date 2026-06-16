@@ -145,6 +145,27 @@ static int effective_test_threads() {
     return forced_buft_is_ame() ? 1 : (int) N_THREADS;
 }
 
+static bool xsai_test_progress_enabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * env = std::getenv("XSAI_TEST_BACKEND_OPS_PROGRESS_LOG");
+        cached = env != nullptr && env[0] != '\0' &&
+            strcmp(env, "0") != 0 && strcmp(env, "false") != 0 &&
+            strcmp(env, "FALSE") != 0 && strcmp(env, "off") != 0 &&
+            strcmp(env, "OFF") != 0;
+    }
+    return cached == 1;
+}
+
+static void xsai_test_progress_log(const char * phase, const std::string & op, const std::string & vars) {
+    if (!xsai_test_progress_enabled()) {
+        return;
+    }
+    fprintf(stderr, "[XSAI_TEST_BACKEND_OPS_PROGRESS] %s op=%s vars=%s\n",
+            phase, op.c_str(), vars.c_str());
+    fflush(stderr);
+}
+
 static uint64_t effective_perf_target_flops_cpu() {
     const uint64_t GFLOP = 1000ULL * 1000ULL * 1000ULL;
     const uint64_t MFLOP = 1000ULL * 1000ULL;
@@ -1508,6 +1529,7 @@ struct test_case {
             return true;
         }
 
+        xsai_test_progress_log("prealloc_alloc_buffer_begin", op_desc(out), vars());
         size_t alignment = ggml_backend_buft_get_alignment(buft);
         size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, base);
         size_t buffer_size = GGML_PAD(alloc_size, alignment) + alignment;
@@ -1516,9 +1538,11 @@ struct test_case {
             error_message = std::string("failed to allocate buffer type ") + ggml_backend_buft_name(buft);
             return false;
         }
+        xsai_test_progress_log("prealloc_alloc_buffer_done", op_desc(out), vars());
 
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        xsai_test_progress_log("prealloc_tallocr_begin", op_desc(out), vars());
         ggml_tallocr tallocr = ggml_tallocr_new(buffer);
         enum ggml_status status = ggml_tallocr_alloc(&tallocr, base);
         if (status != GGML_STATUS_SUCCESS) {
@@ -1526,13 +1550,16 @@ struct test_case {
             error_message = std::string("failed to place tensor in buffer type ") + ggml_backend_buft_name(buft);
             return false;
         }
+        xsai_test_progress_log("prealloc_tallocr_done", op_desc(out), vars());
 
+        xsai_test_progress_log("prealloc_init_view_chain_begin", op_desc(out), vars());
         status = init_view_chain(selected);
         if (status != GGML_STATUS_SUCCESS) {
             ggml_backend_buffer_free(buffer);
             error_message = std::string("failed to initialize view chain for buffer type ") + ggml_backend_buft_name(buft);
             return false;
         }
+        xsai_test_progress_log("prealloc_init_view_chain_done", op_desc(out), vars());
 
         extra_buffers.push_back(buffer);
         return true;
@@ -1575,13 +1602,17 @@ struct test_case {
         }
 
         std::string prealloc_error;
+        xsai_test_progress_log("test_prealloc_begin", current_op_name, vars());
         if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
+            xsai_test_progress_log("test_prealloc_fail", current_op_name, vars());
             ggml_free(ctx);
             return test_status_t::FAIL;
         }
+        xsai_test_progress_log("test_prealloc_done", current_op_name, vars());
 
         // check if the backends support the ops
         bool supported = true;
+        xsai_test_progress_log("test_support_begin", current_op_name, vars());
         for (ggml_backend_t backend : {backend1, backend2}) {
             const ggml_backend_buffer_type_t forced_buft = backend == backend1 ? g_forced_buft : nullptr;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -1591,6 +1622,7 @@ struct test_case {
                 }
             }
         }
+        xsai_test_progress_log(supported ? "test_support_done" : "test_support_unsupported", current_op_name, vars());
 
         if (!supported) {
             // Create test result for unsupported operation
@@ -1610,6 +1642,7 @@ struct test_case {
         add_sentinel(ctx);
 
         // allocate
+        xsai_test_progress_log("test_alloc_begin", current_op_name, vars());
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend1);
 
         if (buf == NULL) {
@@ -1617,17 +1650,22 @@ struct test_case {
             ggml_free(ctx);
             return test_status_t::FAIL;
         }
+        xsai_test_progress_log("test_alloc_done", current_op_name, vars());
 
         // build graph
+        xsai_test_progress_log("test_build_graph_begin", current_op_name, vars());
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
             ggml_graph_add_node(gf, sentinel);
         }
+        xsai_test_progress_log("test_build_graph_done", current_op_name, vars());
 
         // randomize tensors
+        xsai_test_progress_log("test_init_tensors_begin", current_op_name, vars());
         initialize_tensors(ctx);
+        xsai_test_progress_log("test_init_tensors_done", current_op_name, vars());
 
         // compare
         struct callback_userdata {
@@ -1710,9 +1748,11 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        xsai_test_progress_log("test_compare_begin", current_op_name, vars());
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
+        xsai_test_progress_log(cmp_ok ? "test_compare_done" : "test_compare_fail", current_op_name, vars());
 
         ggml_backend_buffer_free(buf);
         free_extra_buffers();
@@ -1761,13 +1801,16 @@ struct test_case {
         }
 
         std::string prealloc_error;
+        xsai_test_progress_log("perf_prealloc_begin", current_op_name, vars());
         if (!preallocate_selected_tensor(out, g_forced_buft, extra_buffers, prealloc_error)) {
             test_result result(backend_display_name(backend), current_op_name, vars(), "perf", false, false,
                                prealloc_error);
             output_printer->print_test_result(result);
             return true;
         }
+        xsai_test_progress_log("perf_prealloc_done", current_op_name, vars());
 
+        xsai_test_progress_log("perf_support_begin", current_op_name, vars());
         if (!supports_selected_buft_op(backend, out, g_forced_buft)) {
             // Create test result for unsupported performance test
             test_result result(backend_display_name(backend), current_op_name, vars(), "perf", false, false,
@@ -1779,30 +1822,39 @@ struct test_case {
 
             return true;
         }
+        xsai_test_progress_log("perf_support_done", current_op_name, vars());
 
         // allocate
+        xsai_test_progress_log("perf_alloc_begin", current_op_name, vars());
         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
             return false;
         }
+        xsai_test_progress_log("perf_alloc_done", current_op_name, vars());
 
         // randomize tensors
+        xsai_test_progress_log("perf_init_tensors_begin", current_op_name, vars());
         initialize_tensors(ctx.get());
+        xsai_test_progress_log("perf_init_tensors_done", current_op_name, vars());
 
         // build graph
+        xsai_test_progress_log("perf_build_graph_begin", current_op_name, vars());
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+        xsai_test_progress_log("perf_build_graph_done", current_op_name, vars());
         nemu_signal(DISABLE_TIME_INTR);
         nemu_signal(NOTIFY_PROFILER);
 
         // warmup run
+        xsai_test_progress_log("perf_warmup_compute_begin", current_op_name, vars());
         ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
             return false;
         }
+        xsai_test_progress_log("perf_warmup_compute_done", current_op_name, vars());
         reset_ame_profile_if_available();
 
         // determine number of runs

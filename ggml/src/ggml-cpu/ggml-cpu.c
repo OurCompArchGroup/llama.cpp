@@ -119,6 +119,7 @@ static struct {
 } g_ggml_xsai_op_profile;
 
 static int ggml_xsai_op_profile_enabled(void);
+static int ggml_xsai_op_progress_enabled(void);
 
 static const char * ggml_xsai_profile_timer_name(void) {
 #if defined(__riscv)
@@ -490,6 +491,51 @@ static int ggml_xsai_op_profile_enabled(void) {
         registered = 1;
     }
     return cached;
+}
+
+static int ggml_xsai_op_progress_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ggml_xsai_profile_env_on("GGML_XSAI_OP_PROGRESS_LOG") ? 1 : 0;
+    }
+    return cached;
+}
+
+static void ggml_xsai_op_progress_log(const char * phase, int node_n, const struct ggml_tensor * node) {
+    char name[GGML_MAX_NAME];
+    ggml_xsai_profile_normalize_name(node->name, name, sizeof(name));
+    const char * module = ggml_xsai_profile_module_name(name, node->op);
+
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            node->src[0] != NULL && node->src[1] != NULL) {
+        fprintf(stderr,
+                "[GGML_XSAI_OP_PROGRESS] %s node=%d name=%s module=%s op=%s M=%" PRId64 " N=%" PRId64 " K=%" PRId64 " src0=%s src1=%s dst=%s\n",
+                phase,
+                node_n,
+                name,
+                module,
+                node->op < GGML_OP_COUNT ? ggml_op_name(node->op) : "UNKNOWN",
+                node->src[0]->ne[1],
+                node->src[1]->ne[1],
+                node->src[0]->ne[0],
+                ggml_xsai_profile_type_name(node->src[0]->type),
+                ggml_xsai_profile_type_name(node->src[1]->type),
+                ggml_xsai_profile_type_name(node->type));
+    } else {
+        fprintf(stderr,
+                "[GGML_XSAI_OP_PROGRESS] %s node=%d name=%s module=%s op=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] dst=%s\n",
+                phase,
+                node_n,
+                name,
+                module,
+                node->op < GGML_OP_COUNT ? ggml_op_name(node->op) : "UNKNOWN",
+                node->ne[0],
+                node->ne[1],
+                node->ne[2],
+                node->ne[3],
+                ggml_xsai_profile_type_name(node->type));
+    }
+    fflush(stderr);
 }
 
 #if defined(__ARM_ARCH)
@@ -3359,6 +3405,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
 
     const int xsai_profile = state->ith == 0 ? ggml_xsai_op_profile_enabled() : 0;
+    const int xsai_progress = state->ith == 0 ? ggml_xsai_op_progress_enabled() : 0;
     if (xsai_profile) {
         g_ggml_xsai_op_profile.graphs++;
     }
@@ -3376,7 +3423,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         const uint64_t xsai_profile_t0 = xsai_profile ? ggml_xsai_profile_read_cycle() : 0;
+        if (xsai_progress) {
+            ggml_xsai_op_progress_log("begin", node_n, node);
+        }
         ggml_compute_forward(&params, node);
+        if (xsai_progress) {
+            ggml_xsai_op_progress_log("end", node_n, node);
+        }
         if (xsai_profile) {
             ggml_xsai_op_profile_record(node, ggml_xsai_profile_read_cycle() - xsai_profile_t0);
         }
