@@ -13,6 +13,11 @@
 #include <thread>
 #include <unordered_map>
 
+extern "C" {
+void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t k, float scale);
+size_t quantize_i2_s(const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+}
+
 // Quantization types. Changes to this struct must be replicated in quantize.cpp
 struct tensor_quantization {
     std::string name;
@@ -113,6 +118,12 @@ static void llama_tensor_dequantize_impl(
     float * f32_output = (float *) output.data();
 
     const ggml_type_traits * qtype = ggml_get_type_traits(tensor->type);
+    if (tensor->type == GGML_TYPE_I2_S) {
+        const uint8_t * data = (const uint8_t *) tensor->data;
+        const float * scale = (const float *) (data + nelements/4);
+        dequantize_row_i2_s(data, f32_output, nelements, scale[0]);
+        return;
+    }
     if (ggml_is_quantized(tensor->type)) {
         if (qtype->to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(tensor->type)));
@@ -248,7 +259,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
                 new_type = GGML_TYPE_IQ3_S;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_I2_S) {
                 new_type = GGML_TYPE_Q4_K;
             }
         }
@@ -509,6 +520,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_Q6_K:    default_type = GGML_TYPE_Q6_K;    break;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   default_type = GGML_TYPE_TQ1_0;   break;
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   default_type = GGML_TYPE_TQ2_0;   break;
+        case LLAMA_FTYPE_MOSTLY_I2_S:    default_type = GGML_TYPE_I2_S;    break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: default_type = GGML_TYPE_IQ2_XXS; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  default_type = GGML_TYPE_IQ2_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   default_type = GGML_TYPE_IQ2_XS;  break;
@@ -977,10 +989,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             new_size = 0;
             for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
                 const float * f32_data_03 = f32_data + i03 * nelements_matrix;
-                void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
+                void * new_data_03 = (char *)new_data + new_size;
                 const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;
 
-                new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                if (new_type == GGML_TYPE_I2_S) {
+                    GGML_ASSERT(tensor->ne[3] == 1);
+                    GGML_ASSERT(tensor->ne[2] == 1);
+                    new_size += quantize_i2_s(f32_data_03, new_data_03, nrows, n_per_row, imatrix_03);
+                } else {
+                    new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
+                }
 
                 // TODO: temporary sanity check that the F16 -> MXFP4 is lossless
 #if 0
