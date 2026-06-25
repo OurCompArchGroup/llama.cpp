@@ -3,8 +3,12 @@
 
 llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
+    const bool is_bitnet_25 = model.arch == LLM_ARCH_BITNET_25;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+    if (is_bitnet_25) {
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+    }
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -28,9 +32,11 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
 
         // self-attention
         {
+            ggml_tensor * rope_factors = is_bitnet_25 ? model.get_rope_factors(cparams, il) : nullptr;
+
             // compute Q and K and RoPE them
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
-            if (model.layers[il].wq_scale) {
+            if (!is_bitnet_25 && model.layers[il].wq_scale) {
                 Qcur = ggml_mul(ctx0, Qcur, model.layers[il].wq_scale);
             }
             cb(Qcur, "Qcur", il);
@@ -41,7 +47,7 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
 
             // B1.K
             ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
-            if (model.layers[il].wk_scale) {
+            if (!is_bitnet_25 && model.layers[il].wk_scale) {
                 Kcur = ggml_mul(ctx0, Kcur, model.layers[il].wk_scale);
             }
             cb(Kcur, "Kcur", il);
@@ -52,7 +58,7 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
 
             // B1.V
             ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
-            if (model.layers[il].wv_scale) {
+            if (!is_bitnet_25 && model.layers[il].wv_scale) {
                 Vcur = ggml_mul(ctx0, Vcur, model.layers[il].wv_scale);
             }
             cb(Vcur, "Vcur", il);
@@ -66,13 +72,13 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
             Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
+                    ctx0, Qcur, inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
             Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, nullptr,
+                    ctx0, Kcur, inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
@@ -97,7 +103,7 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
             if (model.layers[il].bo) {
                 cur = ggml_add(ctx0, cur, model.layers[il].bo);
             }
-            cb(cur, "attn_out", il);
+            cb(cur, is_bitnet_25 ? "attn_o_out" : "attn_out", il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
@@ -119,8 +125,8 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
                 model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_scale,
                 NULL,                      NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(cur, "ffn_sub_out", il);
+                is_bitnet_25 ? LLM_FFN_RELU_SQR : LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(cur, is_bitnet_25 ? "ffn_out" : "ffn_sub_out", il);
 
         cur = build_norm(cur,
                 model.layers[il].ffn_sub_norm, NULL,
@@ -150,7 +156,6 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
     res->t_embd = cur;
 
     // lm_head
-    // FIXME: do not use model.tok_embd directly, duplicate as model.output
     cur = build_lora_mm(model.tok_embd, cur);
 
     cb(cur, "result_output", -1);

@@ -73,6 +73,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
     { LLM_ARCH_BITNET,           "bitnet"           },
+    { LLM_ARCH_BITNET_25,        "bitnet-25"        },
     { LLM_ARCH_T5,               "t5"               },
     { LLM_ARCH_T5ENCODER,        "t5encoder"        },
     { LLM_ARCH_JAIS,             "jais"             },
@@ -1586,6 +1587,24 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
             return {
                 LLM_TENSOR_TOKEN_EMBD,
                 LLM_TENSOR_OUTPUT_NORM,
+                LLM_TENSOR_ATTN_Q,
+                LLM_TENSOR_ATTN_K,
+                LLM_TENSOR_ATTN_V,
+                LLM_TENSOR_ATTN_OUT,
+                LLM_TENSOR_ATTN_NORM,
+                LLM_TENSOR_ATTN_SUB_NORM,
+                LLM_TENSOR_FFN_GATE,
+                LLM_TENSOR_FFN_DOWN,
+                LLM_TENSOR_FFN_UP,
+                LLM_TENSOR_FFN_NORM,
+                LLM_TENSOR_FFN_SUB_NORM,
+            };
+        case LLM_ARCH_BITNET_25:
+            return {
+                LLM_TENSOR_TOKEN_EMBD,
+                LLM_TENSOR_OUTPUT_NORM,
+                LLM_TENSOR_OUTPUT,
+                LLM_TENSOR_ROPE_FREQS,
                 LLM_TENSOR_ATTN_Q,
                 LLM_TENSOR_ATTN_K,
                 LLM_TENSOR_ATTN_V,
