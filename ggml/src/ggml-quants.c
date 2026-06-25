@@ -2270,6 +2270,74 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+size_t quantize_i2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+
+    GGML_ASSERT(nrow > 0);
+    GGML_ASSERT(n_per_row % 128 == 0);
+
+    const int64_t n = nrow * n_per_row;
+    uint8_t * out = (uint8_t *) dst;
+
+    double max = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        max = MAX(max, fabs((double) src[i]));
+    }
+
+    const float scale = (float) max;
+    memset(out, 0, (size_t) n / 4);
+
+    for (int64_t blk = 0; blk < n / 128; ++blk) {
+        for (int64_t j = 0; j < 128; ++j) {
+            const int group_idx = (int) (j / 32);
+            const int group_pos = (int) (j % 32);
+            const float v = src[blk * 128 + j];
+            uint8_t q = 1;
+            if (fabsf(v) >= 1e-6f) {
+                q = (v * scale > 0.0f) ? 2 : 0;
+            }
+            out[blk * 32 + group_pos] |= (uint8_t) (q << (6 - 2 * group_idx));
+        }
+    }
+
+    float * scale_ptr = (float *) (out + n / 4);
+    scale_ptr[0] = scale;
+    for (int i = 1; i < 8; ++i) {
+        scale_ptr[i] = scale;
+    }
+
+    return (size_t) n / 4 + 32;
+}
+
+void dequantize_row_i2_s(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, float scale) {
+    static const float map2bit[4] = { -1.0f, 0.0f, +1.0f, 0.0f };
+
+    int64_t done = 0;
+    while (done < k) {
+        const int64_t blk_e = (k - done >= 128) ? 128 : (k - done);
+        const int64_t cols0 = blk_e >= 32  ? 32 : blk_e;
+        const int64_t cols1 = blk_e >= 64  ? 32 : MAX(0, blk_e - 32);
+        const int64_t cols2 = blk_e >= 96  ? 32 : MAX(0, blk_e - 64);
+        const int64_t cols3 = blk_e >= 128 ? 32 : MAX(0, blk_e - 96);
+
+        for (int gp = 0; gp < 32; ++gp) {
+            const uint8_t b = x[gp];
+            const uint8_t c0 = (b >> 6) & 0x3;
+            const uint8_t c1 = (b >> 4) & 0x3;
+            const uint8_t c2 = (b >> 2) & 0x3;
+            const uint8_t c3 = (b >> 0) & 0x3;
+
+            if (gp < cols0) y[done + 0*32 + gp] = scale * map2bit[c0];
+            if (gp < cols1) y[done + 1*32 + gp] = scale * map2bit[c1];
+            if (gp < cols2) y[done + 2*32 + gp] = scale * map2bit[c2];
+            if (gp < cols3) y[done + 3*32 + gp] = scale * map2bit[c3];
+        }
+
+        x += 32;
+        done += blk_e;
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -5084,12 +5152,12 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         return false;
     }
 
-    if (nbytes % ggml_type_size(type) != 0) {
+    if (type != GGML_TYPE_I2_S && nbytes % ggml_type_size(type) != 0) {
         fprintf(stderr, "%s: invalid size %zu for type %s (type size = %zu)\n", __func__, nbytes, ggml_type_name(type), ggml_type_size(type));
         return false;
     }
 
-    const size_t nb = nbytes/ggml_type_size(type);
+    const size_t nb = type == GGML_TYPE_I2_S ? 0 : nbytes/ggml_type_size(type);
 
     switch (type) {
         case GGML_TYPE_BF16:
@@ -5262,6 +5330,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
             } break;
+        case GGML_TYPE_I2_S:
+        case GGML_TYPE_I8_S:
+            // Per-tensor scale format; basic size checks above are sufficient here.
+            break;
         case GGML_TYPE_IQ1_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);

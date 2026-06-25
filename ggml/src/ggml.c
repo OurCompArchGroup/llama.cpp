@@ -890,17 +890,18 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_tq2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_0_ref,
     },
-    [36] = { // GGML_TYPE_IQ4_NL_4_4
-        .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
+    [GGML_TYPE_I2_S] = {
+        .type_name                = "i2_s",
+        .blck_size                = 1,
+        .type_size                = sizeof(int8_t),
+        .is_quantized             = true,
+        .from_float_ref           = NULL,
     },
-    [37] = { // GGML_TYPE_IQ4_NL_4_8
-        .type_name                = "TYPE_IQ4_NL_4_8 REMOVED, use IQ4_NL with runtime repacking",
-        .blck_size                = 0,
-        .type_size                = 0,
-        .is_quantized             = false,
+    [GGML_TYPE_I8_S] = {
+        .type_name                = "i8_s",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = true,
     },
     [38] = { // GGML_TYPE_IQ4_NL_8_8
         .type_name                = "TYPE_IQ4_NL_8_8 REMOVED, use IQ4_NL with runtime repacking",
@@ -1254,6 +1255,14 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         }
     }
 
+    if (tensor->type == GGML_TYPE_I2_S) {
+        size_t nbytes = ggml_row_size(tensor->type, tensor->ne[0]);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            nbytes *= tensor->ne[i];
+        }
+        return nbytes + 32;
+    }
+
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
     if (blck_size == 1) {
@@ -1286,6 +1295,9 @@ size_t ggml_type_size(enum ggml_type type) {
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
     assert(ne % ggml_blck_size(type) == 0);
+    if (type == GGML_TYPE_I2_S) {
+        return (size_t) ne/4;
+    }
     return ggml_type_size(type)*ne/ggml_blck_size(type);
 }
 
@@ -1391,6 +1403,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ4_XS:        wtype = GGML_TYPE_IQ4_XS;   break;
         case GGML_FTYPE_MOSTLY_IQ3_S:         wtype = GGML_TYPE_IQ3_S;    break;
         case GGML_FTYPE_MOSTLY_IQ2_S:         wtype = GGML_TYPE_IQ2_S;    break;
+        case GGML_FTYPE_MOSTLY_I2_S:          wtype = GGML_TYPE_I2_S;     break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
     }
@@ -1413,7 +1426,7 @@ static bool ggml_is_contiguous_n(const struct ggml_tensor * tensor, int n) {
     if (tensor->ne[0] != ggml_blck_size(tensor->type) && tensor->nb[0] != next_nb) {
         return false;
     }
-    next_nb *= tensor->ne[0]/ggml_blck_size(tensor->type);
+    next_nb = ggml_row_size(tensor->type, tensor->ne[0]);
     for (int i = 1; i < GGML_MAX_DIMS; i++) {
         if (tensor->ne[i] != 1) {
             if (i > n) {
@@ -1447,7 +1460,14 @@ bool ggml_is_contiguous_2(const struct ggml_tensor * tensor) {
 }
 
 bool ggml_is_contiguously_allocated(const struct ggml_tensor * tensor) {
-    return ggml_nbytes(tensor) == ggml_nelements(tensor) * ggml_type_size(tensor->type)/ggml_blck_size(tensor->type);
+    size_t nbytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        nbytes *= tensor->ne[i];
+    }
+    if (tensor->type == GGML_TYPE_I2_S) {
+        nbytes += 32;
+    }
+    return ggml_nbytes(tensor) == nbytes;
 }
 
 bool ggml_is_permuted(const struct ggml_tensor * tensor) {
@@ -1695,6 +1715,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     for (int i = 1; i < n_dims; i++) {
         data_size *= ne[i];
     }
+    if (type == GGML_TYPE_I2_S && data_size > 0) {
+        data_size += 32;
+    }
 
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
 
@@ -1740,7 +1763,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     }
 
     result->nb[0] = ggml_type_size(type);
-    result->nb[1] = result->nb[0]*(result->ne[0]/ggml_blck_size(type));
+    result->nb[1] = ggml_row_size(type, result->ne[0]);
     for (int i = 2; i < GGML_MAX_DIMS; i++) {
         result->nb[i] = result->nb[i - 1]*result->ne[i - 1];
     }
@@ -7581,6 +7604,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q6_K:    result = quantize_q6_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_I2_S:    result = quantize_i2_s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -7612,7 +7636,11 @@ size_t ggml_quantize_chunk(
             assert(false);
     }
 
-    GGML_ASSERT(result == nrows * row_size);
+    if (type == GGML_TYPE_I2_S) {
+        GGML_ASSERT(result == nrows * row_size + 32);
+    } else {
+        GGML_ASSERT(result == nrows * row_size);
+    }
 
     return result;
 }
