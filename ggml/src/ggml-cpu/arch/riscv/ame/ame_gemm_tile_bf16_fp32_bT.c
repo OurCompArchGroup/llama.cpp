@@ -4,6 +4,14 @@
 #define AME_MLOAD_FENCE 1
 #endif
 
+static void ame_probe_emit_bf16_once(void) {
+    static volatile int emitted = 0;
+    if (__sync_bool_compare_and_swap(&emitted, 0, 1)) {
+        fprintf(stderr, "[AME-PROBE] AME bf16 tile kernel executed\n");
+        fflush(stderr);
+    }
+}
+
 // BF16 GEMM using RISC-V AME instructions.
 // C(MxN) = A(MxK) x B^T(NxK), where B is transposed in memory.
 void ggml_ame_gemm_tile_bf16_fp32_bT(
@@ -38,6 +46,7 @@ void ggml_ame_gemm_tile_bf16_fp32_bT(
     MLBE16(tr1, addr_b, TILE_K_BYTES);
 
     MFMACC_S_BF16(acc0, tr0, tr1);
+    ame_probe_emit_bf16_once();
 
     MSCE32(acc0, addr_c, stride_c);
 

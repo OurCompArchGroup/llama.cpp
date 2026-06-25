@@ -40,9 +40,9 @@ static inline int ame_log_enabled(void) {
         }                                             \
     } while (0)
 
-#define AME_TILE_M 128
+#define AME_TILE_M 64
 #define AME_TILE_K 64
-#define AME_TILE_N 128
+#define AME_TILE_N 64
 // mtilek is configured in bytes for the current AME/QEMU model, so BF16 uses
 // half as many K elements as the int8 path for the same 64-byte register row.
 #define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
@@ -58,6 +58,14 @@ static inline int ame_log_enabled(void) {
 static inline int ggml_ame_can_use_q8(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
     if (K % 32 != 0) return 0;
+    if (M < AME_TILE_M) return 0;
+    if (N < AME_TILE_N) return 0;
+    return 1;
+}
+
+static inline int ggml_ame_can_use_i2_s(int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return 0;
+    if (K % 128 != 0) return 0;
     if (M < AME_TILE_M) return 0;
     if (N < AME_TILE_N) return 0;
     return 1;
@@ -410,6 +418,19 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne11,
     size_t src1_stride,
     int graph_id,
+    void * work_data,
+    size_t work_size
+);
+
+void ggml_ame_mul_mat_i2_s(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride,
     void * work_data,
     size_t work_size
 );

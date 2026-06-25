@@ -6,6 +6,14 @@
 #define AME_MLOAD_FENCE 1
 #endif
 
+static void ame_probe_emit_i8_once(void) {
+    static volatile int emitted = 0;
+    if (__sync_bool_compare_and_swap(&emitted, 0, 1)) {
+        fprintf(stderr, "[AME-PROBE] AME int8 tile kernel executed\n");
+        fflush(stderr);
+    }
+}
+
 // INT8 GEMM using RISC-V AME instructions
 // Tile size: M=AME_TILE_M, K=AME_TILE_K, N=AME_TILE_N (atomic AME variant)
 // C(MxN) = A(MxK) × B^T(NxK), where B is transposed in memory
@@ -49,6 +57,7 @@ void ggml_ame_gemm_tile_i8_i32_bT(
 
     // INT8 matrix multiply-accumulate: C(MxN) = A(MxK) × B^T(NxK)
     MQMA(acc0, tr0, tr1);
+    ame_probe_emit_i8_once();
 
     // Store INT32 result to C (MxN)
     MSCE32(acc0, addr_c, stride_c * 4);

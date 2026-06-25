@@ -112,7 +112,7 @@ static void reference_mul_mat_q8_0_f32(
 
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I2_S;
 }
 
 static size_t ame_align_up(size_t value, size_t alignment) {
@@ -284,6 +284,20 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
                 params->wsize
             );
         }
+    } else if (src0->type == GGML_TYPE_I2_S) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        AME_LOG("backend_ame_mul_mat: dispatching to I2_S kernel");
+        ggml_ame_mul_mat_i2_s(
+            src0->data,
+            src1->data,
+            dst->data,
+            ne00, ne01,
+            ne10, ne11,
+            src1->nb[1],
+            params->wdata,
+            params->wsize
+        );
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_BF16);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
@@ -320,6 +334,17 @@ public:
                 return false;
             }
             if (!ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+                return false;
+            }
+            size = ggml_backend_ame_desired_wsize(op);
+            return true;
+        }
+
+        if (op->src[0]->type == GGML_TYPE_I2_S) {
+            if (op->src[1]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_i2_s(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
                 return false;
             }
             size = ggml_backend_ame_desired_wsize(op);
@@ -377,6 +402,13 @@ public:
                 return false;
             }
             if (!ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
+        } else if (src0->type == GGML_TYPE_I2_S) {
+            if (src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+            if (!ggml_ame_can_use_i2_s(src0->ne[1], src1->ne[1], src0->ne[0])) {
                 return false;
             }
         } else if (src0->type == GGML_TYPE_BF16) {
@@ -573,10 +605,14 @@ public:
             return true;
         }
 
-        const bool shape_supported =
-            op->src[0]->type == GGML_TYPE_Q8_0
-                ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
-                : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        bool shape_supported = false;
+        if (op->src[0]->type == GGML_TYPE_Q8_0) {
+            shape_supported = ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        } else if (op->src[0]->type == GGML_TYPE_I2_S) {
+            shape_supported = ggml_ame_can_use_i2_s(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        } else {
+            shape_supported = ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        }
         if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
             return true;
@@ -590,6 +626,7 @@ public:
 
         const bool src1_supported =
             (op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32) ||
+            (op->src[0]->type == GGML_TYPE_I2_S && op->src[1]->type == GGML_TYPE_F32) ||
             (op->src[0]->type == GGML_TYPE_BF16 && (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16));
         if (src1_supported) {
             AME_LOG("supports_op: accept M=%lld N=%lld K=%lld", (long long) op->src[0]->ne[1], (long long) op->src[1]->ne[1], (long long) op->src[0]->ne[0]);
