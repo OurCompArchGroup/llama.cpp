@@ -22,6 +22,14 @@
 
 #define UNUSED GGML_UNUSED
 
+static inline int nearest_int(float fval) {
+    assert(fabsf(fval) <= 4194303.f);
+    float val = fval + 12582912.f;
+    int i;
+    memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -102,6 +110,27 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     assert(k % QK_K == 0);
     block_tq2_0 * GGML_RESTRICT y = vy;
     quantize_row_tq2_0_ref(x, y, k);
+}
+
+void quantize_row_i8_s(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k, float * act_scale, int32_t * act_sum) {
+    int8_t * dst = (int8_t *) y;
+
+    double max = 1e-5;
+    for (int64_t i = 0; i < k; ++i) {
+        max = MAX(max, fabs((double) x[i]));
+    }
+
+    const float scale = (float) (127.0 / max);
+    int32_t sum = 0;
+    for (int64_t i = 0; i < k; ++i) {
+        int v = nearest_int(x[i] * scale);
+        v = MAX(-128, MIN(127, v));
+        dst[i] = (int8_t) v;
+        sum += v;
+    }
+
+    act_scale[0] = scale;
+    act_sum[0] = sum;
 }
 
 //===================================== Q8_K ==============================================
@@ -414,6 +443,36 @@ void ggml_vec_dot_tq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     }
 
     *s = sumf;
+}
+
+void ggml_vec_dot_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(by);
+
+    const uint8_t * x = (const uint8_t *) vx;
+    const int8_t  * y = (const int8_t  *) vy;
+
+    GGML_ASSERT(n % 128 == 0);
+
+    for (int row = 0; row < nrc; ++row) {
+        const uint8_t * xr = x + row * bx;
+        int32_t sum = 0;
+
+        for (int64_t blk = 0; blk < n / 128; ++blk) {
+            const uint8_t * xb = xr + blk * 32;
+            const int8_t  * yb = y  + blk * 128;
+
+            for (int gp = 0; gp < 32; ++gp) {
+                const uint8_t b = xb[gp];
+                sum += (int32_t) ((b >> 6) & 0x3) * (int32_t) yb[gp +  0];
+                sum += (int32_t) ((b >> 4) & 0x3) * (int32_t) yb[gp + 32];
+                sum += (int32_t) ((b >> 2) & 0x3) * (int32_t) yb[gp + 64];
+                sum += (int32_t) ((b >> 0) & 0x3) * (int32_t) yb[gp + 96];
+            }
+        }
+
+        s[row] = (float) sum;
+    }
 }
 
 void ggml_vec_dot_q2_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

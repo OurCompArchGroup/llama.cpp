@@ -411,7 +411,8 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
             // TODO: find the optimal value
             const int64_t min_batch = 32;
 
-            return ggml_is_contiguous(src0) &&
+            return src0->type != GGML_TYPE_I2_S &&
+                   ggml_is_contiguous(src0) &&
                    ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    (ne0 >= min_batch && ne1 >= min_batch && ne10 >= min_batch) &&
@@ -419,7 +420,8 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
         }
 
         case GGML_OP_OUT_PROD:
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return src0->type != GGML_TYPE_I2_S &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    ggml_is_matrix(src0) &&
                    ggml_is_matrix(src1) &&

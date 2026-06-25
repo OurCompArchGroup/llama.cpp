@@ -382,6 +382,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_I2_S] = {
+        .vec_dot                  = ggml_vec_dot_i2_i8_s,
+        .vec_dot_type             = GGML_TYPE_I8_S,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_I8_S] = {
+        .from_float               = NULL,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -1171,6 +1179,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    const float * i2_scale = type == GGML_TYPE_I2_S ? (const float *) ((const uint8_t *) src0->data + (ggml_nelements(src0) / 4)) : NULL;
+    const float * act_scales = type == GGML_TYPE_I2_S && src1->type != vec_dot_type ? (const float *) ((const char *) params->wdata + ne13*row_size*ne11*ne12) : NULL;
+    const int32_t * act_sums = type == GGML_TYPE_I2_S && src1->type != vec_dot_type ? (const int32_t *) ((const char *) act_scales + ne13*ne11*ne12*sizeof(float)) : NULL;
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
@@ -1199,6 +1210,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i1 = i11;
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
+                const size_t i2_idx = (size_t) i13 * ne12 * ne11 + (size_t) i12 * ne11 + (size_t) i11;
 
                 const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
 
@@ -1217,7 +1229,14 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    if (type == GGML_TYPE_I2_S) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 0,
+                                src0_row + ir0 * nb01, nb01,
+                                src1_col, 0, 1);
+                        tmp[ir0 - iir0] = (tmp[ir0 - iir0] - act_sums[i2_idx]) / act_scales[i2_idx] * (*i2_scale);
+                    } else {
+                        vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1298,8 +1317,12 @@ UseGgmlGemm1:;
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
-        assert(params->wsize >= ne13*nbw3);
+        const size_t i2_rows = (size_t) ne11 * ne12 * ne13;
+        assert(params->wsize >= ne13*nbw3 + (src0->type == GGML_TYPE_I2_S ? i2_rows * (sizeof(float) + sizeof(int32_t)) : 0));
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        float   * act_scales = src0->type == GGML_TYPE_I2_S ? (float   *) (wdata + ne13*nbw3) : NULL;
+        int32_t * act_sums   = src0->type == GGML_TYPE_I2_S ? (int32_t *) ((char *) act_scales + i2_rows * sizeof(float)) : NULL;
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1314,13 +1337,20 @@ UseGgmlGemm1:;
     #else
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    const float * src1_row = (float *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                    void * dst_row = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
+                    const size_t i2_idx = (size_t) i13 * ne12 * ne11 + (size_t) i12 * ne11 + (size_t) i11;
+                    if (src0->type == GGML_TYPE_I2_S) {
+                        quantize_row_i8_s(src1_row, dst_row, ne10, act_scales + i2_idx, act_sums + i2_idx);
+                    } else {
+                        size_t bs = ggml_blck_size(vec_dot_type);
+                        int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                        from_float(src1_row + ne10_block_start*bs,
+                                   (void *) ((char *) dst_row + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
         }
@@ -2788,6 +2818,10 @@ struct ggml_cplan ggml_graph_plan(
 
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            if (vec_dot_type == GGML_TYPE_I8_S) {
+                                const size_t i2_rows = (size_t) node->src[1]->ne[1] * node->src[1]->ne[2] * node->src[1]->ne[3];
+                                cur += i2_rows * sizeof(float) + i2_rows * sizeof(int32_t);
+                            }
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "ggml.h"
 #include "unary-ops.h"
@@ -10,6 +11,12 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+
+static inline float ggml_i2_s_scale(const ggml_tensor * tensor) {
+    const uint8_t * base = (const uint8_t *) tensor->data;
+    const size_t packed_bytes_total = (size_t) ggml_nelements(tensor) / 4;
+    return *(const float *) (base + packed_bytes_total);
+}
 
 // ggml_compute_forward_dup
 
@@ -481,7 +488,42 @@ static void ggml_compute_forward_dup_from_q(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = type == GGML_TYPE_I2_S ? NULL : ggml_get_type_traits(type)->to_float;
+    const float i2_scale = type == GGML_TYPE_I2_S ? ggml_i2_s_scale(src0) : 0.0f;
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    if (type == GGML_TYPE_I2_S) {
+        const int64_t row_elems = ne00;
+        const int64_t nr = ggml_nrows(src0);
+
+        // I2_S is packed per source row with one scale for the whole tensor.
+        // The generic block-wise dup path is not valid for this layout.
+        GGML_ASSERT(ggml_is_contiguous(dst) || (ne10 == ne00 && ne11 == ne01 && ne12 == ne02 && ne13 == ne03));
+
+        const int dr = (nr + nth - 1)/nth;
+        const int ir0 = dr*ith;
+        const int ir1 = MIN(ir0 + dr, nr);
+
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = ir - i03*ne02*ne01 - i02*ne01;
+
+            const int64_t i = ir * row_elems;
+            const int64_t i13 = i/(ne10 * ne11 * ne12);
+            const int64_t i12 = (i - i13*ne10*ne11*ne12) / (ne10*ne11);
+            const int64_t i11 = (i - i13*ne10*ne11*ne12 - i12*ne10*ne11) / ne10;
+            const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
+
+            const uint8_t * src0_row = (const uint8_t *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+            float * dst_row = (float *) ((char *) dst->data + i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13);
+
+            dequantize_row_i2_s(src0_row, dst_row, row_elems, i2_scale);
+        }
+
+        return;
+    }
 
     size_t qk = ggml_blck_size(type);
     const int64_t nr = ggml_nelements(src1) / qk;
@@ -490,9 +532,6 @@ static void ggml_compute_forward_dup_from_q(
     GGML_ASSERT(nb10 == ggml_type_size(dst->type));
     // must either have first dimension large enough to hold a row, or fully contiguous
     GGML_ASSERT((ne10 % qk) == 0 || ggml_is_contiguous(dst));
-
-    const int ith = params->ith;
-    const int nth = params->nth;
 
     const int dr = (nr + nth - 1)/nth;
 
@@ -516,9 +555,15 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        dequantize_row_q(
+        if (type == GGML_TYPE_I2_S) {
+            dequantize_row_i2_s(
+                (const uint8_t *) ((const char *) src0->data + x_offset),
+                (float *) ((char *) dst->data + dst_offset), qk, i2_scale);
+        } else {
+            dequantize_row_q(
                 (const void *) ((char *) src0->data + x_offset),
-                     (float *) ((char *)  dst->data + dst_offset), qk);
+                (float *) ((char *) dst->data + dst_offset), qk);
+        }
     }
 }
 
@@ -592,8 +637,9 @@ static void ggml_compute_forward_add_q_f32(
 
     const ggml_type type = src0->type;
     const ggml_type dtype = dst->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = type == GGML_TYPE_I2_S ? NULL : ggml_get_type_traits(type)->to_float;
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(dtype)->from_float;
+    const float i2_scale = type == GGML_TYPE_I2_S ? ggml_i2_s_scale(src0) : 0.0f;
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -638,7 +684,11 @@ static void ggml_compute_forward_add_q_f32(
         assert(ne00 % 32 == 0);
 
         // unquantize row from src0 to temp buffer
-        dequantize_row_q(src0_row, wdata, ne00);
+        if (type == GGML_TYPE_I2_S) {
+            dequantize_row_i2_s((const uint8_t *) src0_row, wdata, ne00, i2_scale);
+        } else {
+            dequantize_row_q(src0_row, wdata, ne00);
+        }
         // add src1
         ggml_vec_acc_f32(ne00, wdata, src1_row);
         // quantize row to dst
@@ -935,8 +985,9 @@ static void ggml_compute_forward_add1_q_f32(
     GGML_TENSOR_UNARY_OP_LOCALS
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = type == GGML_TYPE_I2_S ? NULL : ggml_get_type_traits(type)->to_float;
     ggml_from_float_t const quantize_row_q = ggml_get_type_traits_cpu(type)->from_float;
+    const float i2_scale = type == GGML_TYPE_I2_S ? ggml_i2_s_scale(src0) : 0.0f;
 
     // we don't support permuted src0
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -971,7 +1022,11 @@ static void ggml_compute_forward_add1_q_f32(
         assert(ne0 % 32 == 0);
 
         // unquantize row from src0 to temp buffer
-        dequantize_row_q(src0_row, wdata, ne0);
+        if (type == GGML_TYPE_I2_S) {
+            dequantize_row_i2_s((const uint8_t *) src0_row, wdata, ne0, i2_scale);
+        } else {
+            dequantize_row_q(src0_row, wdata, ne0);
+        }
         // add src1
         ggml_vec_acc1_f32(ne0, wdata, v);
         // quantize row to dst
@@ -4180,7 +4235,8 @@ static void ggml_compute_forward_out_prod_q_f32(
     const int nth = params->nth;
 
     const ggml_type type = src0->type;
-    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+    ggml_to_float_t const dequantize_row_q = type == GGML_TYPE_I2_S ? NULL : ggml_get_type_traits(type)->to_float;
+    const float i2_scale = type == GGML_TYPE_I2_S ? ggml_i2_s_scale(src0) : 0.0f;
 
     GGML_ASSERT(ne02 == ne12);
     GGML_ASSERT(ne03 == ne13);
@@ -4250,7 +4306,11 @@ static void ggml_compute_forward_out_prod_q_f32(
             float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
             float * d  = (float *) ((char *)  dst->data + (          i1*nb1 + i2*nb2 + i3*nb3));
 
-            dequantize_row_q(s0, wdata, ne0);
+            if (type == GGML_TYPE_I2_S) {
+                dequantize_row_i2_s((const uint8_t *) s0, wdata, ne0, i2_scale);
+            } else {
+                dequantize_row_q(s0, wdata, ne0);
+            }
             ggml_vec_mad_f32(ne0, d, wdata, *s1);
         }
     }
@@ -4629,6 +4689,47 @@ static void ggml_compute_forward_get_rows_q(
     }
 }
 
+static void ggml_compute_forward_get_rows_i2_s(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    assert(ne0  == nc);
+    assert(ne02 == ne11);
+    assert(ggml_nrows(dst) == nr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    const uint8_t * base = (const uint8_t *) src0->data;
+    const size_t packed_bytes_total = (size_t) ggml_nelements(src0) / 4;
+    const float scale = *(const float *) (base + packed_bytes_total);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        dequantize_row_i2_s(
+            (const uint8_t *) ((const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3), nc, scale);
+    }
+}
+
 static void ggml_compute_forward_get_rows_f16(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -4784,6 +4885,10 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ2_S:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
+            } break;
+        case GGML_TYPE_I2_S:
+            {
+                ggml_compute_forward_get_rows_i2_s(params, dst);
             } break;
         case GGML_TYPE_F16:
             {
@@ -5507,6 +5612,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_Q8_K:
+        case GGML_TYPE_I2_S:
+        case GGML_TYPE_I8_S:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
