@@ -45,36 +45,37 @@ void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                    
     MSETTILEM(tmp, TILE_M);                                                             \
     MSETTILEK(tmp, TILE_K);                                                             \
     MSETTILEN(tmp, TILE_N);                                                             \
+    ggml_ame_config_i8_i32();                                                           \
     AME_TILE_PROGRESS_LOG("mset_done%s", TAG);                                         \
                                                                                         \
     int32_t * addr_c = C;                                                               \
     const int stride_c = TILE_N;                                                        \
                                                                                         \
     AME_TILE_PROGRESS_LOG("mzero_begin%s", TAG);                                       \
-    MZERO_ACC(acc0);                                                                    \
+    MZERO(acc0);                                                                        \
     AME_TILE_PROGRESS_LOG("mzero_done%s", TAG);                                        \
     AME_MLOAD_FENCE_BEFORE_LOAD(TAG);                                                   \
                                                                                         \
     const int8_t * addr_a = A;                                                          \
-    AME_TILE_PROGRESS_LOG("mlae8_begin%s A=%p stride=%d", TAG,                         \
+    AME_TILE_PROGRESS_LOG("mla_begin%s A=%p stride=%d", TAG,                           \
         (const void *) addr_a, TILE_K);                                                 \
-    MLAE8(tr0, addr_a, TILE_K);                                                         \
-    AME_TILE_PROGRESS_LOG("mlae8_done%s", TAG);                                        \
+    MLA(tr0, addr_a, TILE_K);                                                           \
+    AME_TILE_PROGRESS_LOG("mla_done%s", TAG);                                          \
                                                                                         \
     const int8_t * addr_b = B;                                                          \
-    AME_TILE_PROGRESS_LOG("mlbe8_begin%s B=%p stride=%d", TAG,                         \
+    AME_TILE_PROGRESS_LOG("mlb_begin%s B=%p stride=%d", TAG,                           \
         (const void *) addr_b, TILE_K);                                                 \
-    MLBE8(tr1, addr_b, TILE_K);                                                         \
-    AME_TILE_PROGRESS_LOG("mlbe8_done%s", TAG);                                        \
+    MLB(tr1, addr_b, TILE_K);                                                           \
+    AME_TILE_PROGRESS_LOG("mlb_done%s", TAG);                                          \
                                                                                         \
-    AME_TILE_PROGRESS_LOG("mqma_begin%s", TAG);                                        \
-    MQMA(acc0, tr0, tr1);                                                               \
-    AME_TILE_PROGRESS_LOG("mqma_done%s", TAG);                                         \
+    AME_TILE_PROGRESS_LOG("mmacc_begin%s", TAG);                                       \
+    MMACC(acc0, tr0, tr1);                                                              \
+    AME_TILE_PROGRESS_LOG("mmacc_done%s", TAG);                                        \
                                                                                         \
-    AME_TILE_PROGRESS_LOG("msce32_begin%s C=%p stride_bytes=%d", TAG,                  \
+    AME_TILE_PROGRESS_LOG("msc_begin%s C=%p stride_bytes=%d", TAG,                     \
         (void *) addr_c, stride_c * 4);                                                 \
-    MSCE32(acc0, addr_c, stride_c * 4);                                                 \
-    AME_TILE_PROGRESS_LOG("msce32_done%s", TAG);                                       \
+    MSC(acc0, addr_c, stride_c * 4);                                                    \
+    AME_TILE_PROGRESS_LOG("msc_done%s", TAG);                                          \
                                                                                         \
     AME_TILE_PROGRESS_LOG("mrelease_begin%s", TAG);                                    \
     const unsigned long acquire_target = ggml_ame_sync_release_acquire_store();         \

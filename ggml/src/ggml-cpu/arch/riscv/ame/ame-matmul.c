@@ -898,12 +898,25 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const size_t required_wsize = ggml_ame_i8_kernel_workspace_size(kernel, N, K, use_packed_b_panel);
     uint8_t * workspace = (uint8_t *) work_data;
     int allocated_workspace = 0;
+    AME_PANEL_PROGRESS_LOG(
+        "ame64 start: kernel=%s M=%lld N=%lld K=%lld nb64=%lld use_packed_b_panel=%d work_data=%p work_size=%zu",
+        kernel->name, (long long) M, (long long) N, (long long) K, (long long) nb64,
+        use_packed_b_panel, work_data, work_size);
 
     if (workspace == NULL || work_size < required_wsize) {
+        AME_PANEL_PROGRESS_LOG(
+            "ame64 workspace_alloc_begin: required=%zu current=%zu",
+            required_wsize, work_size);
         workspace = (uint8_t *) ggml_aligned_malloc(required_wsize);
-        if (!workspace) return;
+        if (!workspace) {
+            AME_PANEL_PROGRESS_LOG("ame64 workspace_alloc_failed: required=%zu", required_wsize);
+            return;
+        }
         work_size = required_wsize;
         allocated_workspace = 1;
+        AME_PANEL_PROGRESS_LOG(
+            "ame64 workspace_alloc_done: workspace=%p size=%zu",
+            (void *) workspace, work_size);
     }
 
     uintptr_t ws_ptr = (uintptr_t) workspace;
@@ -922,21 +935,36 @@ void ggml_ame_mul_mat_q8_0_ame64(
     ws_ptr += (size_t) tile_m * tile_n * sizeof(int32_t);
 
     if (ws_ptr > ws_end) {
+        AME_PANEL_PROGRESS_LOG(
+            "ame64 workspace_layout_overflow: ws_ptr=%p ws_end=%p",
+            (void *) ws_ptr, (void *) ws_end);
         if (allocated_workspace) {
             ggml_aligned_free(workspace, work_size);
         }
         return;
     }
 
+    AME_PANEL_PROGRESS_LOG(
+        "ame64 workspace_ready: tile_a=%p tile_b=%p tile_c=%p tile_m=%d tile_n=%d tile_k=%d",
+        (void *) tile_a, (void *) tile_b, (void *) tile_c, tile_m, tile_n, tile_k);
+    AME_PANEL_PROGRESS_LOG("ame64 assert_phys_begin");
     ame_assert_phys_contiguous();
+    AME_PANEL_PROGRESS_LOG("ame64 assert_phys_done");
+    AME_PANEL_PROGRESS_LOG("ame64 sync_begin_op_begin");
     ggml_ame_sync_begin_op();
+    AME_PANEL_PROGRESS_LOG("ame64 sync_begin_op_done");
+    AME_PANEL_PROGRESS_LOG("ame64 clear_tiles_begin");
     memset(tile_a, 0, (size_t) tile_m * tile_k * sizeof(int8_t));
     if (!use_packed_b_panel) {
         memset(tile_b, 0, tile_b_size);
     }
+    AME_PANEL_PROGRESS_LOG("ame64 clear_tiles_done");
 
     uint64_t prof_t0 = prof ? ame_read_cycle() : 0;
     const float * xq_scales = NULL;
+    AME_PANEL_PROGRESS_LOG(
+        "ame64 prepare_cache_begin: src1_key=%p src1=%p graph_id=%d graph_key=%p generation=%llu",
+        src1_key, src1, graph_id, graph_key, (unsigned long long) src1_generation);
     const block_q8_ame64 * xq = ame_prepare_x_q64_cache(
         src1_key,
         src1,
@@ -947,9 +975,11 @@ void ggml_ame_mul_mat_q8_0_ame64(
         graph_key,
         src1_generation,
         &xq_scales);
+    AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_primary_done: xq=%p scales=%p", (const void *) xq, (const void *) xq_scales);
     if (xq == NULL) {
         // no graph-local cache id available; fall back to one-shot quantization by using
         // a temporary cache entry keyed to this call only
+        AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_fallback_begin");
         xq = ame_prepare_x_q64_cache(
             src1,
             src1,
@@ -961,6 +991,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
             ++g_ame_x_q64_oneshot_generation,
             &xq_scales);
         if (xq == NULL) {
+            AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_failed");
             if (allocated_workspace) {
                 ggml_aligned_free(workspace, work_size);
             }
@@ -970,8 +1001,10 @@ void ggml_ame_mul_mat_q8_0_ame64(
         g_ame_x_q64_cache.graph_key = NULL;
         g_ame_x_q64_cache.graph_id = 0;
         g_ame_x_q64_cache.generation = 0;
+        AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_fallback_done: xq=%p scales=%p", (const void *) xq, (const void *) xq_scales);
     }
     if (prof) prof_local.cycles_prepare_cache += ame_read_cycle() - prof_t0;
+    AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_done");
 
     const int use_packed_a_tiles =
         kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
@@ -1120,10 +1153,19 @@ void ggml_ame_mul_mat_q8_0_ame64(
             const int jmax = (j0 + tile_n <= N) ? tile_n : (N - j0);
             float acc_f32[AME_TILE_M_MAX * AME_TILE_N_MAX];
             memset(acc_f32, 0, sizeof(acc_f32));
+            AME_PANEL_PROGRESS_LOG(
+                "ame64 tile_output_begin: M=%lld N=%lld K=%lld i0=%lld j0=%lld imax=%d jmax=%d",
+                (long long) M, (long long) N, (long long) K,
+                (long long) i0, (long long) j0, imax, jmax);
 
             for (int64_t kb = 0; kb < nb64; ++kb) {
                 float y_scales[AME_TILE_N_MAX];
                 float x_scales[AME_TILE_M_MAX];
+
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 tile_k_begin: M=%lld N=%lld K=%lld i0=%lld j0=%lld kb=%lld/%lld",
+                    (long long) M, (long long) N, (long long) K,
+                    (long long) i0, (long long) j0, (long long) kb, (long long) nb64);
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 for (int i = 0; i < tile_m; ++i) {
@@ -1135,6 +1177,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     }
                 }
                 if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 pack_a_done: i0=%lld j0=%lld kb=%lld",
+                    (long long) i0, (long long) j0, (long long) kb);
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 if (!ame_skip_tile_b_zero()) {
@@ -1146,15 +1191,25 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     memcpy(&tile_b[j * tile_k], bx->qs, AME_Q8_PACK_K);
                 }
                 if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 pack_b_done: i0=%lld j0=%lld kb=%lld",
+                    (long long) i0, (long long) j0, (long long) kb);
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 if (!ame_skip_tile_c_zero()) {
                     memset(tile_c, 0, (size_t) tile_m * tile_n * sizeof(int32_t));
                     if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
                 }
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 before_gemm: i0=%lld j0=%lld kb=%lld tile_a=%p tile_b=%p tile_c=%p",
+                    (long long) i0, (long long) j0, (long long) kb,
+                    (const void *) tile_a, (const void *) tile_b, (void *) tile_c);
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 kernel->gemm(tile_a, tile_b, tile_c);
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 after_gemm: i0=%lld j0=%lld kb=%lld",
+                    (long long) i0, (long long) j0, (long long) kb);
                 if (prof) {
                     prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
                     prof_local.tile_calls++;
@@ -1177,6 +1232,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     imax,
                     jmax);
                 if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
+                AME_PANEL_PROGRESS_LOG(
+                    "ame64 scale_done: i0=%lld j0=%lld kb=%lld",
+                    (long long) i0, (long long) j0, (long long) kb);
             }
 
             prof_t0 = prof ? ame_read_cycle() : 0;
@@ -1191,6 +1249,10 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 prof_local.cycles_store += ame_read_cycle() - prof_t0;
                 prof_local.output_tile_calls++;
             }
+            AME_PANEL_PROGRESS_LOG(
+                "ame64 tile_output_done: M=%lld N=%lld K=%lld i0=%lld j0=%lld",
+                (long long) M, (long long) N, (long long) K,
+                (long long) i0, (long long) j0);
         }
     }
 

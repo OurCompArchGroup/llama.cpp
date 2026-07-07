@@ -82,7 +82,7 @@ void ggml_ame_gemm_tile_i8_i32_bT_128_64_128(
     int32_t * C);
 
 typedef struct {
-    unsigned long tok0_release_target;
+    unsigned long sync0_release_target;
 } ggml_ame_sync_state;
 
 typedef void (*ggml_ame_gemm_tile_i8_i32_bT_fn)(
@@ -254,18 +254,19 @@ static inline size_t ggml_ame_i8_kernel_workspace_size(const ggml_ame_i8_kernel 
 
 static inline void ggml_ame_sync_begin_op(void) {
 #if defined(__riscv)
-    asm volatile("msyncreset tok0" ::: "memory");
+    asm volatile("msyncregreset sync0" ::: "memory");
 #endif
-    ggml_ame_sync_state_global.tok0_release_target = 0;
+    ggml_ame_sync_state_global.sync0_release_target = 0;
 }
 
 static inline unsigned long ggml_ame_sync_release_acquire_store(void) {
 #if defined(__riscv)
-    asm volatile("mrelease tok0" ::: "memory");
-    const unsigned long acquire_target = ++ggml_ame_sync_state_global.tok0_release_target;
-    asm volatile("macquire %0,tok0" :: "r"(acquire_target) : "memory");
+    asm volatile("mrelease sync0" ::: "memory");
+    const unsigned long acquire_target = ++ggml_ame_sync_state_global.sync0_release_target;
+    asm volatile("macquire sync0, %0" :: "r"(acquire_target) : "memory");
+    asm volatile("mfence" ::: "memory");
 #else
-    const unsigned long acquire_target = ++ggml_ame_sync_state_global.tok0_release_target;
+    const unsigned long acquire_target = ++ggml_ame_sync_state_global.sync0_release_target;
 #endif
     return acquire_target;
 }
@@ -292,6 +293,10 @@ typedef struct {
     uint16_t d;
     int8_t qs[AME_Q8_PACK_K];
 } block_q8_ame64;
+
+#define AME_MCFG_INT8  0x02
+#define AME_MCFG_UINT8 0x03
+#define AME_MCFG_INT32 0x04
 
 // Matrix configuration instructions
 #ifdef STC
@@ -336,60 +341,52 @@ typedef struct {
     )
 
 // Matrix accumulator zero instruction
-#define MZERO_ACC(ACC) \
+#define MZERO(ACC) \
     asm volatile ( \
-        "mzero.acc.m " #ACC \
+        "mzero " #ACC \
         : \
         : \
         : \
     )
 
 // Matrix load instructions
-#define MLAE8(REG, SRC, N) \
+#define MLA(REG, SRC, N) \
     asm volatile ( \
-        "mlae8.m " #REG ", (%0), %1" \
+        "mla " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
-#define MLBE8(REG, SRC, N) \
+#define MLB(REG, SRC, N) \
     asm volatile ( \
-        "mlbe8.m " #REG ", (%0), %1" \
+        "mlb " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
-#define MLCE32(REG, SRC, N) \
+#define MLC(REG, SRC, N) \
     asm volatile ( \
-        "mlce32.m " #REG ", (%0), %1" \
+        "mlc " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
 // Matrix store instruction
-#define MSCE32(REG, DST, N) \
+#define MSC(REG, DST, N) \
     asm volatile ( \
-        "msce32.m " #REG ", (%0), %1" \
+        "msc " #REG ", (%0), %1" \
         : \
         : "r"(DST), "r"(N) \
         : "memory" \
     )
 
 // Matrix multiply-accumulate instruction
-#define MMA(ACC, TR0, TR2) \
+#define MMACC(ACC, TR0, TR2) \
     asm volatile ( \
-        "mmau.mm " #ACC ", " #TR0 ", " #TR2 "\n" \
-        : \
-        : \
-        : \
-    )
-
-#define MQMA(ACC, TR0, TR2) \
-    asm volatile ( \
-        "mqma.mm " #ACC ", " #TR0 ", " #TR2 "\n" \
+        "mmacc " #ACC ", " #TR2 ", " #TR0 "\n" \
         : \
         : \
         : \
@@ -424,65 +421,80 @@ typedef struct {
     );(RD)=VAL;
 
 // Matrix accumulator zero instruction
-#define MZERO_ACC(ACC) \
+#define MZERO(ACC) \
     asm volatile ( \
-        "mzero1r " #ACC \
+        "mzero " #ACC \
         : \
         : \
         : \
     )
 
 // Matrix load instructions
-#define MLAE8(REG, SRC, N) \
+#define MLA(REG, SRC, N) \
     asm volatile ( \
-        "mlae8 " #REG ", (%0), %1" \
+        "mla " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
-#define MLBE8(REG, SRC, N) \
+#define MLB(REG, SRC, N) \
     asm volatile ( \
-        "mlbe8 " #REG ", (%0), %1" \
+        "mlb " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
-#define MLCE32(REG, SRC, N) \
+#define MLC(REG, SRC, N) \
     asm volatile ( \
-        "mlce32 " #REG ", (%0), %1" \
+        "mlc " #REG ", (%0), %1" \
         : \
         : "r"(SRC), "r"(N) \
         : \
     )
 
 // Matrix store instruction
-#define MSCE32(REG, DST, N) \
+#define MSC(REG, DST, N) \
     asm volatile ( \
-        "msce32 " #REG ", (%0), %1" \
+        "msc " #REG ", (%0), %1" \
         : \
         : "r"(DST), "r"(N) \
         : "memory" \
     )
 
 // Matrix multiply-accumulate instruction
-#define MMAU(ACC, TR0, TR2) \
+#define MMACC(ACC, TR0, TR2) \
     asm volatile ( \
-        "mmaccu.w.b" #ACC ", " #TR0 ", " #TR2 "\n" \
-        : \
-        : \
-        : \
-    )
-
-#define MQMA(ACC, TR0, TR2) \
-    asm volatile ( \
-        "mmacc.w.b " #ACC ", " #TR0 ", " #TR2 "\n" \
+        "mmacc " #ACC ", " #TR2 ", " #TR0 "\n" \
         : \
         : \
         : \
     )
 #endif
+
+#define MSETCFG(CFG, VAL) \
+    asm volatile ( \
+        "msetcfg " #CFG ", %0" \
+        : \
+        : "r"(VAL) \
+        : "memory" \
+    )
+
+static inline void ggml_ame_config_i8_i32(void) {
+#if defined(__riscv)
+    const unsigned long cfg_i8 = AME_MCFG_INT8;
+    const unsigned long cfg_i32 = AME_MCFG_INT32;
+    MSETCFG(mcfg0, cfg_i8);
+    MSETCFG(mcfg1, cfg_i8);
+    MSETCFG(mcfg2, cfg_i8);
+    MSETCFG(mcfg3, cfg_i8);
+    MSETCFG(mcfg4, cfg_i32);
+    MSETCFG(mcfg5, cfg_i32);
+    MSETCFG(mcfg6, cfg_i32);
+    MSETCFG(mcfg7, cfg_i32);
+#endif
+}
 
 #ifdef __cplusplus
 extern "C" {
