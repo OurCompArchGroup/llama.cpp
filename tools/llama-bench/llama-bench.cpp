@@ -455,6 +455,20 @@ static bool getenv_bool(const char * name) {
     return strcmp(v, "0") != 0;
 }
 
+static void checkpoint_before_first_decode() {
+    static const bool enabled = getenv_bool("LLAMA_BENCH_CKPT_BEFORE_FIRST_DECODE");
+    static std::atomic<bool> emitted(false);
+
+    if (!enabled || emitted.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
+    fprintf(stderr, "[LLAMA_BENCH_CKPT] start ROI before first llama_decode\n");
+    fflush(stderr);
+    nemu_signal(DISABLE_TIME_INTR);
+    nemu_signal(NOTIFY_PROFILER);
+}
+
 static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
     if (a.pattern != b.pattern) {
         // cString comparison that may be null
@@ -2703,6 +2717,7 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
+        checkpoint_before_first_decode();
         int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
         if (res != 0) {
             if (use_estimate && res == 2) {
@@ -2758,6 +2773,7 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads, layer_debug_
     const int n_decode = use_estimate ? 1 : n_gen;
 
     for (int i = 0; i < n_decode; i++) {
+        checkpoint_before_first_decode();
         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
         if (res != 0) {
             if (use_estimate && res == 2) {

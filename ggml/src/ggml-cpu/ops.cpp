@@ -7,9 +7,14 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#if defined(GGML_USE_RV_AME)
+#include "arch/riscv/ame/ame-flash-attn.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -4855,6 +4860,11 @@ static void ggml_compute_forward_set_rows_f32(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
+    // A transposed F16 V cache is represented as one element per SET_ROWS row.
+    // Avoid a function-pointer call and an n=1 vector conversion for every
+    // element; the generic path below still handles all other layouts/types.
+    const bool direct_f32_to_f16 = dst->type == GGML_TYPE_F16 && nc == 1;
+
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             for (int64_t i = ir0; i < ir1; ++i) {
@@ -4865,6 +4875,12 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                if (direct_f32_to_f16) {
+                    const float value = *(const float *) ((const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03);
+                    *(ggml_fp16_t *) ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3) = GGML_CPU_FP32_TO_FP16(value);
+                    continue;
+                }
 
                 from_float(
                         (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
@@ -8550,6 +8566,21 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
+#if defined(GGML_USE_RV_AME)
+    std::vector<uint8_t> ame_validation_output;
+    if (ggml_ame_flash_attn_ext_compute(params, dst)) {
+        const char * validate = getenv("GGML_AME_FLASH_ATTN_VALIDATE");
+        const bool validate_enabled = validate != nullptr && validate[0] != '\0' &&
+            strcmp(validate, "0") != 0 && strcmp(validate, "false") != 0 &&
+            strcmp(validate, "off") != 0 && strcmp(validate, "no") != 0;
+        if (!validate_enabled) {
+            return;
+        }
+        ame_validation_output.resize(ggml_nbytes(dst));
+        memcpy(ame_validation_output.data(), dst->data, ame_validation_output.size());
+    }
+#endif
+
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -8642,6 +8673,29 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
     }
+
+#if defined(GGML_USE_RV_AME)
+    if (!ame_validation_output.empty()) {
+        const float * actual = reinterpret_cast<const float *>(ame_validation_output.data());
+        const float * reference = static_cast<const float *>(dst->data);
+        double squared_error = 0.0;
+        double squared_reference = 0.0;
+        float max_abs_error = 0.0f;
+        const int64_t count = ggml_nelements(dst);
+        for (int64_t i = 0; i < count; ++i) {
+            const double difference = (double) actual[i] - reference[i];
+            squared_error += difference * difference;
+            squared_reference += (double) reference[i] * reference[i];
+            max_abs_error = std::max(max_abs_error, fabsf(actual[i] - reference[i]));
+        }
+        const double nmse = squared_reference > 0.0 ? squared_error / squared_reference : squared_error;
+        fprintf(stderr, "[AME_FLASH_ATTN_VALIDATE] kv=%s elements=%lld nmse=%.9g max_abs=%.9g\n",
+            ggml_type_name(dst->src[1]->type), (long long) count, nmse, (double) max_abs_error);
+        fflush(stderr);
+        GGML_ASSERT(std::isfinite(nmse) && nmse <= 5e-4);
+        memcpy(dst->data, ame_validation_output.data(), ame_validation_output.size());
+    }
+#endif
 }
 
 void ggml_compute_forward_flash_attn_ext(

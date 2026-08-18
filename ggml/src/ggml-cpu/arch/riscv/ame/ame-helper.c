@@ -108,3 +108,61 @@ void ggml_ame_repack_q8_0_to_ame64(
         }
     }
 }
+
+void ggml_ame_repack_q8_0_to_ame64_whole_k(
+    void * dst,
+    const void * src,
+    int64_t nrows,
+    int64_t k
+) {
+    const block_q8_0 * restrict src_rows = (const block_q8_0 *) src;
+    block_q8_ame64 * restrict dst_rows = (block_q8_ame64 *) dst;
+
+    assert(k > 0 && k % QK8_0 == 0);
+
+    const int64_t nb32 = k / QK8_0;
+    const int64_t nb64 = (k + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const block_q8_0 * src_row = src_rows + row * nb32;
+        block_q8_ame64 * dst_row = dst_rows + row * nb64;
+        float amax = 0.0f;
+
+        for (int64_t b32 = 0; b32 < nb32; ++b32) {
+            const float d = GGML_FP16_TO_FP32(src_row[b32].d);
+            for (int j = 0; j < QK8_0; ++j) {
+                const float av = fabsf(d * src_row[b32].qs[j]);
+                if (av > amax) {
+                    amax = av;
+                }
+            }
+        }
+
+        const float delta = amax / 127.0f;
+        const float inv_delta = delta ? 1.0f / delta : 0.0f;
+        const ggml_fp16_t delta_fp16 = GGML_FP32_TO_FP16(delta);
+
+        for (int64_t b64 = 0; b64 < nb64; ++b64) {
+            block_q8_ame64 * out = &dst_row[b64];
+            out->d = delta_fp16;
+
+            for (int j = 0; j < AME_Q8_PACK_K; ++j) {
+                const int64_t index = b64 * AME_Q8_PACK_K + j;
+                if (index >= k) {
+                    out->qs[j] = 0;
+                    continue;
+                }
+
+                const block_q8_0 * in = &src_row[index / QK8_0];
+                const float value = GGML_FP16_TO_FP32(in->d) * in->qs[index % QK8_0];
+                float quantized = roundf(value * inv_delta);
+                if (quantized > 127.0f) {
+                    quantized = 127.0f;
+                } else if (quantized < -127.0f) {
+                    quantized = -127.0f;
+                }
+                out->qs[j] = (int8_t) quantized;
+            }
+        }
+    }
+}

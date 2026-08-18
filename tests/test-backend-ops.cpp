@@ -157,6 +157,47 @@ static bool xsai_test_progress_enabled() {
     return cached == 1;
 }
 
+static bool xsai_test_print_error_enabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * env = std::getenv("XSAI_TEST_BACKEND_OPS_PRINT_ERROR");
+        cached = env != nullptr && env[0] != '\0' &&
+            strcmp(env, "0") != 0 && strcmp(env, "false") != 0 &&
+            strcmp(env, "FALSE") != 0 && strcmp(env, "off") != 0 &&
+            strcmp(env, "OFF") != 0;
+    }
+    return cached == 1;
+}
+
+static bool xsai_test_fixed_seed(uint32_t & seed) {
+    const char * env = std::getenv("XSAI_TEST_BACKEND_OPS_SEED");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    char * end = nullptr;
+    const unsigned long value = std::strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || value > UINT32_MAX) {
+        fprintf(stderr, "warning: ignoring invalid XSAI_TEST_BACKEND_OPS_SEED='%s'\n", env);
+        return false;
+    }
+
+    seed = (uint32_t) value;
+    return true;
+}
+
+static bool xsai_test_k_scale_stress_enabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * env = std::getenv("XSAI_TEST_BACKEND_OPS_K_SCALE_STRESS");
+        cached = env != nullptr && env[0] != '\0' &&
+            strcmp(env, "0") != 0 && strcmp(env, "false") != 0 &&
+            strcmp(env, "FALSE") != 0 && strcmp(env, "off") != 0 &&
+            strcmp(env, "OFF") != 0;
+    }
+    return cached == 1;
+}
+
 static void xsai_test_progress_log(const char * phase, const std::string & op, const std::string & vars) {
     if (!xsai_test_progress_enabled()) {
         return;
@@ -265,13 +306,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
     {
         // parallel initialization
         const size_t n_threads = effective_test_threads();
+        uint32_t fixed_seed = 0;
+        const bool use_fixed_seed = xsai_test_fixed_seed(fixed_seed);
+        static uint32_t tensor_sequence = 0;
+        const uint32_t tensor_seed = fixed_seed + tensor_sequence++;
         // static RNG initialization (revisit if n_threads stops being constant)
-        std::vector<std::default_random_engine> generators = [n_threads]() {
+        std::vector<std::default_random_engine> generators = [n_threads, use_fixed_seed, tensor_seed]() {
             std::random_device rd;
             std::vector<std::default_random_engine> vec;
             vec.reserve(n_threads);
-            //for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(1234 + i); } // fixed seed
-            for (size_t i = 0; i < n_threads; i++) { vec.emplace_back(rd()); }
+            for (size_t i = 0; i < n_threads; i++) {
+                vec.emplace_back(use_fixed_seed ? tensor_seed + (uint32_t) i : rd());
+            }
             return vec;
         }();
 
@@ -296,6 +342,17 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             for (auto & t : tasks) {
                 t.get();
             }
+        }
+    }
+
+    if (xsai_test_k_scale_stress_enabled() && tensor->ne[0] >= 64 &&
+            (tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_F32)) {
+        static const float scales[] = { 1.0f, 0.5f, 0.25f, 0.125f, 0.0625f };
+        const size_t n_scales = sizeof(scales) / sizeof(scales[0]);
+        const bool reverse = tensor->type == GGML_TYPE_F32;
+        for (size_t i = 0; i < nels; ++i) {
+            const size_t phase = ((i % tensor->ne[0]) / 64) % n_scales;
+            data[i] *= scales[reverse ? n_scales - 1 - phase : phase];
         }
     }
 
@@ -1729,9 +1786,15 @@ struct test_case {
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
-            if (err > ud->tc->max_err(ud->backend1)) {
-                printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+            const double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            const double max_err = ud->tc->max_err(ud->backend1);
+            if (xsai_test_print_error_enabled()) {
+                printf("[%s] ERR = %.9f threshold = %.9f ", ggml_op_desc(t1), err, max_err);
+            }
+            if (err > max_err) {
+                if (!xsai_test_print_error_enabled()) {
+                    printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, max_err);
+                }
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
@@ -4187,6 +4250,8 @@ struct test_mul_mat : public test_case {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
         ggml_tensor * a;
         ggml_tensor * b;
+        const bool allow_param_a = !(forced_buft_is_ame() &&
+            (type_a == GGML_TYPE_BF16 || type_a == GGML_TYPE_F16));
 
         const int npermuted = (per[0] != 0) + (per[1] != 1) + (per[2] != 2) + (per[3] != 3);
         if (npermuted > 0) {
@@ -4202,7 +4267,7 @@ struct test_mul_mat : public test_case {
             a = ggml_new_tensor_4d(ctx, type_a, ne_a[per[0]], ne_a[per[1]], ne_a[per[2]], ne_a[per[3]]);
             b = ggml_new_tensor_4d(ctx, type_b, ne_b[per[0]], ne_b[per[1]], ne_b[per[2]], ne_b[per[3]]);
             if (!ggml_is_quantized(type_a)) {
-                if (bs[1] == 1 && nr[1] == 1) {
+                if (allow_param_a && bs[1] == 1 && nr[1] == 1) {
                     ggml_set_param(a);
                 }
                 ggml_set_param(b);
@@ -4220,7 +4285,7 @@ struct test_mul_mat : public test_case {
             b = ggml_new_tensor_4d(ctx, type_b, k_physical, n, bs[0]*nr[0], bs[1]*nr[1]);
 
             if (!ggml_is_quantized(type_a)) {
-                if (bs[1] == 1 && nr[1] == 1) {
+                if (allow_param_a && bs[1] == 1 && nr[1] == 1) {
                     ggml_set_param(a);
                 }
                 ggml_set_param(b);
@@ -7506,6 +7571,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
@@ -8061,6 +8127,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 32, 4));
     test_cases.emplace_back(new test_gla(GGML_TYPE_F32, 32, 64, 128, 4));
 
+    // Model-independent XSAI calibration and holdout grid. Keep this list in
+    // sync with llm-microarch-sim's frozen synthetic probe manifest.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  128,  64,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64, 128,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,  128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,  512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64, 1024, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  256, 128,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 128, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  192,  64,  192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  384, 128,  384, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128,  768, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1536, 128, 1536, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64, 8192, {1, 1}, {1, 1}));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
@@ -8068,6 +8153,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 768, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   64,  64,  32, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16,  64,  64,  32, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  128, 128, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  256, 128, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  128, 128, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {2, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {2, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  128, 128, 256, {2, 1}, {8, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {2, 1}, {8, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  128, 128, 256, {2, 1}, {8, 1}, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  256, 128, 128, {2, 1}, {8, 1}, {0, 2, 1, 3}));
 
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
@@ -8703,6 +8801,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Small full-tile cases for the RISC-V AME FlashAttention path.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 64, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 64, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {2, 1}, 65, 65, true, true, 8, 10, GGML_PREC_F32, GGML_TYPE_Q8_0));
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -8776,6 +8879,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Model-independent XSAI calibration and holdout grid. The 512x128x512
+    // point already exists immediately below and is intentionally not duplicated.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  128,  64,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64, 128,   64, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,  128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  256, 128,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 128, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  192,  64,  192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  384, 128,  384, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128,  768, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1536, 128, 1536, {1, 1}, {1, 1}));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
@@ -8783,6 +8899,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 128, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 8192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  128, 128,  256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  256, 128,  128, {1, 1}, {1, 1}));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
@@ -8934,12 +9052,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // XSAI AME FlashAttention checkpoint/debug shape.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 64, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0));
+
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
-
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
@@ -9103,6 +9223,10 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     if (mode == MODE_PERF) {
         auto test_cases = make_test_cases_perf();
         filter_test_cases(test_cases, params_filter);
+        if (params_filter != nullptr && test_cases.empty()) {
+            fprintf(stderr, "error: performance filter matched zero compiled test cases: %s\n", params_filter);
+            return false;
+        }
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
         }

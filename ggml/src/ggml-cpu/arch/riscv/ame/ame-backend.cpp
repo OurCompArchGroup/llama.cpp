@@ -27,6 +27,16 @@ static bool ame_backend_env_enabled(const char * name) {
         strcmp(value, "false") != 0 && strcmp(value, "off") != 0 && strcmp(value, "no") != 0;
 }
 
+static inline uint64_t ame_backend_read_cycle() {
+#if defined(__riscv)
+    uint64_t cycles;
+    __asm__ volatile("rdcycle %0" : "=r"(cycles));
+    return cycles;
+#else
+    return 0;
+#endif
+}
+
 static int64_t ame_backend_env_i64(const char * name, int64_t fallback) {
     const char * value = getenv(name);
     if (value == nullptr || value[0] == '\0') {
@@ -38,9 +48,35 @@ static int64_t ame_backend_env_i64(const char * name, int64_t fallback) {
     return end != value ? (int64_t) parsed : fallback;
 }
 
-static bool ame_backend_packed_b_panel_allowed_for_m(int64_t M) {
-    const int64_t max_m = ame_backend_env_i64("GGML_AME_PACKED_B_PANEL_MAX_M", 0);
-    return max_m <= 0 || M <= max_m;
+static bool ame_backend_can_use_f16_via_bf16(const ggml_tensor * op) {
+    if (!ame_backend_env_enabled("GGML_AME_F16_BF16") || getenv("GGML_AME_SCALAR") != nullptr ||
+        op == nullptr || op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ame_backend_env_enabled("GGML_AME_F16_BF16_REQUIRE_AME_BUFFER") &&
+        (src0->buffer == nullptr || src0->buffer->buft != ggml_backend_cpu_riscv_ame_buffer_type())) {
+        return false;
+    }
+    if (src0->ne[0] != src1->ne[0] || src0->ne[2] <= 0 || src0->ne[3] <= 0 ||
+        src1->ne[2] % src0->ne[2] != 0 || src1->ne[3] % src0->ne[3] != 0) {
+        return false;
+    }
+    if (src0->nb[0] != sizeof(ggml_fp16_t) || src1->nb[0] != sizeof(float) ||
+        op->nb[0] != sizeof(float) || op->nb[1] != (size_t) op->ne[0] * sizeof(float)) {
+        return false;
+    }
+    if (src0->nb[1] < (size_t) src0->ne[0] * sizeof(ggml_fp16_t) ||
+        src1->nb[1] < (size_t) src1->ne[0] * sizeof(float)) {
+        return false;
+    }
+
+    return ggml_ame_can_use_bf16(src0->ne[1], src1->ne[1], src0->ne[0]);
 }
 
 // Simple scalar reference implementation for Q8_0 x F32 matmul
@@ -136,9 +172,42 @@ static void reference_mul_mat_q8_0_f32(
     free(y);
 }
 
+static void reference_mul_mat_bf16_f32(
+    const void * src0_data,
+    ggml_type src1_type,
+    const void * src1_data,
+    float * dst_data,
+    int64_t M, int64_t N, int64_t K,
+    size_t src1_stride_bytes
+) {
+    const ggml_bf16_t * a = (const ggml_bf16_t *) src0_data;
+    std::vector<ggml_bf16_t> src1_bf16;
+
+    if (src1_type == GGML_TYPE_F32) {
+        src1_bf16.resize((size_t) N * (size_t) K);
+        for (int64_t n = 0; n < N; ++n) {
+            const float * src1_col = (const float *) ((const char *) src1_data + n * src1_stride_bytes);
+            ggml_cpu_fp32_to_bf16(src1_col, src1_bf16.data() + n * K, K);
+        }
+    }
+
+    for (int64_t n = 0; n < N; ++n) {
+        const ggml_bf16_t * b_col = src1_type == GGML_TYPE_BF16
+            ? (const ggml_bf16_t *) ((const char *) src1_data + n * src1_stride_bytes)
+            : src1_bf16.data() + n * K;
+        for (int64_t m = 0; m < M; ++m) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                sum += GGML_BF16_TO_FP32(a[m * K + k]) * GGML_BF16_TO_FP32(b_col[k]);
+            }
+            dst_data[n * M + m] = sum;
+        }
+    }
+}
+
 // Check if AME can accelerate this operation
 static bool qtype_has_ame_kernels(ggml_type type) {
-    return type == GGML_TYPE_Q8_0;
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16;
 }
 
 static size_t ame_align_up(size_t value, size_t alignment) {
@@ -163,6 +232,14 @@ static bool ame_use_packed_q8() {
     static int cached = -1;
     if (cached == -1) {
         cached = ame_parse_env_bool("GGML_AME_PACKED_Q8") ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+static bool ame_use_whole_k_q8() {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ame_parse_env_bool("GGML_AME_WHOLE_K_Q8") ? 1 : 0;
     }
     return cached == 1;
 }
@@ -376,7 +453,13 @@ static void ame_store_packed_q8_weight(
     }
 
     if (entry.data != nullptr) {
-        ggml_ame_repack_q8_0_to_ame64(entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+        if (ame_use_whole_k_q8()) {
+            ggml_ame_repack_q8_0_to_ame64_whole_k(
+                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+        } else {
+            ggml_ame_repack_q8_0_to_ame64(
+                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+        }
         ame_build_packed_q8_tile_a_cache(entry, tensor);
     }
 }
@@ -408,10 +491,157 @@ static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
     const int64_t K = op->src[0]->ne[0];
     const int64_t M = op->src[0]->ne[1];
     const int64_t N = op->src[1]->ne[1];
-    const bool use_packed_b_panel = ame_backend_env_enabled("GGML_AME_USE_PACKED_B_PANEL") &&
-        ame_backend_packed_b_panel_allowed_for_m(M);
+    // Kernel dispatch enables packed-B solely through this flag. Workspace
+    // planning must use the same condition; otherwise larger M shapes fall
+    // back to a per-call allocation even though they still execute packed-B.
+    const bool use_packed_b_panel = ame_backend_env_enabled("GGML_AME_USE_PACKED_B_PANEL");
     const ggml_ame_i8_kernel * kernel = ggml_ame_select_i8_kernel(M, N, K);
     return ggml_ame_i8_kernel_workspace_size(kernel, N, K, use_packed_b_panel ? 1 : 0);
+}
+
+static void ame_convert_f16_rows_to_bf16(
+    const void * src,
+    size_t src_row_stride,
+    ggml_bf16_t * dst,
+    float * f32_scratch,
+    int64_t rows,
+    int64_t cols
+) {
+    for (int64_t i = 0; i < rows; ++i) {
+        const ggml_fp16_t * src_row = reinterpret_cast<const ggml_fp16_t *>(
+            static_cast<const char *>(src) + i * src_row_stride);
+        ggml_cpu_fp16_to_fp32(src_row, f32_scratch + i * cols, cols);
+    }
+    ggml_cpu_fp32_to_bf16(f32_scratch, dst, rows * cols);
+}
+
+static void ggml_backend_ame_mul_mat_f16_via_bf16(ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ame_backend_can_use_f16_via_bf16(dst));
+
+    const int64_t K = src0->ne[0];
+    const int64_t M = src0->ne[1];
+    const int64_t N = src1->ne[1];
+    const int64_t r2 = src1->ne[2] / src0->ne[2];
+    const int64_t r3 = src1->ne[3] / src0->ne[3];
+    const int64_t batches = src1->ne[2] * src1->ne[3];
+    const size_t converted_a_size = (size_t) M * (size_t) K * sizeof(ggml_bf16_t);
+    const size_t f32_scratch_offset = ame_align_up(converted_a_size, GGML_MEM_ALIGN);
+    const size_t f32_scratch_size = (size_t) M * (size_t) K * sizeof(float);
+    const size_t conversion_workspace_size = f32_scratch_offset + f32_scratch_size;
+    void * conversion_workspace = ggml_aligned_malloc(conversion_workspace_size);
+    GGML_ASSERT(conversion_workspace != nullptr);
+    ggml_bf16_t * converted_a = static_cast<ggml_bf16_t *>(conversion_workspace);
+    float * f32_scratch = reinterpret_cast<float *>(
+        static_cast<char *>(conversion_workspace) + f32_scratch_offset);
+
+    const bool profile = ame_backend_env_enabled("GGML_AME_BF16_PROFILE");
+    const bool progress = ame_backend_env_enabled("GGML_AME_BF16_PROGRESS");
+    const uint64_t total_start = profile ? ame_backend_read_cycle() : 0;
+    uint64_t convert_a_cycles = 0;
+    uint64_t kernel_cycles = 0;
+    int64_t converted_a_slices = 0;
+    int64_t last_i02 = -1;
+    int64_t last_i03 = -1;
+
+    if (progress) {
+        fprintf(stderr,
+            "[AME_F16_BF16_PROGRESS] phase=begin name=%s M=%lld N=%lld K=%lld batches=%lld "
+            "src0_ne2=%lld src1_ne2=%lld src0_nb1=%zu src0_nb2=%zu src1_nb1=%zu src1_nb2=%zu\n",
+            dst->name,
+            (long long) M,
+            (long long) N,
+            (long long) K,
+            (long long) batches,
+            (long long) src0->ne[2],
+            (long long) src1->ne[2],
+            src0->nb[1],
+            src0->nb[2],
+            src1->nb[1],
+            src1->nb[2]);
+        fflush(stderr);
+    }
+
+    for (int64_t i13 = 0; i13 < src1->ne[3]; ++i13) {
+        for (int64_t i12 = 0; i12 < src1->ne[2]; ++i12) {
+            const int64_t i02 = i12 / r2;
+            const int64_t i03 = i13 / r3;
+            const void * src0_batch = static_cast<const char *>(src0->data) + i02 * src0->nb[2] + i03 * src0->nb[3];
+
+            if (i02 != last_i02 || i03 != last_i03) {
+                const uint64_t start = profile ? ame_backend_read_cycle() : 0;
+                ame_convert_f16_rows_to_bf16(
+                    src0_batch, src0->nb[1], converted_a, f32_scratch, M, K);
+                if (profile) {
+                    convert_a_cycles += ame_backend_read_cycle() - start;
+                }
+                ++converted_a_slices;
+                last_i02 = i02;
+                last_i03 = i03;
+            }
+
+            const void * src1_batch = static_cast<const char *>(src1->data) + i12 * src1->nb[2] + i13 * src1->nb[3];
+            void * dst_batch = static_cast<char *>(dst->data) + i12 * dst->nb[2] + i13 * dst->nb[3];
+            if (progress) {
+                fprintf(stderr,
+                    "[AME_F16_BF16_PROGRESS] phase=batch_begin name=%s batch=%lld/%lld src0_slice=%lld,%lld\n",
+                    dst->name,
+                    (long long) (i13 * src1->ne[2] + i12 + 1),
+                    (long long) batches,
+                    (long long) i02,
+                    (long long) i03);
+                fflush(stderr);
+            }
+            const uint64_t start = profile ? ame_backend_read_cycle() : 0;
+            ggml_ame_mul_mat_bf16(
+                converted_a,
+                src1_batch,
+                dst_batch,
+                K, M,
+                K, N,
+                src1->nb[1],
+                src1->type,
+                params->wdata,
+                params->wsize
+            );
+            if (profile) {
+                kernel_cycles += ame_backend_read_cycle() - start;
+            }
+            if (progress) {
+                fprintf(stderr,
+                    "[AME_F16_BF16_PROGRESS] phase=batch_end name=%s batch=%lld/%lld\n",
+                    dst->name,
+                    (long long) (i13 * src1->ne[2] + i12 + 1),
+                    (long long) batches);
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (profile) {
+        fprintf(stderr,
+            "[AME_F16_BF16_PROFILE] name=%s M=%lld N=%lld K=%lld batches=%lld a_slices=%lld "
+            "whole_k=%d reg_pairs=%lld convert_a_cycles=%llu kernel_cycles=%llu total_cycles=%llu\n",
+            dst->name,
+            (long long) M,
+            (long long) N,
+            (long long) K,
+            (long long) batches,
+            (long long) converted_a_slices,
+            ame_backend_env_enabled("GGML_AME_WHOLE_K_BF16") ? 1 : 0,
+            (long long) (ame_backend_env_i64("GGML_AME_BF16_REG_PAIRS", 2) >= 2 ? 2 : 1),
+            (unsigned long long) convert_a_cycles,
+            (unsigned long long) kernel_cycles,
+            (unsigned long long) (ame_backend_read_cycle() - total_start));
+    }
+    if (progress) {
+        fprintf(stderr, "[AME_F16_BF16_PROGRESS] phase=end name=%s\n", dst->name);
+        fflush(stderr);
+    }
+
+    ggml_aligned_free(conversion_workspace, conversion_workspace_size);
 }
 
 // Compute forward for AME operations
@@ -419,9 +649,14 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    if (src0->type == GGML_TYPE_F16) {
+        ggml_backend_ame_mul_mat_f16_via_bf16(params, dst);
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(src1));
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -429,38 +664,58 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     const int64_t ne11 = src1->ne[1];
 
     GGML_ASSERT(ne00 == ne10);
-    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
 
-    const int8_t * packed_w_tile_a = nullptr;
-    const float * packed_w_tile_scales = nullptr;
-    const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0, &packed_w_tile_a, &packed_w_tile_scales);
-    if (packed_w != nullptr) {
-        AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel");
-        ggml_ame_mul_mat_q8_0_ame64(
-            packed_w,
-            src1,
-            src1->data,
-            dst->data,
-            ne00, ne01,
-            ne10, ne11,
-            src1->nb[1],
-            packed_w_tile_a,
-            packed_w_tile_scales,
-            ggml_threadpool_graph_id(params->threadpool),
-            params->threadpool,
-            ame_tensor_content_generation(src1),
-            params->wdata,
-            params->wsize
-        );
+    if (src0->type == GGML_TYPE_Q8_0) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+        const int8_t * packed_w_tile_a = nullptr;
+        const float * packed_w_tile_scales = nullptr;
+        const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0, &packed_w_tile_a, &packed_w_tile_scales);
+        if (packed_w != nullptr) {
+            AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel whole_k=%d",
+                ame_use_whole_k_q8() ? 1 : 0);
+            ggml_ame_mul_mat_q8_0_ame64(
+                packed_w,
+                src1,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                packed_w_tile_a,
+                packed_w_tile_scales,
+                ggml_threadpool_graph_id(params->threadpool),
+                params->threadpool,
+                ame_tensor_content_generation(src1),
+                params->wdata,
+                params->wsize
+            );
+        } else {
+            AME_LOG("backend_ame_mul_mat: dispatching to baseline Q8_0 kernel");
+            ggml_ame_mul_mat_q8_0(
+                src0->data,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                params->wdata,
+                params->wsize
+            );
+        }
     } else {
-        AME_LOG("backend_ame_mul_mat: dispatching to baseline Q8_0 kernel");
-        ggml_ame_mul_mat_q8_0(
+        GGML_ASSERT(src0->type == GGML_TYPE_BF16);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
+
+        AME_LOG("backend_ame_mul_mat: dispatching to BF16 kernel");
+        ggml_ame_mul_mat_bf16(
             src0->data,
             src1->data,
             dst->data,
             ne00, ne01,
             ne10, ne11,
             src1->nb[1],
+            src1->type,
             params->wdata,
             params->wsize
         );
@@ -478,14 +733,28 @@ public:
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
-        if (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[1]->type != GGML_TYPE_F32) {
-            return false;
+        if (op->src[0]->type == GGML_TYPE_Q8_0) {
+            if (op->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+                return false;
+            }
+            size = ggml_backend_ame_desired_wsize(op);
+            return true;
         }
-        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
-            return false;
+
+        if (op->src[0]->type == GGML_TYPE_BF16 &&
+            (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16) &&
+            ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+            size = 0;
+            return true;
         }
-        size = ggml_backend_ame_desired_wsize(op);
-        return true;
+
+        if (ame_backend_can_use_f16_via_bf16(op)) {
+            size = 0;
+            return true;
+        }
+
+        return false;
     }
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
@@ -493,13 +762,12 @@ public:
             return false;
         }
 
-        if (params->ith != 0) {
-            return true;
-        }
-
         static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
 
         if (scalar_mode) {
+            if (params->ith != 0) {
+                return true;
+            }
             const ggml_tensor * src0 = op->src[0];
             const ggml_tensor * src1 = op->src[1];
             const int64_t M = src0->ne[1];
@@ -516,16 +784,44 @@ public:
                 );
                 return true;
             }
+            if (src0->type == GGML_TYPE_BF16 &&
+                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16)) {
+                reference_mul_mat_bf16_f32(
+                    src0->data,
+                    src1->type,
+                    src1->data,
+                    (float *) op->data,
+                    M, N, K,
+                    src1->nb[1]
+                );
+                return true;
+            }
             return false;
         }
 
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
-        if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32) {
+        const bool f16_via_bf16 = ame_backend_can_use_f16_via_bf16(op);
+        if (src0->type == GGML_TYPE_F16) {
+            if (!f16_via_bf16) {
+                return false;
+            }
+        } else if (src0->type == GGML_TYPE_Q8_0) {
+            if (src1->type != GGML_TYPE_F32 ||
+                !ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
+        } else if (src0->type == GGML_TYPE_BF16) {
+            if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16) ||
+                !ggml_ame_can_use_bf16(src0->ne[1], src1->ne[1], src0->ne[0])) {
+                return false;
+            }
+        } else {
             return false;
         }
-        if (!ggml_ame_can_use(src0->ne[1], src1->ne[1], src0->ne[0])) {
-            return false;
+
+        if (params->ith != 0) {
+            return true;
         }
 
         AME_LOG("tensor_traits::compute_forward: calling AME mul_mat");
@@ -725,7 +1021,10 @@ public:
             return true;
         }
 
-        if (!ggml_ame_can_use(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+        const bool shape_supported = op->src[0]->type == GGML_TYPE_Q8_0
+            ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
+            : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
             return true;
         }
@@ -735,13 +1034,16 @@ public:
             AME_LOG("supports_op: fallback (src1 not host)");
             return true;
         }
-        // src1 must be float32
-        if (op->src[1]->type == GGML_TYPE_F32) {
+        const bool src1_supported =
+            (op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32) ||
+            (op->src[0]->type == GGML_TYPE_BF16 &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16));
+        if (src1_supported) {
             AME_LOG("supports_op: accept M=%lld N=%lld K=%lld", (long long) op->src[0]->ne[1], (long long) op->src[1]->ne[1], (long long) op->src[0]->ne[0]);
             return true;
         }
 
-        AME_LOG("supports_op: fallback (src1 not F32)");
+        AME_LOG("supports_op: fallback (src1 type not supported)");
         return true;
     }
 
@@ -750,6 +1052,9 @@ public:
             op->src[0]->buffer &&
             op->src[0]->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type()) {
             return (ggml::cpu::tensor_traits *)op->src[0]->extra;
+        }
+        if (ame_backend_can_use_f16_via_bf16(op)) {
+            return ggml::cpu::riscv_ame::get_tensor_traits(nullptr, nullptr);
         }
         return nullptr;
     }

@@ -13,6 +13,10 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
+
+#if defined(GGML_USE_RV_AME)
+#include "arch/riscv/ame/ame-flash-attn.h"
+#endif
 #include "ggml.h"
 #include "common.h"
 
@@ -102,8 +106,31 @@ struct ggml_xsai_op_profile_named_bucket {
     int ame_non_candidate;
 };
 
-#define GGML_XSAI_PROFILE_MAX_NAMES   1024
-#define GGML_XSAI_PROFILE_MAX_MODULES 128
+struct ggml_xsai_op_profile_tensor_detail {
+    enum ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+    uint64_t nb[GGML_MAX_DIMS];
+    uint64_t elements;
+    uint64_t nbytes;
+};
+
+struct ggml_xsai_op_profile_detail_entry {
+    uint64_t graph;
+    int node_n;
+    enum ggml_op op;
+    char raw_name[GGML_MAX_NAME];
+    char name[GGML_MAX_NAME];
+    char module[32];
+    uint64_t cycles;
+    uint16_t src_mask;
+    int n_src;
+    struct ggml_xsai_op_profile_tensor_detail dst;
+    struct ggml_xsai_op_profile_tensor_detail src[GGML_MAX_SRC];
+};
+
+#define GGML_XSAI_PROFILE_MAX_NAMES          1024
+#define GGML_XSAI_PROFILE_MAX_MODULES        128
+#define GGML_XSAI_PROFILE_MAX_DETAIL_ENTRIES 4096
 
 static struct {
     uint64_t graphs;
@@ -118,7 +145,17 @@ static struct {
     int n_modules;
 } g_ggml_xsai_op_profile;
 
+static struct {
+    uint64_t graphs;
+    uint64_t seen;
+    uint64_t stored;
+    uint64_t overflow;
+    uint64_t cycles;
+    struct ggml_xsai_op_profile_detail_entry entries[GGML_XSAI_PROFILE_MAX_DETAIL_ENTRIES];
+} g_ggml_xsai_op_profile_detail;
+
 static int ggml_xsai_op_profile_enabled(void);
+static int ggml_xsai_op_profile_detail_enabled(void);
 static int ggml_xsai_op_progress_enabled(void);
 
 static const char * ggml_xsai_profile_timer_name(void) {
@@ -366,8 +403,132 @@ static void ggml_xsai_op_profile_record(const struct ggml_tensor * node, uint64_
             cycles);
 }
 
+static void ggml_xsai_op_profile_capture_tensor(
+        struct ggml_xsai_op_profile_tensor_detail * detail,
+        const struct ggml_tensor                   * tensor) {
+    detail->type = tensor->type;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        detail->ne[i] = tensor->ne[i];
+        detail->nb[i] = tensor->nb[i];
+    }
+    detail->elements = (uint64_t) ggml_nelements(tensor);
+    detail->nbytes = (uint64_t) ggml_nbytes(tensor);
+}
+
+static void ggml_xsai_op_profile_detail_record(
+        uint64_t                   graph,
+        int                        node_n,
+        const struct ggml_tensor * node,
+        uint64_t                   cycles) {
+    g_ggml_xsai_op_profile_detail.seen++;
+    g_ggml_xsai_op_profile_detail.cycles += cycles;
+
+    if (g_ggml_xsai_op_profile_detail.stored >= GGML_XSAI_PROFILE_MAX_DETAIL_ENTRIES) {
+        g_ggml_xsai_op_profile_detail.overflow++;
+        return;
+    }
+
+    struct ggml_xsai_op_profile_detail_entry * entry =
+        &g_ggml_xsai_op_profile_detail.entries[g_ggml_xsai_op_profile_detail.stored++];
+    entry->graph = graph;
+    entry->node_n = node_n;
+    entry->op = node->op;
+    entry->cycles = cycles;
+    entry->src_mask = 0;
+    entry->n_src = 0;
+
+    snprintf(entry->raw_name, sizeof(entry->raw_name), "%s", node->name[0] != '\0' ? node->name : "(unnamed)");
+    ggml_xsai_profile_normalize_name(node->name, entry->name, sizeof(entry->name));
+    snprintf(entry->module, sizeof(entry->module), "%s", ggml_xsai_profile_module_name(entry->name, node->op));
+
+    ggml_xsai_op_profile_capture_tensor(&entry->dst, node);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (node->src[i] == NULL) {
+            continue;
+        }
+        entry->src_mask |= (uint16_t) (1u << i);
+        entry->n_src++;
+        ggml_xsai_op_profile_capture_tensor(&entry->src[i], node->src[i]);
+    }
+}
+
 static const char * ggml_xsai_profile_type_name(enum ggml_type type) {
     return type < GGML_TYPE_COUNT ? ggml_type_name(type) : "none";
+}
+
+static void ggml_xsai_op_profile_detail_dump_tensor(
+        uint64_t                                          entry_index,
+        const char                                      * role,
+        int                                               source_index,
+        const struct ggml_xsai_op_profile_tensor_detail * tensor) {
+    fprintf(stderr,
+            "[GGML_XSAI_OP_DETAIL] tensor entry=%llu role=%s index=%d type=%s "
+            "ne=[%lld,%lld,%lld,%lld] nb=[%llu,%llu,%llu,%llu] elements=%llu nbytes=%llu\n",
+            (unsigned long long) entry_index,
+            role,
+            source_index,
+            ggml_xsai_profile_type_name(tensor->type),
+            (long long) tensor->ne[0],
+            (long long) tensor->ne[1],
+            (long long) tensor->ne[2],
+            (long long) tensor->ne[3],
+            (unsigned long long) tensor->nb[0],
+            (unsigned long long) tensor->nb[1],
+            (unsigned long long) tensor->nb[2],
+            (unsigned long long) tensor->nb[3],
+            (unsigned long long) tensor->elements,
+            (unsigned long long) tensor->nbytes);
+}
+
+static void ggml_xsai_op_profile_detail_dump(void) {
+    if (!ggml_xsai_op_profile_detail_enabled() || g_ggml_xsai_op_profile_detail.seen == 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[GGML_XSAI_OP_DETAIL] summary timer=%s graphs=%llu seen=%llu stored=%llu overflow=%llu cycles=%llu\n",
+            ggml_xsai_profile_timer_name(),
+            (unsigned long long) g_ggml_xsai_op_profile_detail.graphs,
+            (unsigned long long) g_ggml_xsai_op_profile_detail.seen,
+            (unsigned long long) g_ggml_xsai_op_profile_detail.stored,
+            (unsigned long long) g_ggml_xsai_op_profile_detail.overflow,
+            (unsigned long long) g_ggml_xsai_op_profile_detail.cycles);
+
+    for (uint64_t i = 0; i < g_ggml_xsai_op_profile_detail.stored; ++i) {
+        const struct ggml_xsai_op_profile_detail_entry * entry = &g_ggml_xsai_op_profile_detail.entries[i];
+        fprintf(stderr,
+                "[GGML_XSAI_OP_DETAIL] node entry=%llu graph=%llu node=%d raw_name=\"%s\" name=\"%s\" "
+                "module=%s op=%s cycles=%llu n_src=%d\n",
+                (unsigned long long) (i + 1),
+                (unsigned long long) entry->graph,
+                entry->node_n,
+                entry->raw_name,
+                entry->name,
+                entry->module,
+                entry->op < GGML_OP_COUNT ? ggml_op_name(entry->op) : "UNKNOWN",
+                (unsigned long long) entry->cycles,
+                entry->n_src);
+        ggml_xsai_op_profile_detail_dump_tensor(i + 1, "dst", -1, &entry->dst);
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            if ((entry->src_mask & (uint16_t) (1u << src)) != 0) {
+                ggml_xsai_op_profile_detail_dump_tensor(i + 1, "src", src, &entry->src[src]);
+            }
+        }
+    }
+    fflush(stderr);
+}
+
+static int ggml_xsai_op_profile_detail_enabled(void) {
+    static int cached = -1;
+    static int registered = 0;
+    if (cached == -1) {
+        cached = ggml_xsai_profile_env_on("GGML_XSAI_OP_PROFILE_DETAIL") ? 1 : 0;
+    }
+    if (cached && !registered) {
+        atexit(ggml_xsai_op_profile_detail_dump);
+        registered = 1;
+    }
+    return cached;
 }
 
 static const char * ggml_xsai_profile_ame_candidate_name(
@@ -3339,6 +3500,9 @@ struct ggml_cplan ggml_graph_plan(
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + padding
                         cur = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV)*n_tasks;
+#if defined(GGML_USE_RV_AME)
+                        cur = MAX(cur, ggml_ame_flash_attn_ext_work_size(node));
+#endif
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
@@ -3405,9 +3569,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
 
     const int xsai_profile = state->ith == 0 ? ggml_xsai_op_profile_enabled() : 0;
+    const int xsai_detail = state->ith == 0 ? ggml_xsai_op_profile_detail_enabled() : 0;
     const int xsai_progress = state->ith == 0 ? ggml_xsai_op_progress_enabled() : 0;
+    const int xsai_timing = xsai_profile || xsai_detail;
+    uint64_t xsai_detail_graph = 0;
     if (xsai_profile) {
         g_ggml_xsai_op_profile.graphs++;
+    }
+    if (xsai_detail) {
+        xsai_detail_graph = ++g_ggml_xsai_op_profile_detail.graphs;
     }
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
@@ -3422,16 +3592,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        const uint64_t xsai_profile_t0 = xsai_profile ? ggml_xsai_profile_read_cycle() : 0;
         if (xsai_progress) {
             ggml_xsai_op_progress_log("begin", node_n, node);
         }
+        const uint64_t xsai_profile_t0 = xsai_timing ? ggml_xsai_profile_read_cycle() : 0;
         ggml_compute_forward(&params, node);
+        const uint64_t xsai_profile_cycles = xsai_timing ? ggml_xsai_profile_read_cycle() - xsai_profile_t0 : 0;
         if (xsai_progress) {
             ggml_xsai_op_progress_log("end", node_n, node);
         }
         if (xsai_profile) {
-            ggml_xsai_op_profile_record(node, ggml_xsai_profile_read_cycle() - xsai_profile_t0);
+            ggml_xsai_op_profile_record(node, xsai_profile_cycles);
+        }
+        if (xsai_detail) {
+            ggml_xsai_op_profile_detail_record(xsai_detail_graph, node_n, node, xsai_profile_cycles);
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
