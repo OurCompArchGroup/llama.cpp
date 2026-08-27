@@ -2311,7 +2311,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
 #if defined(GGML_USE_RV_AME)
-    if (ggml_ame_mem_trace_is_q_projection(tensor)) {
+    if (ggml_ame_mem_trace_is_target(tensor)) {
         ggml_barrier(params->threadpool);
         if (params->ith == 0) {
             ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_BEGIN);
@@ -2727,7 +2727,7 @@ done:
 #if defined(GGML_USE_RV_AME)
     // Re-evaluate the op identity after backend dispatch instead of carrying
     // state across architecture-specific kernels.
-    if (ggml_ame_mem_trace_is_q_projection(tensor)) {
+    if (ggml_ame_mem_trace_is_target(tensor)) {
         ggml_barrier(params->threadpool);
         if (params->ith == 0) {
             ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_END);
