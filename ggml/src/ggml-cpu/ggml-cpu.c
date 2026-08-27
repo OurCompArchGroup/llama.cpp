@@ -16,6 +16,7 @@
 
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
+#include "arch/riscv/ame/ame-mem-trace.h"
 #endif
 #include "ggml.h"
 #include "common.h"
@@ -2309,9 +2310,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
+#if defined(GGML_USE_RV_AME)
+    if (ggml_ame_mem_trace_is_q_projection(tensor)) {
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0) {
+            ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_BEGIN);
+        }
+        ggml_barrier(params->threadpool);
+    }
+#endif
+
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
-        return;
+        goto done;
     }
 
     switch (tensor->op) {
@@ -2711,6 +2722,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
+
+done:
+#if defined(GGML_USE_RV_AME)
+    // Re-evaluate the op identity after backend dispatch instead of carrying
+    // state across architecture-specific kernels.
+    if (ggml_ame_mem_trace_is_q_projection(tensor)) {
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0) {
+            ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_END);
+        }
+        ggml_barrier(params->threadpool);
+    }
+#endif
+    return;
 }
 
 // Android's libc implementation "bionic" does not support setting affinity
