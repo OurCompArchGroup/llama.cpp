@@ -87,6 +87,14 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop(
     int k_tiles,
     int32_t * C);
 
+void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
+    const int8_t * a_tiles,
+    ptrdiff_t a_tile_stride,
+    const int8_t * b_tiles,
+    ptrdiff_t b_tile_stride,
+    int k_tiles,
+    int32_t * C);
+
 typedef void (*ggml_ame_overlap_fn)(void * opaque);
 
 typedef void (*ggml_ame_pipeline_finish_fn)(void * opaque, int tile_index);

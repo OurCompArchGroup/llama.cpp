@@ -1514,7 +1514,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int tile_n = kernel->tile_n;
     const int use_packed_b_panel = ame_use_packed_b_panel();
     const int use_packed_a_tiles =
-        kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
+        (kernel->kind == GGML_AME_I8_KERNEL_64_64_64 ||
+         kernel->kind == GGML_AME_I8_KERNEL_128_64_128) &&
         !ame_disable_packed_a_tiles() &&
         src0_tile_a != NULL &&
         src0_tile_scales != NULL;
@@ -1532,7 +1533,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
         use_packed_b_panel &&
         use_packed_a_tiles &&
         ame_whole_k_q8_enabled() &&
-        kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
         async_batch == 0 &&
         !sparse_progress &&
         !ame_ckpt_tile_enabled() &&
@@ -1541,7 +1541,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int use_whole_k_fused_epilogue =
         use_whole_k_kloop && ame_whole_k_fused_epilogue_enabled();
     const int use_whole_k_output_pipeline =
-        use_whole_k_fused_epilogue && ame_whole_k_output_pipeline_enabled();
+        use_whole_k_fused_epilogue &&
+        kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
+        ame_whole_k_output_pipeline_enabled();
     const int use_whole_k_acc_pipeline =
         use_whole_k_output_pipeline &&
         ame_whole_k_acc_pipeline_enabled() &&
@@ -1912,13 +1914,23 @@ void ggml_ame_mul_mat_q8_0_ame64(
                         src0_tile_a + (size_t) mt * (size_t) nb64 * tile_bytes;
 
                     prof_t0 = prof ? ame_read_cycle() : 0;
-                    ggml_ame_gemm_tile_i8_i32_bT_kloop(
-                        packed_a_panel,
-                        (ptrdiff_t) tile_bytes,
-                        packed_b_panel,
-                        (ptrdiff_t) tile_b_size,
-                        (int) nb64,
-                        tile_c);
+                    if (kernel->kind == GGML_AME_I8_KERNEL_128_64_128) {
+                        ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
+                            packed_a_panel,
+                            (ptrdiff_t) tile_bytes,
+                            packed_b_panel,
+                            (ptrdiff_t) tile_b_size,
+                            (int) nb64,
+                            tile_c);
+                    } else {
+                        ggml_ame_gemm_tile_i8_i32_bT_kloop(
+                            packed_a_panel,
+                            (ptrdiff_t) tile_bytes,
+                            packed_b_panel,
+                            (ptrdiff_t) tile_b_size,
+                            (int) nb64,
+                            tile_c);
+                    }
                     ame_ckpt_rebase_after_tile();
                     sparse_tile += (uint64_t) nb64;
                     if (prof) {

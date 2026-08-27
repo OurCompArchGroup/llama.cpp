@@ -169,6 +169,56 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop(
         a_tiles, a_tile_stride, b_tiles, b_tile_stride, k_tiles, C, 0, NULL, NULL);
 }
 
+void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
+    const int8_t * a_tiles,
+    ptrdiff_t a_tile_stride,
+    const int8_t * b_tiles,
+    ptrdiff_t b_tile_stride,
+    int k_tiles,
+    int32_t * C
+) {
+    if (k_tiles <= 0) {
+        return;
+    }
+
+    int tmp;
+    MSETTILEM(tmp, 128);
+    MSETTILEK(tmp, 64);
+    MSETTILEN(tmp, 128);
+    ggml_ame_config_i8_i32();
+
+    MZERO(acc0);
+    AME_MLOAD_FENCE_BEFORE_LOAD("_128_kloop");
+
+    const int8_t * addr_a = a_tiles;
+    const int8_t * addr_b = b_tiles;
+    int kb = 0;
+    for (; kb + 1 < k_tiles; kb += 2) {
+        MLA(tr0, addr_a, 64);
+        MLB(tr1, addr_b, 64);
+        MMACC(acc0, tr0, tr1);
+        addr_a += a_tile_stride;
+        addr_b += b_tile_stride;
+
+        MLA(tr2, addr_a, 64);
+        MLB(tr3, addr_b, 64);
+        MMACC(acc0, tr2, tr3);
+        addr_a += a_tile_stride;
+        addr_b += b_tile_stride;
+    }
+    if (kb < k_tiles) {
+        MLA(tr0, addr_a, 64);
+        MLB(tr1, addr_b, 64);
+        MMACC(acc0, tr0, tr1);
+    }
+
+    register int32_t * c_live __asm__("s11") = C;
+    MSC(acc0, c_live, 128 * (int) sizeof(int32_t));
+    const unsigned long target = ggml_ame_sync_release();
+    ggml_ame_sync_acquire_wait(target);
+    asm volatile("" : "+r"(c_live) : : "memory");
+}
+
 #define AME_KLOOP_COMPUTE(ACC) do {                                      \
     MZERO(ACC);                                                          \
     const int8_t * addr_a = a_tiles;                                     \
