@@ -1858,8 +1858,13 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * cache_k_write = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        cb(cache_k_write, "cache_k_write", il);
+        ggml_build_forward_expand(gf, cache_k_write);
+
+        ggml_tensor * cache_v_write = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        cb(cache_v_write, "cache_v_write", il);
+        ggml_build_forward_expand(gf, cache_v_write);
     }
 
     const auto & kq_mask = inp->get_kq_mask();
@@ -1873,6 +1878,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
+        cb(cur, "attn_out", il);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);

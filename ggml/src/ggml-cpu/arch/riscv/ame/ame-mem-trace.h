@@ -14,18 +14,18 @@
 
 static inline const char * ggml_ame_mem_trace_target_name(void) {
     const char * name = getenv("GGML_XSAI_MEM_TRACE_NAME");
-    return name != NULL && name[0] != '\0' ? name : "Qcur";
+    return name != NULL && name[0] != '\0' ? name : "*";
 }
 
 static inline const char * ggml_ame_mem_trace_target_op(void) {
     const char * op = getenv("GGML_XSAI_MEM_TRACE_OP");
-    return op != NULL && op[0] != '\0' ? op : "MUL_MAT";
+    return op != NULL && op[0] != '\0' ? op : "*";
 }
 
 static inline int ggml_ame_mem_trace_target_layer(void) {
     const char * value = getenv("GGML_XSAI_MEM_TRACE_LAYER");
     if (value == NULL || value[0] == '\0') {
-        return -1;
+        return 1;
     }
 
     char * end = NULL;
@@ -40,14 +40,21 @@ static inline bool ggml_ame_mem_trace_name_matches(const char * tensor_name) {
     if (layer >= 0) {
         const size_t target_len = strlen(target);
         const size_t tensor_len = strlen(tensor_name);
-        if (tensor_len <= target_len + 1 || strncmp(tensor_name, target, target_len) != 0 ||
-                tensor_name[target_len] != '-') {
+        const char * layer_suffix = strrchr(tensor_name, '-');
+        if (layer_suffix == NULL || layer_suffix == tensor_name || layer_suffix[1] == '\0' ||
+                (strcmp(target, "*") != 0 &&
+                 (tensor_len <= target_len + 1 || strncmp(tensor_name, target, target_len) != 0 ||
+                  tensor_name[target_len] != '-'))) {
             return false;
         }
 
         char * end = NULL;
-        const long parsed = strtol(tensor_name + target_len + 1, &end, 10);
-        return end != tensor_name + target_len + 1 && *end == '\0' && parsed == layer;
+        const long parsed = strtol(layer_suffix + 1, &end, 10);
+        return end != layer_suffix + 1 && *end == '\0' && parsed == layer;
+    }
+
+    if (strcmp(target, "*") == 0) {
+        return tensor_name[0] != '\0';
     }
 
     if (strcmp(tensor_name, target) == 0) {
@@ -76,6 +83,10 @@ static inline bool ggml_ame_mem_trace_is_target(const struct ggml_tensor * tenso
         (strcmp(ggml_ame_mem_trace_target_op(), "*") == 0 ||
          strcmp(ggml_op_name(tensor->op), ggml_ame_mem_trace_target_op()) == 0) &&
         ggml_ame_mem_trace_name_matches(tensor->name);
+}
+
+static inline const char * ggml_ame_mem_trace_node_name(const struct ggml_tensor * tensor) {
+    return tensor->name[0] != '\0' ? tensor->name : ggml_op_name(tensor->op);
 }
 
 static inline void ggml_ame_mem_trace_signal(int signal_id) {
