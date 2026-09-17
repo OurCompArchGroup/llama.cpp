@@ -452,13 +452,14 @@ void ggml_vec_dot_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void 
     const uint8_t * x = (const uint8_t *) vx;
     const int8_t  * y = (const int8_t  *) vy;
 
-    GGML_ASSERT(n % 128 == 0);
+    const int64_t n128 = ((int64_t) n / 128) * 128;
+    const int64_t rest = (int64_t) n - n128;
 
     for (int row = 0; row < nrc; ++row) {
         const uint8_t * xr = x + row * bx;
         int32_t sum = 0;
 
-        for (int64_t blk = 0; blk < n / 128; ++blk) {
+        for (int64_t blk = 0; blk < n128 / 128; ++blk) {
             const uint8_t * xb = xr + blk * 32;
             const int8_t  * yb = y  + blk * 128;
 
@@ -468,6 +469,31 @@ void ggml_vec_dot_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void 
                 sum += (int32_t) ((b >> 4) & 0x3) * (int32_t) yb[gp + 32];
                 sum += (int32_t) ((b >> 2) & 0x3) * (int32_t) yb[gp + 64];
                 sum += (int32_t) ((b >> 0) & 0x3) * (int32_t) yb[gp + 96];
+            }
+        }
+
+        if (rest > 0) {
+            const uint8_t * xb = xr + (n128 / 128) * 32;
+            const int8_t  * yb = y  + n128;
+            const int64_t cols0 = rest >= 32  ? 32 : rest;
+            const int64_t cols1 = rest >= 64  ? 32 : (rest > 32 ? rest - 32 : 0);
+            const int64_t cols2 = rest >= 96  ? 32 : (rest > 64 ? rest - 64 : 0);
+            const int64_t cols3 = rest >= 128 ? 32 : (rest > 96 ? rest - 96 : 0);
+
+            for (int gp = 0; gp < 32; ++gp) {
+                const uint8_t b = xb[gp];
+                if (gp < cols0) {
+                    sum += (int32_t) ((b >> 6) & 0x3) * (int32_t) yb[gp];
+                }
+                if (gp < cols1) {
+                    sum += (int32_t) ((b >> 4) & 0x3) * (int32_t) yb[gp + 32];
+                }
+                if (gp < cols2) {
+                    sum += (int32_t) ((b >> 2) & 0x3) * (int32_t) yb[gp + 64];
+                }
+                if (gp < cols3) {
+                    sum += (int32_t) ((b >> 0) & 0x3) * (int32_t) yb[gp + 96];
+                }
             }
         }
 
