@@ -1335,18 +1335,27 @@ UseGgmlGemm1:;
             }
         }
     #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    const float * src1_row = (float *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
-                    void * dst_row = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
-                    const size_t i2_idx = (size_t) i13 * ne12 * ne11 + (size_t) i12 * ne11 + (size_t) i11;
-                    if (src0->type == GGML_TYPE_I2_S) {
+        if (src0->type == GGML_TYPE_I2_S) {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                        const float * src1_row = (float *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        void * dst_row = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
+                        const size_t i2_idx = (size_t) i13 * ne12 * ne11 + (size_t) i12 * ne11 + (size_t) i11;
                         quantize_row_i8_s(src1_row, dst_row, ne10, act_scales + i2_idx, act_sums + i2_idx);
-                    } else {
-                        size_t bs = ggml_blck_size(vec_dot_type);
-                        int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                    }
+                }
+            }
+        } else {
+            const size_t  bs               = ggml_blck_size(vec_dot_type);
+            const int64_t ne10_block_start = (ith * ne10/bs) / nth;
+            const int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        const float * src1_row = (float *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+                        void * dst_row = (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
                         from_float(src1_row + ne10_block_start*bs,
                                    (void *) ((char *) dst_row + ne10_block_start*nbw0),
                                    (ne10_block_end - ne10_block_start) * bs);
