@@ -49,6 +49,12 @@ static inline int ame_log_enabled(void) {
 
 #define AME_Q8_PACK_K 64
 
+// NEMU feat-bitnet's FP2PACK4 load is deliberately asymmetric: packed
+// BitLinear weights occupy B, use 64 K elements, and require 128 B rows.
+#define AME_I2_NATIVE_TILE_M 64
+#define AME_I2_NATIVE_TILE_K 64
+#define AME_I2_NATIVE_TILE_N 128
+
 // Helper functions to check if AME can be used for given dimensions.
 //
 // Q8_0 keeps the existing K-alignment constraint from the block format.
@@ -66,6 +72,20 @@ static inline int ggml_ame_can_use_q8(int M, int N, int K) {
 static inline int ggml_ame_can_use_i2_s(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
     if (K % 128 != 0) return 0;
+    if (M < AME_TILE_M) return 0;
+    if (N < AME_TILE_N) return 0;
+    return 1;
+}
+
+// The ordinary I2_S implementation consumes row-local 128-element blocks.
+// The native FP2PACK4 path can instead decode the legacy flat stream and pad
+// its final K block in a temporary tile.  Keep this separate from the normal
+// predicate: the portable CPU/AME paths still require K to be 128-aligned.
+static inline int ggml_ame_can_use_i2_s_native_padded(int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return 0;
+    // I2_S has four 2-bit values per byte.  The on-disk flat stream cannot
+    // represent a row whose logical length is not byte-aligned.
+    if (K % 4 != 0) return 0;
     if (M < AME_TILE_M) return 0;
     if (N < AME_TILE_N) return 0;
     return 1;
@@ -350,6 +370,14 @@ void ggml_ame_gemm_tile_bf16_fp32_bT(
     float * C
 );
 
+// Native NEMU FP2PACK4 path: A is INT8 [64 x 64], B is packed signed I2
+// [128 x 64] with a 16-byte row stride, and C is INT32 [64 x 128].
+void ggml_ame_gemm_tile_i8_i32_fp2pack4_bT(
+    const int8_t * A,
+    const uint8_t * B,
+    int32_t * C
+);
+
 // Core AME GEMM function for INT8 matrix multiplication
 // C(M×N) += A(M×K) × B(K×N), where B is transposed in memory
 void ggml_ame_gemm_q8_0(
@@ -423,6 +451,22 @@ void ggml_ame_mul_mat_q8_0_ame64(
 );
 
 void ggml_ame_mul_mat_i2_s(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride,
+    void * work_data,
+    size_t work_size
+);
+
+// I2_S x F32 wrapper for the NEMU feat-bitnet FP2PACK4 B-load path.  The
+// caller selects it only when GGML_AME_NATIVE_I2_S=1; the ordinary I2_S
+// implementation remains the QEMU-compatible fallback.
+void ggml_ame_mul_mat_i2_s_fp2pack4(
     const void * src0,
     const void * src1,
     void * dst,

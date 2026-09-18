@@ -110,11 +110,6 @@ static void reference_mul_mat_q8_0_f32(
     free(y);
 }
 
-// Check if AME can accelerate this operation
-static bool qtype_has_ame_kernels(ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I2_S;
-}
-
 static size_t ame_align_up(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
@@ -131,6 +126,34 @@ static bool ame_parse_env_bool(const char * name) {
         return false;
     }
     return true;
+}
+
+static bool ame_use_native_i2_s() {
+    return ame_parse_env_bool("GGML_AME_NATIVE_I2_S");
+}
+
+static bool ame_can_use_i2_s_shape(int M, int N, int K) {
+    // NEMU's native FP2PACK4 wrapper has an internal tail-padding path for
+    // legacy flat I2_S tensors.  Do not expose this to the portable AME or
+    // generic CPU kernels: both still require full 128-element I2_S rows.
+    return ame_use_native_i2_s()
+        ? ggml_ame_can_use_i2_s_native_padded(M, N, K)
+        : ggml_ame_can_use_i2_s(M, N, K);
+}
+
+static bool ame_native_i2_s_only() {
+    return ame_parse_env_bool("GGML_AME_NATIVE_I2_S_ONLY");
+}
+
+// NEMU feat-bitnet implements the FP2PACK4 path but not the legacy AME
+// encodings used by the Q8_0 and BF16 kernels.  In this mode all non-I2_S
+// matmuls must remain on ggml's generic CPU implementation.
+static bool qtype_has_ame_kernels(ggml_type type) {
+    if (ame_native_i2_s_only()) {
+        return type == GGML_TYPE_I2_S && ame_use_native_i2_s();
+    }
+
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I2_S;
 }
 
 static bool ame_use_packed_q8() {
@@ -224,7 +247,18 @@ static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
 }
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
-    GGML_UNUSED(op);
+    if (op->src[0]->type == GGML_TYPE_I2_S && ame_use_native_i2_s()) {
+        // The FP2PACK4 B panel must be page aligned.  Reserve worst-case
+        // alignment slack because params->wdata is only guaranteed to have
+        // ggml's normal alignment, not a 4 KiB alignment.
+        size_t size = 64 + 63;
+        size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_K * sizeof(int8_t);
+        size += 4095;
+        size += AME_I2_NATIVE_TILE_N * (AME_I2_NATIVE_TILE_K / 4) * sizeof(uint8_t);
+        size += 63;
+        size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N * sizeof(int32_t);
+        return ame_align_up(size, 64);
+    }
 
     size_t size = 64;
     size = ame_align_up(size, 64);
@@ -287,17 +321,31 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     } else if (src0->type == GGML_TYPE_I2_S) {
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-        AME_LOG("backend_ame_mul_mat: dispatching to I2_S kernel");
-        ggml_ame_mul_mat_i2_s(
-            src0->data,
-            src1->data,
-            dst->data,
-            ne00, ne01,
-            ne10, ne11,
-            src1->nb[1],
-            params->wdata,
-            params->wsize
-        );
+        if (ame_use_native_i2_s()) {
+            AME_LOG("backend_ame_mul_mat: dispatching to native I2_S x I8 FP2PACK4 kernel");
+            ggml_ame_mul_mat_i2_s_fp2pack4(
+                src0->data,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                params->wdata,
+                params->wsize
+            );
+        } else {
+            AME_LOG("backend_ame_mul_mat: dispatching to portable I2_S kernel");
+            ggml_ame_mul_mat_i2_s(
+                src0->data,
+                src1->data,
+                dst->data,
+                ne00, ne01,
+                ne10, ne11,
+                src1->nb[1],
+                params->wdata,
+                params->wsize
+            );
+        }
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_BF16);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
@@ -329,6 +377,10 @@ public:
             return false;
         }
 
+        if (!qtype_has_ame_kernels(op->src[0]->type)) {
+            return false;
+        }
+
         if (op->src[0]->type == GGML_TYPE_Q8_0) {
             if (op->src[1]->type != GGML_TYPE_F32) {
                 return false;
@@ -344,7 +396,7 @@ public:
             if (op->src[1]->type != GGML_TYPE_F32) {
                 return false;
             }
-            if (!ggml_ame_can_use_i2_s(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
+            if (!ame_can_use_i2_s_shape(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
                 return false;
             }
             size = ggml_backend_ame_desired_wsize(op);
@@ -363,6 +415,10 @@ public:
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
         if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+
+        if (!qtype_has_ame_kernels(op->src[0]->type)) {
             return false;
         }
 
@@ -408,7 +464,7 @@ public:
             if (src1->type != GGML_TYPE_F32) {
                 return false;
             }
-            if (!ggml_ame_can_use_i2_s(src0->ne[1], src1->ne[1], src0->ne[0])) {
+            if (!ame_can_use_i2_s_shape(src0->ne[1], src1->ne[1], src0->ne[0])) {
                 return false;
             }
         } else if (src0->type == GGML_TYPE_BF16) {
@@ -609,7 +665,7 @@ public:
         if (op->src[0]->type == GGML_TYPE_Q8_0) {
             shape_supported = ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         } else if (op->src[0]->type == GGML_TYPE_I2_S) {
-            shape_supported = ggml_ame_can_use_i2_s(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+            shape_supported = ame_can_use_i2_s_shape(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         } else {
             shape_supported = ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         }
@@ -640,7 +696,8 @@ public:
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT &&
             op->src[0]->buffer &&
-            op->src[0]->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type()) {
+            op->src[0]->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type() &&
+            qtype_has_ame_kernels(op->src[0]->type)) {
             return (ggml::cpu::tensor_traits *)op->src[0]->extra;
         }
         return nullptr;

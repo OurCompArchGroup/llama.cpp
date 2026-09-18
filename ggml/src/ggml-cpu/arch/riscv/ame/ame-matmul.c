@@ -54,6 +54,12 @@ extern void ggml_ame_gemm_tile_bf16_fp32_bT(
     float * C
 );
 
+extern void ggml_ame_gemm_tile_i8_i32_fp2pack4_bT(
+    const int8_t * A,
+    const uint8_t * B,
+    int32_t * C
+);
+
 #if defined(__riscv_v)
 #include <riscv_vector.h>
 
@@ -703,6 +709,189 @@ void ggml_ame_mul_mat_i2_s(
     }
 
     GGML_UNUSED(ne10);
+}
+
+// Convert one 64-element I2_S interval to NEMU FP2PACK4's B-row encoding.
+// I2_S codes are {-1, 0, +1, 0}; FP2PACK4 stores four signed 2-bit lanes per
+// byte, where 3=-1, 0=0 and 1=+1.  The native B load is row-major over
+// output channels, which is the opposite operand order from GGML MUL_MAT.
+static inline uint8_t ggml_ame_i2_s_to_fp2pack4_code(const uint8_t * row, int64_t k) {
+    const uint8_t packed = row[(size_t) (k / 128) * 32 + (size_t) (k % 32)];
+    const uint8_t code = (packed >> (6 - 2 * ((k % 128) / 32))) & 0x3;
+    return code == 0 ? 3 : (code == 2 ? 1 : 0);
+}
+
+// I2_S GGUFs produced before row-tail support pack the entire tensor as one
+// stream of 128-element blocks.  For K % 128 != 0, a matrix row therefore
+// starts part way through a packed block.  Decode by logical tensor index
+// before creating the row-local FP2PACK4 tile; treating src + row*K/4 as a
+// normal I2_S row would use the wrong weights after row zero.
+static inline uint8_t ggml_ame_i2_s_flat_to_fp2pack4_code(
+        const uint8_t * packed_weights, int64_t logical_index) {
+    const uint8_t packed = packed_weights[(size_t) (logical_index / 128) * 32 +
+                                          (size_t) (logical_index % 32)];
+    const uint8_t code = (packed >> (6 - 2 * ((logical_index % 128) / 32))) & 0x3;
+    return code == 0 ? 3 : (code == 2 ? 1 : 0);
+}
+
+static inline void ggml_ame_pack_i2_s_fp2pack4_row64(
+        const uint8_t * row, int64_t k0, uint8_t * dst) {
+    GGML_ASSERT((k0 % AME_I2_NATIVE_TILE_K) == 0);
+    for (int k = 0; k < AME_I2_NATIVE_TILE_K; k += 4) {
+        const uint8_t q0 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 0);
+        const uint8_t q1 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 1);
+        const uint8_t q2 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 2);
+        const uint8_t q3 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 3);
+        dst[k / 4] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
+    }
+}
+
+static inline void ggml_ame_pack_i2_s_flat_fp2pack4_row64(
+        const uint8_t * packed_weights, int64_t row, int64_t K,
+        int64_t k0, uint8_t * dst) {
+    const int valid = (int) MIN(AME_I2_NATIVE_TILE_K, K - k0);
+
+    GGML_ASSERT(valid >= 0 && valid <= AME_I2_NATIVE_TILE_K);
+    GGML_ASSERT((valid % 4) == 0);
+
+    // The caller zeroes dst first.  Its remaining bytes are the K tail's
+    // zero padding and must stay encoded as FP2PACK4 zero.
+    for (int k = 0; k < valid; k += 4) {
+        const int64_t base = row * K + k0 + k;
+        const uint8_t q0 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 0);
+        const uint8_t q1 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 1);
+        const uint8_t q2 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 2);
+        const uint8_t q3 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 3);
+        dst[k / 4] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
+    }
+}
+
+void ggml_ame_mul_mat_i2_s_fp2pack4(
+    const void * src0,
+    const void * src1,
+    void * dst,
+    int64_t ne00,
+    int64_t ne01,
+    int64_t ne10,
+    int64_t ne11,
+    size_t src1_stride,
+    void * work_data,
+    size_t work_size
+) {
+    const int64_t M = ne01; // output channels / I2_S rows
+    const int64_t N = ne11; // tokens / activation rows
+    const int64_t K = ne00;
+    const int64_t Kpad = ((K + 127) / 128) * 128;
+    const int row_aligned_128 = (K % 128) == 0;
+
+    GGML_ASSERT(ne00 == ne10);
+    GGML_ASSERT((K % 4) == 0);
+
+    const uint8_t * restrict weights = (const uint8_t *) src0;
+    const float * restrict activations = (const float *) src1;
+    float * restrict out = (float *) dst;
+    const float i2_scale = ggml_ame_i2_s_tensor_scale(src0, M, K);
+    const size_t weight_row_bytes = (size_t) K / 4;
+
+    // Existing I2_S workspace reservations are sufficient for these three
+    // tile buffers.  The FP2 B tile is only 128 x 16 bytes.
+    const size_t required_wsize = ggml_ame_q8_workspace_size(N, K / AME_I2_NATIVE_TILE_K);
+    uint8_t * workspace = (uint8_t *) work_data;
+    int allocated_workspace = 0;
+    if (workspace == NULL || work_size < required_wsize) {
+        workspace = (uint8_t *) ggml_aligned_malloc(required_wsize);
+        if (!workspace) return;
+        work_size = required_wsize;
+        allocated_workspace = 1;
+    }
+
+    uintptr_t ws_ptr = ame_align_up_size((uintptr_t) workspace, 64);
+    const uintptr_t ws_end = (uintptr_t) workspace + work_size;
+    int8_t * tile_a = (int8_t *) ws_ptr;
+    ws_ptr += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_K * sizeof(int8_t);
+
+    // The FP2PACK4 B tile is a 128 x 16-byte (2 KiB) panel.  Keep it in a
+    // single page as required by the NEMU FP2PACK4 B-load contract.
+    ws_ptr = ame_align_up_size(ws_ptr, 4096);
+    uint8_t * tile_b = (uint8_t *) ws_ptr;
+    ws_ptr += AME_I2_NATIVE_TILE_N * (AME_I2_NATIVE_TILE_K / 4);
+    ws_ptr = ame_align_up_size(ws_ptr, 64);
+    int32_t * tile_c = (int32_t *) ws_ptr;
+    ws_ptr += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N * sizeof(int32_t);
+    if (ws_ptr > ws_end) {
+        if (allocated_workspace) ggml_aligned_free(workspace, work_size);
+        return;
+    }
+
+    ame_assert_phys_contiguous();
+    if (!row_aligned_128) {
+        AME_LOG("native I2_S: padding flat K=%lld to Kpad=%lld for row-local FP2PACK4 tiles",
+                (long long) K, (long long) Kpad);
+    }
+
+    for (int64_t n0 = 0; n0 < N; n0 += AME_I2_NATIVE_TILE_M) {
+        const int nmax = (int) MIN(AME_I2_NATIVE_TILE_M, N - n0);
+        float activation_scales[AME_I2_NATIVE_TILE_M] = { 0 };
+        for (int n = 0; n < nmax; ++n) {
+            const float * activation = (const float *) ((const char *) activations + (n0 + n) * src1_stride);
+            activation_scales[n] = ggml_ame_i8_delta_from_row_f32(activation, K);
+        }
+
+        for (int64_t m0 = 0; m0 < M; m0 += AME_I2_NATIVE_TILE_N) {
+            const int mmax = (int) MIN(AME_I2_NATIVE_TILE_N, M - m0);
+            float acc_f32[AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N];
+            memset(acc_f32, 0, sizeof(acc_f32));
+
+            for (int64_t k0 = 0; k0 < Kpad; k0 += AME_I2_NATIVE_TILE_K) {
+                memset(tile_a, 0, AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_K);
+                for (int n = 0; n < nmax; ++n) {
+                    const float * activation = (const float *) ((const char *) activations + (n0 + n) * src1_stride);
+                    const float scale = activation_scales[n];
+                    const float inv_scale = scale ? 1.0f / scale : 0.0f;
+                    const int valid = (int) MIN(AME_I2_NATIVE_TILE_K, K - k0);
+                    if (valid > 0) {
+                        ggml_ame_quantize_block_f32_to_i8_scale(
+                            activation + k0, valid, inv_scale,
+                            &tile_a[n * AME_I2_NATIVE_TILE_K]);
+                    }
+                }
+
+                memset(tile_b, 0, AME_I2_NATIVE_TILE_N * (AME_I2_NATIVE_TILE_K / 4));
+                for (int m = 0; m < mmax; ++m) {
+                    uint8_t * dst_row = &tile_b[m * (AME_I2_NATIVE_TILE_K / 4)];
+                    if (k0 < K) {
+                        if (row_aligned_128) {
+                            const uint8_t * row = weights + (size_t) (m0 + m) * weight_row_bytes;
+                            ggml_ame_pack_i2_s_fp2pack4_row64(row, k0, dst_row);
+                        } else {
+                            ggml_ame_pack_i2_s_flat_fp2pack4_row64(
+                                weights, m0 + m, K, k0, dst_row);
+                        }
+                    }
+                }
+
+                memset(tile_c, 0, AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N * sizeof(int32_t));
+                ggml_ame_gemm_tile_i8_i32_fp2pack4_bT(tile_a, tile_b, tile_c);
+
+                for (int n = 0; n < nmax; ++n) {
+                    for (int m = 0; m < mmax; ++m) {
+                        acc_f32[n * AME_I2_NATIVE_TILE_N + m] +=
+                            tile_c[n * AME_I2_NATIVE_TILE_N + m] * (i2_scale * activation_scales[n]);
+                    }
+                }
+            }
+
+            for (int n = 0; n < nmax; ++n) {
+                for (int m = 0; m < mmax; ++m) {
+                    out[(m0 + m) * N + (n0 + n)] = acc_f32[n * AME_I2_NATIVE_TILE_N + m];
+                }
+            }
+        }
+    }
+
+    if (allocated_workspace) {
+        ggml_aligned_free(workspace, work_size);
+    }
 }
 
 static const ggml_bf16_t * ame_get_bf16_col_ptr(
