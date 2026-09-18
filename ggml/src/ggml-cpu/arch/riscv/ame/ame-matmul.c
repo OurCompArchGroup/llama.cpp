@@ -883,7 +883,9 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
 
             for (int n = 0; n < nmax; ++n) {
                 for (int m = 0; m < mmax; ++m) {
-                    out[(m0 + m) * N + (n0 + n)] = acc_f32[n * AME_I2_NATIVE_TILE_N + m];
+                    // GGML MUL_MAT stores dst as [M, N] with ne[0] (the
+                    // output-channel dimension) contiguous: dst[n*M + m].
+                    out[(n0 + n) * M + (m0 + m)] = acc_f32[n * AME_I2_NATIVE_TILE_N + m];
                 }
             }
         }
