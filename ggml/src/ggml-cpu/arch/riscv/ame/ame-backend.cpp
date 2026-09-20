@@ -248,16 +248,7 @@ static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
 
 static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
     if (op->src[0]->type == GGML_TYPE_I2_S && ame_use_native_i2_s()) {
-        // The FP2PACK4 B panel must be page aligned.  Reserve worst-case
-        // alignment slack because params->wdata is only guaranteed to have
-        // ggml's normal alignment, not a 4 KiB alignment.
-        size_t size = 64 + 63;
-        size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_K * sizeof(int8_t);
-        size += 4095;
-        size += AME_I2_NATIVE_TILE_N * (AME_I2_NATIVE_TILE_K / 4) * sizeof(uint8_t);
-        size += 63;
-        size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N * sizeof(int32_t);
-        return ame_align_up(size, 64);
+        return ggml_ame_i2_s_fp2pack4_workspace_size();
     }
 
     size_t size = 64;

@@ -378,6 +378,11 @@ void ggml_ame_gemm_tile_i8_i32_fp2pack4_bT(
     int32_t * C
 );
 
+// Worst-case workspace for the native FP2PACK4 wrapper.  The returned size
+// includes alignment slack for a 64-byte A tile, a page-aligned B tile, and a
+// 64-byte aligned C tile.
+size_t ggml_ame_i2_s_fp2pack4_workspace_size(void);
+
 // Core AME GEMM function for INT8 matrix multiplication
 // C(M×N) += A(M×K) × B(K×N), where B is transposed in memory
 void ggml_ame_gemm_q8_0(

@@ -186,6 +186,19 @@ static size_t ggml_ame_q8_workspace_size(int64_t N, int64_t n_k_tiles) {
     return size;
 }
 
+size_t ggml_ame_i2_s_fp2pack4_workspace_size(void) {
+    // The caller's buffer is only guaranteed to have GGML's normal alignment.
+    // Reserve the maximum slack before each alignment operation so the native
+    // wrapper can put B at a page boundary required by NEMU FP2PACK4 loads.
+    size_t size = 64 + 63;
+    size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_K * sizeof(int8_t);
+    size += 4095;
+    size += AME_I2_NATIVE_TILE_N * (AME_I2_NATIVE_TILE_K / 4) * sizeof(uint8_t);
+    size += 63;
+    size += AME_I2_NATIVE_TILE_M * AME_I2_NATIVE_TILE_N * sizeof(int32_t);
+    return ame_align_up_size(size, 64);
+}
+
 static size_t ggml_ame_q8_0_workspace_size(int64_t N, int64_t K) {
     GGML_UNUSED(N);
 
@@ -793,9 +806,7 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
     const float i2_scale = ggml_ame_i2_s_tensor_scale(src0, M, K);
     const size_t weight_row_bytes = (size_t) K / 4;
 
-    // Existing I2_S workspace reservations are sufficient for these three
-    // tile buffers.  The FP2 B tile is only 128 x 16 bytes.
-    const size_t required_wsize = ggml_ame_q8_workspace_size(N, K / AME_I2_NATIVE_TILE_K);
+    const size_t required_wsize = ggml_ame_i2_s_fp2pack4_workspace_size();
     uint8_t * workspace = (uint8_t *) work_data;
     int allocated_workspace = 0;
     if (workspace == NULL || work_size < required_wsize) {
