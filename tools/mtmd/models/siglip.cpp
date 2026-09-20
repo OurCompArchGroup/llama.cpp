@@ -13,9 +13,25 @@ ggml_cgraph * clip_graph_siglip::build() {
                             NORM_TYPE_NORMAL,
                             hparams.ffn_op,
                             learned_pos_embd,
-                            nullptr);
+                            nullptr,
+                            proj_type == PROJECTOR_TYPE_BITVLA);
 
-    if (proj_type == PROJECTOR_TYPE_GEMMA3) {
+    if (proj_type == PROJECTOR_TYPE_BITVLA) {
+        if (hparams.vision_drop_first_token) {
+            ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches - 1);
+            ggml_set_name(patches, "patches");
+            ggml_set_input(patches);
+            cur = ggml_get_rows(ctx0, cur, patches);
+        }
+
+        cur = build_ffn(cur,
+            model.mm_0_w, model.mm_0_b,
+            nullptr, nullptr,
+            model.mm_2_w, model.mm_2_b,
+            hparams.projector_ffn_op,
+            -1);
+
+    } else if (proj_type == PROJECTOR_TYPE_GEMMA3) {
         const int batch_size = 1;
         GGML_ASSERT(n_patches_x == n_patches_y);
         const int patches_per_image = n_patches_x;

@@ -3613,6 +3613,7 @@ class GGUFValueType(IntEnum):
 
 
 class VisionProjectorType:
+    BITVLA = "bitvla"
     GEMMA3 = "gemma3"
     GEMMA3NV = "gemma3nv"
     GEMMA3NA = "gemma3na"

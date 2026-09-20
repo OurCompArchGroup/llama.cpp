@@ -50,6 +50,8 @@ struct clip_hparams {
     int32_t warmup_audio_size = 3000;
 
     ffn_op_type ffn_op = FFN_GELU;
+    ffn_op_type projector_ffn_op = FFN_GELU_ERF;
+    bool vision_drop_first_token = false;
 
     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
 
@@ -83,6 +85,16 @@ struct clip_hparams {
     int32_t custom_image_min_tokens = -1;
     int32_t custom_image_max_tokens = -1;
 
+    // Optional action policy stored alongside a multimodal projector.
+    int32_t action_llm_dim = 0;
+    int32_t action_dim = 0;
+    int32_t action_chunk = 0;
+    int32_t proprio_dim = 0;
+    int32_t action_n_block = 0;
+    int32_t action_input_dim = 0;
+    int32_t action_hidden_dim = 0;
+    float action_norm_eps = 1e-5f;
+
     void set_limit_image_tokens(int n_tokens_min, int n_tokens_max) {
         const int cur_merge = n_merge == 0 ? 1 : n_merge;
         const int patch_area = patch_size * patch_size * cur_merge * cur_merge;
@@ -98,6 +110,13 @@ struct clip_hparams {
         warmup_image_size = n_tok_per_side * patch_size * cur_merge;
         // TODO: support warmup size for custom token numbers
     }
+};
+
+struct clip_action_block {
+    ggml_tensor * norm_w = nullptr;
+    ggml_tensor * norm_b = nullptr;
+    ggml_tensor * fc_w = nullptr;
+    ggml_tensor * fc_b = nullptr;
 };
 
 struct clip_layer {
@@ -257,6 +276,22 @@ struct clip_model {
     ggml_tensor * mm_2_b = nullptr;
 
     ggml_tensor * image_newline = nullptr;
+
+    // Optional BitVLA action policy.
+    ggml_tensor * proprio_fc1_w = nullptr;
+    ggml_tensor * proprio_fc1_b = nullptr;
+    ggml_tensor * proprio_fc2_w = nullptr;
+    ggml_tensor * proprio_fc2_b = nullptr;
+
+    ggml_tensor * action_ln1_w = nullptr;
+    ggml_tensor * action_ln1_b = nullptr;
+    ggml_tensor * action_fc1_w = nullptr;
+    ggml_tensor * action_fc1_b = nullptr;
+    std::vector<clip_action_block> action_blocks;
+    ggml_tensor * action_ln2_w = nullptr;
+    ggml_tensor * action_ln2_b = nullptr;
+    ggml_tensor * action_fc2_w = nullptr;
+    ggml_tensor * action_fc2_b = nullptr;
 
     // Yi type models with mlp+normalization projection
     ggml_tensor * mm_1_w = nullptr; // Yi type models have 0, 1, 3, 4

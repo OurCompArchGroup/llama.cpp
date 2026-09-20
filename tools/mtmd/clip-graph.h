@@ -58,7 +58,12 @@ struct clip_graph {
                 norm_type norm_t,
                 ffn_op_type ffn_t,
                 ggml_tensor * learned_pos_embd,
-                std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos);
+                std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos,
+                bool quantize_activations = false);
+
+    // BitVLA's SigLIP BitLinear applies symmetric per-token int8 fake
+    // quantization immediately before each matrix multiplication.
+    ggml_tensor * build_absmax_quant(ggml_tensor * cur, const char * name, int il) const;
 
     // build the input after conv2d (inp_raw --> patches)
     // returns tensor with shape [n_embd, n_patches]
@@ -83,7 +88,8 @@ struct clip_graph {
             ggml_tensor * down,
             ggml_tensor * down_b,
             ffn_op_type type_op,
-            int il) const;
+            int il,
+            bool quantize_activations = false) const;
 
     ggml_tensor * build_attn(
             ggml_tensor * wo,
@@ -93,7 +99,8 @@ struct clip_graph {
             ggml_tensor * v_cur,
             ggml_tensor * kq_mask,
             float kq_scale,
-            int il) const;
+            int il,
+            bool quantize_activations = false) const;
 
     // implementation of the 2D RoPE without adding a new op in ggml
     // this is not efficient (use double the memory), but works on all backends

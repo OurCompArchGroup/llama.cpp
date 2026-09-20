@@ -898,6 +898,37 @@ int mtmd_get_audio_bitrate(mtmd_context * ctx) {
     return clip_get_hparams(ctx->ctx_a)->audio_sample_rate;
 }
 
+bool mtmd_support_action(mtmd_context * ctx) {
+    return ctx && clip_supports_action(ctx->ctx_v);
+}
+
+bool mtmd_get_action_info(mtmd_context * ctx, mtmd_action_info * info) {
+    if (!info || !mtmd_support_action(ctx)) {
+        return false;
+    }
+    info->llm_dim = clip_action_llm_dim(ctx->ctx_v);
+    info->action_dim = clip_action_dim(ctx->ctx_v);
+    info->action_chunk = clip_action_chunk(ctx->ctx_v);
+    info->proprio_dim = clip_proprio_dim(ctx->ctx_v);
+    return true;
+}
+
+int32_t mtmd_project_proprio(mtmd_context * ctx, const float * proprio, float * embedding) {
+    if (!ctx || !clip_project_proprio(ctx->ctx_v, ctx->n_threads, proprio, embedding)) {
+        LOG_ERR("%s: failed to project proprio input\n", __func__);
+        return 1;
+    }
+    return 0;
+}
+
+int32_t mtmd_predict_action(mtmd_context * ctx, const float * hidden_states, float * actions) {
+    if (!ctx || !clip_predict_action(ctx->ctx_v, ctx->n_threads, hidden_states, actions)) {
+        LOG_ERR("%s: failed to evaluate action head\n", __func__);
+        return 1;
+    }
+    return 0;
+}
+
 //
 // public API functions
 //

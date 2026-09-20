@@ -547,6 +547,13 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
+    // Copy one token embedding into an array of llama_model_n_embd_inp(model) floats.
+    // Returns 0 on success, non-zero on invalid input or an unsupported tensor type.
+    LLAMA_API int32_t llama_model_get_token_embedding(
+            const struct llama_model * model,
+                         llama_token   token,
+                               float * embedding);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 

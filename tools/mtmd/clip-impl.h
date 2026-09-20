@@ -41,6 +41,9 @@
 #define KEY_IMAGE_MEAN          "clip.vision.image_mean"
 #define KEY_IMAGE_STD           "clip.vision.image_std"
 #define KEY_FEATURE_LAYER       "clip.vision.feature_layer"
+#define KEY_FEATURE_SELECT_STRATEGY "clip.vision.feature_select_strategy"
+#define KEY_VISION_HIDDEN_ACT   "clip.vision.hidden_act"
+#define KEY_PROJECTOR_HIDDEN_ACT "clip.vision.projector.hidden_act"
 #define KEY_PROJ_SCALE_FACTOR   "clip.vision.projector.scale_factor"
 #define KEY_SPATIAL_MERGE_SIZE  "clip.vision.spatial_merge_size"
 #define KEY_IS_DEEPSTACK_LAYERS "clip.vision.is_deepstack_layers"
@@ -58,6 +61,19 @@
 #define KEY_AUDIO_PROJ_TYPE     "clip.audio.projector_type" // for models with mixed modalities
 #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
 #define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
+
+// action-specific
+#define KEY_ACTION_LLM_DIM       "bitvla.llm_dimension"
+#define KEY_ACTION_DIM           "bitvla.action_dimension"
+#define KEY_ACTION_CHUNK         "bitvla.action_chunk"
+#define KEY_PROPRIO_DIM          "bitvla.proprio_dimension"
+#define KEY_ACTION_N_BLOCK       "bitvla.action_head.block_count"
+#define KEY_ACTION_INPUT_DIM     "bitvla.action_head.input_dimension"
+#define KEY_ACTION_HIDDEN_DIM    "bitvla.action_head.hidden_dimension"
+#define KEY_ACTION_NORM_EPS      "bitvla.action_head.layer_norm_epsilon"
+#define KEY_ACTION_HEAD_TYPE     "bitvla.action_head.type"
+#define KEY_ACTION_HIDDEN_ACT    "bitvla.action_head.activation"
+#define KEY_PROPRIO_HIDDEN_ACT   "bitvla.proprio_projector.activation"
 
 
 //
@@ -108,6 +124,13 @@
 #define TN_DEEPSTACK_NORM  "v.deepstack.%d.norm.%s"     // qwen3vl deepstack
 #define TN_DEEPSTACK_FC1   "v.deepstack.%d.fc1.%s"      // qwen3vl deepstack
 #define TN_DEEPSTACK_FC2   "v.deepstack.%d.fc2.%s"      // qwen3vl deepstack
+
+// action head and proprio projector
+#define TN_PROPRIO_FC       "proprio_projector.fc%d.%s"
+#define TN_ACTION_LN        "action_head.model.layer_norm%d.%s"
+#define TN_ACTION_FC        "action_head.model.fc%d.%s"
+#define TN_ACTION_BLOCK_LN  "action_head.model.mlp_resnet_blocks.%d.ffn.0.%s"
+#define TN_ACTION_BLOCK_FC  "action_head.model.mlp_resnet_blocks.%d.ffn.1.%s"
 
 // mimicpmv
 #define TN_MINICPMV_POS_EMBD_K "resampler.pos_embed_k"
@@ -205,6 +228,7 @@ struct clip_ctx;
 enum projector_type {
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
+    PROJECTOR_TYPE_BITVLA,
     PROJECTOR_TYPE_LDP,
     PROJECTOR_TYPE_LDPV2,
     PROJECTOR_TYPE_MINICPMV,
@@ -238,6 +262,7 @@ enum projector_type {
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_MLP,       "mlp" },
+    { PROJECTOR_TYPE_BITVLA,    "bitvla" },
     { PROJECTOR_TYPE_LDP,       "ldp" },
     { PROJECTOR_TYPE_LDPV2,     "ldpv2"},
     { PROJECTOR_TYPE_MINICPMV,  "resampler"},

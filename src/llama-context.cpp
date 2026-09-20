@@ -1488,8 +1488,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // Preserve the implicit all-token behavior when no output mask is supplied.
+    // An explicit mask allows callers such as BitVLA to request only selected
+    // hidden states and avoid evaluating the language head for every token.
+    const bool output_all   = cparams.embeddings &&
+        (cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || batch_inp.logits == nullptr);
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;

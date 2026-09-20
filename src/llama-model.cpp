@@ -12,6 +12,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#include "ggml-backend.h"
 
 #include "models/models.h"
 
@@ -25,6 +26,10 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+
+extern "C" {
+void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t k, float scale);
+}
 
 static uint8_t llama_model_synthetic_skip_alloc_placeholder = 0;
 
@@ -8297,6 +8302,56 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 
 int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
+}
+
+int32_t llama_model_get_token_embedding(
+        const llama_model * model,
+              llama_token   token,
+                    float * embedding) {
+    if (!model || !embedding || !model->tok_embd || token < 0 || token >= model->tok_embd->ne[1]) {
+        return 1;
+    }
+
+    const ggml_tensor * tensor = model->tok_embd;
+    const int64_t n_embd = tensor->ne[0];
+    const int64_t n_embd_inp = model->hparams.n_embd_inp();
+    if (n_embd <= 0 || n_embd > n_embd_inp) {
+        return 1;
+    }
+
+    const size_t row_size = ggml_row_size(tensor->type, n_embd);
+    std::vector<uint8_t> row(row_size);
+    ggml_backend_tensor_get(tensor, row.data(), (size_t) token * tensor->nb[1], row_size);
+
+    switch (tensor->type) {
+        case GGML_TYPE_F32:
+            std::memcpy(embedding, row.data(), (size_t) n_embd * sizeof(float));
+            break;
+        case GGML_TYPE_F16:
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) row.data(), embedding, n_embd);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) row.data(), embedding, n_embd);
+            break;
+        case GGML_TYPE_I2_S:
+            {
+                float scale;
+                const size_t scale_offset = (size_t) ggml_nelements(tensor) / 4;
+                ggml_backend_tensor_get(tensor, &scale, scale_offset, sizeof(scale));
+                dequantize_row_i2_s(row.data(), embedding, n_embd, scale);
+            } break;
+        default:
+            {
+                const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+                if (!traits->to_float) {
+                    return 2;
+                }
+                traits->to_float(row.data(), embedding, n_embd);
+            } break;
+    }
+
+    std::fill(embedding + n_embd, embedding + n_embd_inp, 0.0f);
+    return 0;
 }
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {

@@ -10,7 +10,13 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#ifdef GGML_USE_RV_AME
+#include "ggml/src/ggml-cpu/arch/riscv/ame/ame-backend.h"
+#endif
+
+#include <algorithm>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -223,6 +229,28 @@ struct clip_ctx {
 // clip_graph
 //
 
+static int clip_effective_n_layer(int n_layer) {
+    const char * env = getenv("BITVLA_VIT_MAX_LAYER");
+    if (env == nullptr || env[0] == '\0') {
+        return n_layer;
+    }
+    char * end = nullptr;
+    const long parsed = strtol(env, &end, 10);
+    if (end == env || parsed <= 0) {
+        return n_layer;
+    }
+    if (parsed >= n_layer) {
+        return n_layer;
+    }
+    LOG_INF("%s: BITVLA_VIT_MAX_LAYER=%ld (model has %d)\n", __func__, parsed, n_layer);
+    return (int) parsed;
+}
+
+static bool clip_dump_vit_enabled() {
+    const char * env = getenv("BITVLA_DUMP_VIT");
+    return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -235,7 +263,7 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         n_embd(hparams.n_embd),
         n_head(hparams.n_head),
         d_head(n_embd / n_head),
-        n_layer(hparams.n_layer),
+        n_layer(clip_effective_n_layer(hparams.n_layer)),
         n_mmproj_embd(clip_n_mmproj_embd(ctx)),
         eps(hparams.eps),
         kq_scale(1.0f / sqrtf((float)d_head)),
@@ -251,6 +279,13 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
 }
 
 void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {
+    // Dup dump targets so later nodes cannot reuse the buffer.  Views such as
+    // Qcur (reshape of the Q matmul) otherwise report stale or aliased data.
+    if (clip_dump_vit_enabled() && cur != nullptr && il < 1) {
+        cur = ggml_dup(ctx0, cur);
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+    }
     if (il >= 0) {
         ggml_format_name(cur, "%s-%d", name, il);
     } else {
@@ -290,7 +325,8 @@ ggml_tensor * clip_graph::build_vit(
             norm_type norm_t,
             ffn_op_type ffn_t,
             ggml_tensor * learned_pos_embd,
-            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos
+            std::function<ggml_tensor *(ggml_tensor *, const clip_layer &)> add_pos,
+            bool quantize_activations
         ) {
     if (learned_pos_embd) {
         inp = ggml_add(ctx0, inp, learned_pos_embd);
@@ -316,12 +352,15 @@ ggml_tensor * clip_graph::build_vit(
 
         // self-attention
         {
+            ggml_tensor * attn_inp = quantize_activations
+                ? build_absmax_quant(cur, "attn_inp_quant", il)
+                : cur;
             ggml_tensor * Qcur = nullptr;
             ggml_tensor * Kcur = nullptr;
             ggml_tensor * Vcur = nullptr;
             if (layer.qkv_w != nullptr) {
                 // fused qkv
-                cur = ggml_mul_mat(ctx0, layer.qkv_w, cur);
+                cur = ggml_mul_mat(ctx0, layer.qkv_w, attn_inp);
                 if (layer.qkv_b != nullptr) {
                     cur = ggml_add(ctx0, cur, layer.qkv_b);
                 }
@@ -347,17 +386,17 @@ ggml_tensor * clip_graph::build_vit(
 
             } else {
                 // separate q, k, v
-                Qcur = ggml_mul_mat(ctx0, layer.q_w, cur);
+                Qcur = ggml_mul_mat(ctx0, layer.q_w, attn_inp);
                 if (layer.q_b) {
                     Qcur = ggml_add(ctx0, Qcur, layer.q_b);
                 }
 
-                Kcur = ggml_mul_mat(ctx0, layer.k_w, cur);
+                Kcur = ggml_mul_mat(ctx0, layer.k_w, attn_inp);
                 if (layer.k_b) {
                     Kcur = ggml_add(ctx0, Kcur, layer.k_b);
                 }
 
-                Vcur = ggml_mul_mat(ctx0, layer.v_w, cur);
+                Vcur = ggml_mul_mat(ctx0, layer.v_w, attn_inp);
                 if (layer.v_b) {
                     Vcur = ggml_add(ctx0, Vcur, layer.v_b);
                 }
@@ -389,7 +428,7 @@ ggml_tensor * clip_graph::build_vit(
             }
 
             cur = build_attn(layer.o_w, layer.o_b,
-                Qcur, Kcur, Vcur, nullptr, kq_scale, il);
+                Qcur, Kcur, Vcur, nullptr, kq_scale, il, quantize_activations);
             cb(cur, "attn_out", il);
         }
 
@@ -414,7 +453,7 @@ ggml_tensor * clip_graph::build_vit(
             layer.ff_up_w, layer.ff_up_b,
             layer.ff_gate_w, layer.ff_gate_b,
             layer.ff_down_w, layer.ff_down_b,
-            ffn_t, il);
+            ffn_t, il, quantize_activations);
 
         cb(cur, "ffn_out", il);
 
@@ -445,6 +484,24 @@ ggml_tensor * clip_graph::build_vit(
         inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, norm_t, eps, -1);
     }
     return inpL;
+}
+
+ggml_tensor * clip_graph::build_absmax_quant(
+        ggml_tensor * cur,
+        const char * name,
+        int il) const {
+    ggml_tensor * absmax = ggml_pool_1d(
+        ctx0, ggml_abs(ctx0, cur), GGML_OP_POOL_MAX, cur->ne[0], cur->ne[0], 0);
+    absmax = ggml_clamp(ctx0, absmax, 1e-5f, FLT_MAX);
+
+    ggml_tensor * quant = ggml_div(ctx0, cur, absmax);
+    quant = ggml_scale(ctx0, quant, 127.0f);
+    quant = ggml_round(ctx0, quant);
+    quant = ggml_clamp(ctx0, quant, -128.0f, 127.0f);
+    quant = ggml_scale(ctx0, quant, 1.0f / 127.0f);
+    quant = ggml_mul(ctx0, quant, absmax);
+    cb(quant, name, il);
+    return quant;
 }
 
 // build the input after conv2d (inp_raw --> patches)
@@ -502,9 +559,13 @@ ggml_tensor * clip_graph::build_ffn(
         ggml_tensor * down,
         ggml_tensor * down_b,
         ffn_op_type type_op,
-        int il) const {
+        int il,
+        bool quantize_activations) const {
 
-    ggml_tensor * tmp = up ? ggml_mul_mat(ctx0, up, cur) : cur;
+    ggml_tensor * ffn_inp = quantize_activations
+        ? build_absmax_quant(cur, "ffn_inp_quant", il)
+        : cur;
+    ggml_tensor * tmp = up ? ggml_mul_mat(ctx0, up, ffn_inp) : ffn_inp;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -513,7 +574,7 @@ ggml_tensor * clip_graph::build_ffn(
     }
 
     if (gate) {
-        cur = ggml_mul_mat(ctx0, gate, cur);
+        cur = ggml_mul_mat(ctx0, gate, ffn_inp);
         cb(cur, "ffn_gate", il);
 
         if (gate_b) {
@@ -561,6 +622,9 @@ ggml_tensor * clip_graph::build_ffn(
     }
 
     if (down) {
+        if (quantize_activations) {
+            cur = build_absmax_quant(cur, "ffn_out_quant", il);
+        }
         cur = ggml_mul_mat(ctx0, down, cur);
     }
 
@@ -583,7 +647,8 @@ ggml_tensor * clip_graph::build_attn(
         ggml_tensor * v_cur,
         ggml_tensor * kq_mask,
         float kq_scale,
-        int il) const {
+        int il,
+        bool quantize_activations) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -630,6 +695,9 @@ ggml_tensor * clip_graph::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
+        if (quantize_activations) {
+            cur = build_absmax_quant(cur, "attn_out_quant", il);
+        }
         cur = ggml_mul_mat(ctx0, wo, cur);
     }
 
@@ -780,6 +848,7 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_JANUS_PRO:
+        case PROJECTOR_TYPE_BITVLA:
             {
                 builder = std::make_unique<clip_graph_siglip>(ctx, img);
             } break;
@@ -1038,6 +1107,7 @@ struct clip_model_loader {
 
             hparams.has_llava_projector = model.proj_type == PROJECTOR_TYPE_MLP
                                        || model.proj_type == PROJECTOR_TYPE_MLP_NORM
+                                       || model.proj_type == PROJECTOR_TYPE_BITVLA
                                        || model.proj_type == PROJECTOR_TYPE_LDP
                                        || model.proj_type == PROJECTOR_TYPE_LDPV2;
 
@@ -1061,6 +1131,80 @@ struct clip_model_loader {
                 }
             }
 
+            auto parse_hidden_act = [](const std::string & act, const char * key) {
+                if (act == "gelu") {
+                    return FFN_GELU_ERF;
+                }
+                if (act == "gelu_new" || act == "gelu_pytorch_tanh") {
+                    return FFN_GELU;
+                }
+                if (act == "quick_gelu") {
+                    return FFN_GELU_QUICK;
+                }
+                if (act == "silu") {
+                    return FFN_SILU;
+                }
+                throw std::runtime_error(string_format("%s: unsupported activation '%s' in %s\n",
+                            __func__, act.c_str(), key));
+            };
+
+            {
+                std::string vision_hidden_act;
+                get_string(KEY_VISION_HIDDEN_ACT, vision_hidden_act, false);
+                if (!vision_hidden_act.empty()) {
+                    hparams.ffn_op = parse_hidden_act(vision_hidden_act, KEY_VISION_HIDDEN_ACT);
+                    log_ffn_op = vision_hidden_act;
+                }
+            }
+
+            if (model.proj_type == PROJECTOR_TYPE_BITVLA) {
+                std::string projector_hidden_act;
+                get_string(KEY_PROJECTOR_HIDDEN_ACT, projector_hidden_act, true);
+                hparams.projector_ffn_op = parse_hidden_act(projector_hidden_act, KEY_PROJECTOR_HIDDEN_ACT);
+
+                std::string select_strategy;
+                get_string(KEY_FEATURE_SELECT_STRATEGY, select_strategy, true);
+                if (select_strategy == "default") {
+                    hparams.vision_drop_first_token = true;
+                } else if (select_strategy != "full") {
+                    throw std::runtime_error(string_format("%s: unsupported BitVLA feature selection strategy: %s\n",
+                                __func__, select_strategy.c_str()));
+                }
+
+                get_u32(KEY_ACTION_LLM_DIM, hparams.action_llm_dim, false);
+                if (hparams.action_llm_dim > 0) {
+                    get_u32(KEY_ACTION_DIM,        hparams.action_dim);
+                    get_u32(KEY_ACTION_CHUNK,      hparams.action_chunk);
+                    get_u32(KEY_PROPRIO_DIM,       hparams.proprio_dim);
+                    get_u32(KEY_ACTION_N_BLOCK,    hparams.action_n_block);
+                    get_u32(KEY_ACTION_INPUT_DIM,  hparams.action_input_dim);
+                    get_u32(KEY_ACTION_HIDDEN_DIM, hparams.action_hidden_dim);
+                    get_f32(KEY_ACTION_NORM_EPS,   hparams.action_norm_eps);
+
+                    std::string action_head_type;
+                    std::string action_hidden_act;
+                    std::string proprio_hidden_act;
+                    get_string(KEY_ACTION_HEAD_TYPE,   action_head_type);
+                    get_string(KEY_ACTION_HIDDEN_ACT,  action_hidden_act);
+                    get_string(KEY_PROPRIO_HIDDEN_ACT, proprio_hidden_act);
+                    if (action_head_type != "l1_regression") {
+                        throw std::runtime_error(string_format("%s: unsupported BitVLA action head: %s\n",
+                                    __func__, action_head_type.c_str()));
+                    }
+                    if (action_hidden_act != "relu" || proprio_hidden_act != "gelu") {
+                        throw std::runtime_error(string_format(
+                                    "%s: unsupported BitVLA action activations: action=%s, proprio=%s\n",
+                                    __func__, action_hidden_act.c_str(), proprio_hidden_act.c_str()));
+                    }
+                    if (hparams.action_llm_dim != hparams.action_hidden_dim ||
+                            hparams.action_input_dim != hparams.action_dim * hparams.action_llm_dim ||
+                            hparams.action_chunk <= 0 || hparams.action_dim <= 0 ||
+                            hparams.proprio_dim <= 0 || hparams.action_n_block <= 0) {
+                        throw std::runtime_error(string_format("%s: inconsistent BitVLA action metadata\n", __func__));
+                    }
+                }
+            }
+
             {
                 std::string mm_patch_merge_type;
                 get_string(KEY_MM_PATCH_MERGE_TYPE, mm_patch_merge_type, false);
@@ -1069,7 +1213,7 @@ struct clip_model_loader {
                 }
             }
 
-            if (is_vision) {
+                if (is_vision) {
                 int idx_mean = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_MEAN);
                 int idx_std  = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_STD);
                 GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
@@ -1266,6 +1410,10 @@ struct clip_model_loader {
                 if (hparams.image_max_pixels > 0) {
                     LOG_INF("%s: image_max_pixels:   %d%s\n", __func__, hparams.image_max_pixels, hparams.custom_image_max_tokens > 0 ? " (custom value)" : "");
                 }
+                if (hparams.action_llm_dim > 0) {
+                    LOG_INF("%s: action dimensions:  %d x %d\n", __func__, hparams.action_chunk, hparams.action_dim);
+                    LOG_INF("%s: proprio dimension: %d\n", __func__, hparams.proprio_dim);
+                }
             } else if (is_audio) {
                 LOG_INF("\n--- audio hparams ---\n");
                 LOG_INF("%s: n_mel_bins:         %d\n", __func__, hparams.n_mel_bins);
@@ -1395,6 +1543,7 @@ struct clip_model_loader {
                     // only old models need this fix
                     model.proj_type == PROJECTOR_TYPE_MLP
                     || model.proj_type == PROJECTOR_TYPE_MLP_NORM
+                    || model.proj_type == PROJECTOR_TYPE_BITVLA
                     || model.proj_type == PROJECTOR_TYPE_LDP
                     || model.proj_type == PROJECTOR_TYPE_LDPV2
                     || model.proj_type == PROJECTOR_TYPE_QWEN2VL
@@ -1423,15 +1572,17 @@ struct clip_model_loader {
         switch (model.proj_type) {
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
+            case PROJECTOR_TYPE_BITVLA:
                 {
+                    const bool required = model.proj_type == PROJECTOR_TYPE_BITVLA;
                     // LLaVA projection
-                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"), false);
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"), required);
                     model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
                     // Yi-type llava
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"), false);
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
                     // missing in Yi-type llava
-                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"), false);
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"), required);
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                     // Yi-type llava
                     model.mm_3_w = get_tensor(string_format(TN_LLAVA_PROJ, 3, "weight"), false);
@@ -1443,6 +1594,56 @@ struct clip_model_loader {
                         model.proj_type = PROJECTOR_TYPE_MLP_NORM;
                     }
                     model.image_newline = get_tensor(TN_IMAGE_NEWLINE, false);
+
+                    if (model.proj_type == PROJECTOR_TYPE_BITVLA && hparams.action_llm_dim > 0) {
+                        model.proprio_fc1_w = get_tensor(string_format(TN_PROPRIO_FC, 1, "weight"));
+                        model.proprio_fc1_b = get_tensor(string_format(TN_PROPRIO_FC, 1, "bias"));
+                        model.proprio_fc2_w = get_tensor(string_format(TN_PROPRIO_FC, 2, "weight"));
+                        model.proprio_fc2_b = get_tensor(string_format(TN_PROPRIO_FC, 2, "bias"));
+
+                        model.action_ln1_w = get_tensor(string_format(TN_ACTION_LN, 1, "weight"));
+                        model.action_ln1_b = get_tensor(string_format(TN_ACTION_LN, 1, "bias"));
+                        model.action_fc1_w = get_tensor(string_format(TN_ACTION_FC, 1, "weight"));
+                        model.action_fc1_b = get_tensor(string_format(TN_ACTION_FC, 1, "bias"));
+                        model.action_blocks.resize(hparams.action_n_block);
+                        for (int ib = 0; ib < hparams.action_n_block; ++ib) {
+                            auto & block = model.action_blocks[ib];
+                            block.norm_w = get_tensor(string_format(TN_ACTION_BLOCK_LN, ib, "weight"));
+                            block.norm_b = get_tensor(string_format(TN_ACTION_BLOCK_LN, ib, "bias"));
+                            block.fc_w = get_tensor(string_format(TN_ACTION_BLOCK_FC, ib, "weight"));
+                            block.fc_b = get_tensor(string_format(TN_ACTION_BLOCK_FC, ib, "bias"));
+                        }
+                        model.action_ln2_w = get_tensor(string_format(TN_ACTION_LN, 2, "weight"));
+                        model.action_ln2_b = get_tensor(string_format(TN_ACTION_LN, 2, "bias"));
+                        model.action_fc2_w = get_tensor(string_format(TN_ACTION_FC, 2, "weight"));
+                        model.action_fc2_b = get_tensor(string_format(TN_ACTION_FC, 2, "bias"));
+
+                        auto require_shape = [](const ggml_tensor * tensor, int64_t ne0, int64_t ne1 = 1) {
+                            if (tensor->ne[0] != ne0 || tensor->ne[1] != ne1 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+                                throw std::runtime_error(string_format(
+                                            "invalid shape for %s: [%" PRId64 ", %" PRId64 "] (expected [%" PRId64 ", %" PRId64 "])\n",
+                                            tensor->name, tensor->ne[0], tensor->ne[1], ne0, ne1));
+                            }
+                        };
+                        require_shape(model.proprio_fc1_w, hparams.proprio_dim, hparams.action_llm_dim);
+                        require_shape(model.proprio_fc1_b, hparams.action_llm_dim);
+                        require_shape(model.proprio_fc2_w, hparams.action_llm_dim, hparams.action_llm_dim);
+                        require_shape(model.proprio_fc2_b, hparams.action_llm_dim);
+                        require_shape(model.action_ln1_w, hparams.action_input_dim);
+                        require_shape(model.action_ln1_b, hparams.action_input_dim);
+                        require_shape(model.action_fc1_w, hparams.action_input_dim, hparams.action_hidden_dim);
+                        require_shape(model.action_fc1_b, hparams.action_hidden_dim);
+                        for (const auto & block : model.action_blocks) {
+                            require_shape(block.norm_w, hparams.action_hidden_dim);
+                            require_shape(block.norm_b, hparams.action_hidden_dim);
+                            require_shape(block.fc_w, hparams.action_hidden_dim, hparams.action_hidden_dim);
+                            require_shape(block.fc_b, hparams.action_hidden_dim);
+                        }
+                        require_shape(model.action_ln2_w, hparams.action_hidden_dim);
+                        require_shape(model.action_ln2_b, hparams.action_hidden_dim);
+                        require_shape(model.action_fc2_w, hparams.action_hidden_dim, hparams.action_dim);
+                        require_shape(model.action_fc2_b, hparams.action_dim);
+                    }
                 } break;
             case PROJECTOR_TYPE_LDP:
                 {
@@ -1842,8 +2043,23 @@ struct clip_model_loader {
                 throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
             }
 
-            // alloc memory and offload data
+            // alloc memory and offload data.  The CPU AME buffer has ordinary
+            // ggml layout but attaches AME tensor traits at allocation time.
+            // BitVLA uses BF16 mmproj weights, so placing them in that buffer
+            // lets vision/projector/action-head linear layers take the AME
+            // path while all unsupported operations remain on the CPU backend.
             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+#ifdef GGML_USE_RV_AME
+            if (ctx_clip.proj_type() == PROJECTOR_TYPE_BITVLA && ctx_clip.backend == ctx_clip.backend_cpu) {
+                ggml_backend_buffer_type_t ame_buft = ggml_backend_cpu_riscv_ame_buffer_type();
+                if (ame_buft && ggml_backend_supports_buft(ctx_clip.backend_cpu, ame_buft)) {
+                    buft = ame_buft;
+                    LOG_INF("%s: BitVLA weights use %s buffer\n", __func__, ggml_backend_buft_name(buft));
+                } else {
+                    LOG_WRN("%s: BitVLA AME buffer unavailable; using %s weights\n", __func__, ggml_backend_buft_name(buft));
+                }
+            }
+#endif
             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             for (auto & t : tensors_to_load) {
@@ -2962,6 +3178,16 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 res_imgs->entries.push_back(std::move(img_f32));
             } break;
 
+        case PROJECTOR_TYPE_BITVLA:
+            {
+                clip_image_u8 resized_image;
+                const int sz = params.image_size;
+                img_tool::resize(*img, resized_image, {sz, sz}, img_tool::RESIZE_ALGO_BICUBIC, false);
+                clip_image_f32_ptr img_f32(clip_image_f32_init());
+                normalize_image_u8_to_f32(resized_image, *img_f32, params.image_mean, params.image_std);
+                res_imgs->entries.push_back(std::move(img_f32));
+            } break;
+
         case PROJECTOR_TYPE_GEMMA3NV:
             {
                 clip_image_u8 resized_image;
@@ -3177,9 +3403,12 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
     switch (proj) {
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
+        case PROJECTOR_TYPE_BITVLA:
         case PROJECTOR_TYPE_JANUS_PRO:
             {
-                // do nothing
+                if (proj == PROJECTOR_TYPE_BITVLA && params.vision_drop_first_token) {
+                    n_patches -= 1;
+                }
             } break;
         case PROJECTOR_TYPE_LDP:
         case PROJECTOR_TYPE_LDPV2:
@@ -3623,12 +3852,23 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 // The patches vector is used to get rows to index into the embeds with;
                 // we should skip dim 0 only if we have CLS to avoid going out of bounds
                 // when retrieving the rows.
-                int patch_offset = model.class_embedding ? 1 : 0;
-                std::vector<int32_t> patches(num_patches);
-                for (int i = 0; i < num_patches; i++) {
+                const int patch_offset = model.class_embedding || hparams.vision_drop_first_token ? 1 : 0;
+                const int n_selected_patches = num_patches - (hparams.vision_drop_first_token ? 1 : 0);
+                std::vector<int32_t> patches(n_selected_patches);
+                for (int i = 0; i < n_selected_patches; i++) {
                     patches[i] = i + patch_offset;
                 }
                 set_input_i32("patches", patches);
+            } break;
+        case PROJECTOR_TYPE_BITVLA:
+            {
+                if (hparams.vision_drop_first_token) {
+                    std::vector<int32_t> patches(num_patches - 1);
+                    for (int i = 0; i < num_patches - 1; ++i) {
+                        patches[i] = i + 1;
+                    }
+                    set_input_i32("patches", patches);
+                }
             } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
@@ -3703,6 +3943,66 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         return false;
     }
 
+    if (clip_dump_vit_enabled()) {
+        const char * dump_names[] = {
+            "pre_ln",
+            "layer_inp_normed-0",
+            "Qcur-0",
+            "attn_out-0",
+            "ffn_inp-0",
+            "ffn_out-0",
+            "layer_out-0",
+        };
+        for (const char * name : dump_names) {
+            ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+            if (t == nullptr || ggml_nbytes(t) == 0) {
+                LOG_WRN("%s: vit dump missing tensor %s\n", __func__, name);
+                continue;
+            }
+            std::vector<float> values((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(t, values.data(), 0, values.size() * sizeof(float));
+            double sum = 0.0;
+            double abs_sum = 0.0;
+            float min_value = values[0];
+            float max_value = values[0];
+            uint64_t checksum = 0;
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float v = values[i];
+                sum += (double) v;
+                abs_sum += fabs((double) v);
+                min_value = std::min(min_value, v);
+                max_value = std::max(max_value, v);
+                uint32_t bits = 0;
+                memcpy(&bits, &v, sizeof(bits));
+                checksum = checksum * 131u + bits;
+            }
+            LOG_INF("%s: vit dump name=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                    "min=%.6g max=%.6g mean=%.6g absmean=%.6g checksum=%llu first8=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
+                    __func__, name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                    min_value, max_value, sum / (double) values.size(), abs_sum / (double) values.size(),
+                    (unsigned long long) checksum,
+                    values.size() > 0 ? values[0] : 0.0f,
+                    values.size() > 1 ? values[1] : 0.0f,
+                    values.size() > 2 ? values[2] : 0.0f,
+                    values.size() > 3 ? values[3] : 0.0f,
+                    values.size() > 4 ? values[4] : 0.0f,
+                    values.size() > 5 ? values[5] : 0.0f,
+                    values.size() > 6 ? values[6] : 0.0f,
+                    values.size() > 7 ? values[7] : 0.0f);
+            const char * dump_dir = getenv("BITVLA_DUMP_DIR");
+            if (dump_dir != nullptr && dump_dir[0] != '\0') {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, name);
+                std::ofstream out(path, std::ios::binary);
+                if (out) {
+                    out.write(reinterpret_cast<const char *>(values.data()),
+                              (std::streamsize) (values.size() * sizeof(float)));
+                    LOG_INF("%s: wrote %s (%zu floats)\n", __func__, path, values.size());
+                }
+            }
+        }
+    }
+
     // the last node is the embedding tensor
     ggml_tensor * embeddings = ggml_graph_node(gf, -1);
 
@@ -3722,6 +4022,165 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     return true;
 }
 
+static void clip_set_cpu_threads(clip_ctx * ctx, int n_threads) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return;
+    }
+    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_set_n_threads");
+    if (set_n_threads) {
+        set_n_threads(ctx->backend_cpu, n_threads);
+    }
+}
+
+static bool clip_compute_action_graph(
+        clip_ctx * ctx,
+        ggml_context * ctx0,
+        ggml_cgraph * gf,
+        const char * input_name,
+        const float * input_data,
+        ggml_tensor * output,
+        int n_threads,
+        float * output_data) {
+    ggml_set_output(output);
+    ggml_build_forward_expand(gf, output);
+
+    ggml_backend_sched_reset(ctx->sched.get());
+    if (!ggml_backend_sched_reserve(ctx->sched.get(), gf) ||
+            !ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        LOG_ERR("%s: failed to allocate BitVLA action graph\n", __func__);
+        return false;
+    }
+
+    ggml_tensor * input = ggml_get_tensor(ctx0, input_name);
+    GGML_ASSERT(input && (input->flags & GGML_TENSOR_FLAG_INPUT));
+    ggml_backend_tensor_set(input, input_data, 0, ggml_nbytes(input));
+    clip_set_cpu_threads(ctx, n_threads);
+
+    const auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERR("%s: BitVLA action graph failed with error %d\n", __func__, status);
+        return false;
+    }
+    ggml_backend_tensor_get(output, output_data, 0, ggml_nbytes(output));
+    return true;
+}
+
+bool clip_supports_action(const clip_ctx * ctx) {
+    return ctx && ctx->model.proj_type == PROJECTOR_TYPE_BITVLA &&
+        ctx->model.hparams.action_llm_dim > 0 && ctx->model.action_fc2_w;
+}
+
+int32_t clip_action_llm_dim(const clip_ctx * ctx) {
+    return clip_supports_action(ctx) ? ctx->model.hparams.action_llm_dim : 0;
+}
+
+int32_t clip_action_dim(const clip_ctx * ctx) {
+    return clip_supports_action(ctx) ? ctx->model.hparams.action_dim : 0;
+}
+
+int32_t clip_action_chunk(const clip_ctx * ctx) {
+    return clip_supports_action(ctx) ? ctx->model.hparams.action_chunk : 0;
+}
+
+int32_t clip_proprio_dim(const clip_ctx * ctx) {
+    return clip_supports_action(ctx) ? ctx->model.hparams.proprio_dim : 0;
+}
+
+bool clip_project_proprio(
+        clip_ctx * ctx,
+        int n_threads,
+        const float * proprio,
+        float * embedding) {
+    if (!clip_supports_action(ctx) || !proprio || !embedding) {
+        return false;
+    }
+
+    const auto & model = ctx->model;
+    const auto & hparams = model.hparams;
+    std::vector<uint8_t> meta(
+        ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx->max_nodes, false));
+    ggml_init_params params = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx0_ptr(ggml_init(params));
+    ggml_context * ctx0 = ctx0_ptr.get();
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, ctx->max_nodes, false);
+
+    ggml_tensor * cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.proprio_dim);
+    ggml_set_name(cur, "proprio");
+    ggml_set_input(cur);
+    cur = ggml_mul_mat(ctx0, model.proprio_fc1_w, cur);
+    cur = ggml_add(ctx0, cur, model.proprio_fc1_b);
+    cur = ggml_gelu_erf(ctx0, cur);
+    cur = ggml_mul_mat(ctx0, model.proprio_fc2_w, cur);
+    cur = ggml_add(ctx0, cur, model.proprio_fc2_b);
+    ggml_set_name(cur, "proprio_embedding");
+
+    return clip_compute_action_graph(
+        ctx, ctx0, gf, "proprio", proprio, cur, n_threads, embedding);
+}
+
+bool clip_predict_action(
+        clip_ctx * ctx,
+        int n_threads,
+        const float * hidden_states,
+        float * actions) {
+    if (!clip_supports_action(ctx) || !hidden_states || !actions) {
+        return false;
+    }
+
+    const auto & model = ctx->model;
+    const auto & hparams = model.hparams;
+    const int64_t n_action_tokens = (int64_t) hparams.action_chunk * hparams.action_dim;
+    std::vector<uint8_t> meta(
+        ctx->max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(ctx->max_nodes, false));
+    ggml_init_params params = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx0_ptr(ggml_init(params));
+    ggml_context * ctx0 = ctx0_ptr.get();
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, ctx->max_nodes, false);
+
+    ggml_tensor * input = ggml_new_tensor_2d(
+        ctx0, GGML_TYPE_F32, hparams.action_llm_dim, n_action_tokens);
+    ggml_set_name(input, "action_hidden_states");
+    ggml_set_input(input);
+
+    ggml_tensor * cur = ggml_reshape_2d(
+        ctx0, input, hparams.action_input_dim, hparams.action_chunk);
+    cur = ggml_norm(ctx0, cur, hparams.action_norm_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.action_ln1_w), model.action_ln1_b);
+    cur = ggml_mul_mat(ctx0, model.action_fc1_w, cur);
+    cur = ggml_add(ctx0, cur, model.action_fc1_b);
+    cur = ggml_relu(ctx0, cur);
+
+    for (const auto & block : model.action_blocks) {
+        ggml_tensor * residual = cur;
+        cur = ggml_norm(ctx0, cur, hparams.action_norm_eps);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, block.norm_w), block.norm_b);
+        cur = ggml_mul_mat(ctx0, block.fc_w, cur);
+        cur = ggml_add(ctx0, cur, block.fc_b);
+        cur = ggml_relu(ctx0, cur);
+        cur = ggml_add(ctx0, cur, residual);
+    }
+
+    cur = ggml_norm(ctx0, cur, hparams.action_norm_eps);
+    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.action_ln2_w), model.action_ln2_b);
+    cur = ggml_mul_mat(ctx0, model.action_fc2_w, cur);
+    cur = ggml_add(ctx0, cur, model.action_fc2_b);
+    ggml_set_name(cur, "normalized_actions");
+
+    return clip_compute_action_graph(
+        ctx, ctx0, gf, "action_hidden_states", hidden_states, cur, n_threads, actions);
+}
+
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     switch (ctx->model.proj_type) {
         case PROJECTOR_TYPE_LDP:
@@ -3729,6 +4188,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_LDPV2:
             return ctx->model.mm_model_peg_0_b->ne[0];
         case PROJECTOR_TYPE_MLP:
+        case PROJECTOR_TYPE_BITVLA:
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_LIGHTONOCR:
             return ctx->model.mm_2_w->ne[1];

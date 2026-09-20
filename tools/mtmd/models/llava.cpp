@@ -152,7 +152,9 @@ ggml_cgraph * clip_graph_llava::build() {
     if (hparams.has_llava_projector) {
         embeddings = ggml_reshape_2d(ctx0, embeddings, embeddings->ne[0], embeddings->ne[1]);
 
-        ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_patches);
+        const int n_selected_patches = n_patches - (hparams.vision_drop_first_token ? 1 : 0);
+        GGML_ASSERT(n_selected_patches > 0);
+        ggml_tensor * patches = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_selected_patches);
         ggml_set_name(patches, "patches");
         ggml_set_input(patches);
 
@@ -172,6 +174,13 @@ ggml_cgraph * clip_graph_llava::build() {
                 embeddings = ggml_mul_mat(ctx0, model.mm_2_w, embeddings);
                 embeddings = ggml_add(ctx0, embeddings, model.mm_2_b);
             }
+        }
+        else if (proj_type == PROJECTOR_TYPE_BITVLA) {
+            embeddings = build_ffn(embeddings,
+                model.mm_0_w, model.mm_0_b,
+                nullptr, nullptr,
+                model.mm_2_w, model.mm_2_b,
+                hparams.projector_ffn_op, -1);
         }
         else if (proj_type == PROJECTOR_TYPE_MLP_NORM) {
             embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);

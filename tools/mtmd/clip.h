@@ -119,3 +119,12 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
 bool clip_has_whisper_encoder(const struct clip_ctx * ctx);
+
+bool clip_supports_action(const struct clip_ctx * ctx);
+int32_t clip_action_llm_dim(const struct clip_ctx * ctx);
+int32_t clip_action_dim(const struct clip_ctx * ctx);
+int32_t clip_action_chunk(const struct clip_ctx * ctx);
+int32_t clip_proprio_dim(const struct clip_ctx * ctx);
+
+bool clip_project_proprio(struct clip_ctx * ctx, int n_threads, const float * proprio, float * embedding);
+bool clip_predict_action(struct clip_ctx * ctx, int n_threads, const float * hidden_states, float * actions);

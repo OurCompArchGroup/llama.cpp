@@ -2847,6 +2847,283 @@ class LlavaVisionModel(MmprojModel):
         return # skip other tensors
 
 
+class BitVLAActionModelMixin:
+    """Load the action head and proprio projector used by BitVLA checkpoints."""
+
+    action_chunk = 8
+    action_head_layer_norm_epsilon = 1e-5
+
+    @staticmethod
+    def _find_checkpoint(dir_model: Path, prefix: str) -> Path:
+        matches = sorted(dir_model.glob(f"{prefix}--*_checkpoint.pt"))
+        if len(matches) != 1:
+            names = ", ".join(path.name for path in matches) or "none"
+            raise ValueError(
+                f"expected exactly one {prefix} checkpoint in {dir_model}, found: {names}"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _load_checkpoint(path: Path) -> dict[str, Tensor]:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise ValueError(f"checkpoint {path} does not contain a state dictionary")
+
+        result: dict[str, Tensor] = {}
+        for name, tensor in state.items():
+            if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"checkpoint {path} contains a non-tensor state entry: {name!r}")
+            if name.startswith("module."):
+                name = name[len("module."):]
+            if name in result:
+                raise ValueError(f"checkpoint {path} contains duplicate state entry {name!r}")
+            result[name] = tensor.detach().cpu()
+        return result
+
+    @staticmethod
+    def _require_checkpoint_keys(state: dict[str, Tensor], expected: set[str], label: str) -> None:
+        actual = set(state)
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing={missing}")
+            if extra:
+                details.append(f"unexpected={extra}")
+            raise ValueError(f"invalid {label} checkpoint schema ({'; '.join(details)})")
+
+    def _validate_action_modules(
+        self,
+        action: dict[str, Tensor],
+        proprio: dict[str, Tensor],
+    ) -> None:
+        proprio_keys = {"fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"}
+        self._require_checkpoint_keys(proprio, proprio_keys, "proprio projector")
+
+        fc1_w = proprio["fc1.weight"]
+        fc1_b = proprio["fc1.bias"]
+        fc2_w = proprio["fc2.weight"]
+        fc2_b = proprio["fc2.bias"]
+        if fc1_w.ndim != 2 or fc2_w.ndim != 2:
+            raise ValueError("proprio projector linear weights must be rank-2")
+        self.proprio_dim = fc1_w.shape[1]
+        self.action_llm_dim = fc1_w.shape[0]
+        if tuple(fc1_b.shape) != (self.action_llm_dim,):
+            raise ValueError("proprio projector fc1 bias shape does not match fc1 weight")
+        if (
+            tuple(fc2_w.shape) != (self.action_llm_dim, self.action_llm_dim)
+            or tuple(fc2_b.shape) != (self.action_llm_dim,)
+        ):
+            raise ValueError("proprio projector fc2 shape does not match fc1 output dimension")
+        text_config = self.hparams.get("text_config", self.hparams)
+        if self.action_llm_dim != text_config.get("hidden_size"):
+            raise ValueError(
+                "action module hidden dimension does not match text_config.hidden_size "
+                f"({self.action_llm_dim} != {text_config.get('hidden_size')})"
+            )
+
+        block_ids = sorted({
+            int(name.split(".")[2])
+            for name in action
+            if name.startswith("model.mlp_resnet_blocks.") and name.split(".")[2].isdigit()
+        })
+        if not block_ids or block_ids != list(range(len(block_ids))):
+            raise ValueError(f"action head blocks must be contiguous from zero, got {block_ids}")
+
+        expected_action = {
+            "model.layer_norm1.weight",
+            "model.layer_norm1.bias",
+            "model.fc1.weight",
+            "model.fc1.bias",
+            "model.layer_norm2.weight",
+            "model.layer_norm2.bias",
+            "model.fc2.weight",
+            "model.fc2.bias",
+        }
+        for bid in block_ids:
+            expected_action.update({
+                f"model.mlp_resnet_blocks.{bid}.ffn.0.weight",
+                f"model.mlp_resnet_blocks.{bid}.ffn.0.bias",
+                f"model.mlp_resnet_blocks.{bid}.ffn.1.weight",
+                f"model.mlp_resnet_blocks.{bid}.ffn.1.bias",
+            })
+        self._require_checkpoint_keys(action, expected_action, "action head")
+
+        action_fc1_w = action["model.fc1.weight"]
+        action_fc2_w = action["model.fc2.weight"]
+        if action_fc1_w.ndim != 2 or action_fc2_w.ndim != 2:
+            raise ValueError("action head linear weights must be rank-2")
+        if action_fc1_w.shape[0] != self.action_llm_dim:
+            raise ValueError("action head hidden dimension does not match proprio projector output dimension")
+        self.action_input_dim = action_fc1_w.shape[1]
+        self.action_dim = action_fc2_w.shape[0]
+        if action_fc2_w.shape[1] != self.action_llm_dim:
+            raise ValueError("action head output projection does not match hidden dimension")
+        if self.action_input_dim != self.action_dim * self.action_llm_dim:
+            raise ValueError(
+                "action head input dimension must be action_dimension * llm_dimension "
+                f"({self.action_dim} * {self.action_llm_dim}), got {self.action_input_dim}"
+            )
+
+        shape_checks = {
+            "model.layer_norm1.weight": (self.action_input_dim,),
+            "model.layer_norm1.bias": (self.action_input_dim,),
+            "model.fc1.bias": (self.action_llm_dim,),
+            "model.layer_norm2.weight": (self.action_llm_dim,),
+            "model.layer_norm2.bias": (self.action_llm_dim,),
+            "model.fc2.bias": (self.action_dim,),
+        }
+        for name, shape in shape_checks.items():
+            if tuple(action[name].shape) != shape:
+                raise ValueError(
+                    f"action head tensor {name} has shape {tuple(action[name].shape)}, expected {shape}"
+                )
+        for bid in block_ids:
+            block_shapes = {
+                f"model.mlp_resnet_blocks.{bid}.ffn.0.weight": (self.action_llm_dim,),
+                f"model.mlp_resnet_blocks.{bid}.ffn.0.bias": (self.action_llm_dim,),
+                f"model.mlp_resnet_blocks.{bid}.ffn.1.weight": (self.action_llm_dim, self.action_llm_dim),
+                f"model.mlp_resnet_blocks.{bid}.ffn.1.bias": (self.action_llm_dim,),
+            }
+            for name, shape in block_shapes.items():
+                if tuple(action[name].shape) != shape:
+                    raise ValueError(
+                        f"action head tensor {name} has shape {tuple(action[name].shape)}, expected {shape}"
+                    )
+        self.action_block_count = len(block_ids)
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        is_bitvla = self.hparams.get("model_type") == "openvla"
+        if is_bitvla and remote_hf_model_id is not None:
+            raise ValueError("remote BitVLA conversion cannot load action module checkpoints")
+        tensors = super().index_tensors(remote_hf_model_id)
+        if not is_bitvla:
+            return tensors
+
+        self.action_head_path = self._find_checkpoint(self.dir_model, "action_head")
+        self.proprio_projector_path = self._find_checkpoint(self.dir_model, "proprio_projector")
+        action = self._load_checkpoint(self.action_head_path)
+        proprio = self._load_checkpoint(self.proprio_projector_path)
+        self._validate_action_modules(action, proprio)
+
+        for prefix, state in (("action_head.", action), ("proprio_projector.", proprio)):
+            for name, tensor in state.items():
+                full_name = prefix + name
+                if self.lazy:
+                    tensors[full_name] = lambda tensor=tensor: LazyTorchTensor.from_eager(tensor)
+                else:
+                    tensors[full_name] = lambda tensor=tensor: tensor
+        return tensors
+
+    def set_action_gguf_parameters(self) -> None:
+        if not hasattr(self, "action_head_path"):
+            return
+        self.gguf_writer.add_uint32("bitvla.llm_dimension", self.action_llm_dim)
+        self.gguf_writer.add_uint32("bitvla.action_dimension", self.action_dim)
+        self.gguf_writer.add_uint32("bitvla.action_chunk", self.action_chunk)
+        self.gguf_writer.add_uint32("bitvla.proprio_dimension", self.proprio_dim)
+        self.gguf_writer.add_uint32("bitvla.action_head.block_count", self.action_block_count)
+        self.gguf_writer.add_uint32("bitvla.action_head.input_dimension", self.action_input_dim)
+        self.gguf_writer.add_uint32("bitvla.action_head.hidden_dimension", self.action_llm_dim)
+        self.gguf_writer.add_float32(
+            "bitvla.action_head.layer_norm_epsilon", self.action_head_layer_norm_epsilon
+        )
+        self.gguf_writer.add_string("bitvla.action_head.type", "l1_regression")
+        self.gguf_writer.add_string("bitvla.action_head.activation", "relu")
+        self.gguf_writer.add_string("bitvla.proprio_projector.activation", "gelu")
+        self.gguf_writer.add_string("bitvla.source.action_head", self.action_head_path.name)
+        self.gguf_writer.add_string("bitvla.source.proprio_projector", self.proprio_projector_path.name)
+
+
+@ModelBase.register("Llava_OpenVLAForActionPrediction")
+class BitVLAVisionModel(BitVLAActionModelMixin, MmprojModel):
+    """Convert BitVLA's non-language modules to an mmproj GGUF."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.hparams_vision is not None
+        if "model_type" not in self.hparams_vision:
+            raise ValueError("BitVLA mmproj requires vision_config.model_type")
+        if "siglip" not in str(self.hparams_vision["model_type"]).lower():
+            raise ValueError(
+                f"BitVLA mmproj requires a SigLIP vision encoder, got {self.hparams_vision['model_type']!r}"
+            )
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+        vision = self.hparams_vision
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.BITVLA)
+        self.gguf_writer.add_bool("clip.has_llava_projector", True)
+        self.gguf_writer.add_vision_attention_layernorm_eps(vision.get("layer_norm_eps", 1e-6))
+        self.gguf_writer.add_string("clip.vision.feature_select_strategy",
+                                    self.global_config.get("vision_feature_select_strategy", "full"))
+        feature_layer = self.global_config.get("vision_feature_layer", -1)
+        if isinstance(feature_layer, int):
+            feature_layers = [feature_layer]
+        else:
+            feature_layers = list(feature_layer)
+        n_layers = int(vision["num_hidden_layers"])
+        normalized = [layer if layer >= 0 else n_layers + layer + 1 for layer in feature_layers]
+        self.gguf_writer.add_array("clip.vision.feature_layer", normalized)
+        self.gguf_writer.add_string("clip.vision.hidden_act", vision.get("hidden_act", "gelu_pytorch_tanh"))
+        self.gguf_writer.add_string("clip.vision.projector.hidden_act",
+                                    self.global_config.get("projector_hidden_act", "gelu"))
+        self.set_action_gguf_parameters()
+
+    @staticmethod
+    def weight_quant(weight: Tensor) -> Tensor:
+        """Apply the fake quantization used by BitVLA's SigLIP BitLinear."""
+        dtype = weight.dtype
+        weight = weight.float()
+        scale = weight.abs().mean().clamp(min=1e-5)
+        result = (weight / scale).round().clamp(-1, 1) * scale
+        return result.type(dtype)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        del new_name, bid
+
+        # The vision tower's attention and MLP linears are BitLinear in the
+        # BitVLA checkpoint.  Store only those trained ternary weights as I2_S
+        # so runtime can dispatch I2 x I8 AME.  The visual projector is a
+        # conventional nn.Linear and must remain BF16.
+        if n_dims == 2 and re.match(
+            r"^vision_tower\.vision_model\.encoder\.layers\.\d+\."
+            r"(?:self_attn\.(?:q|k|v|out)_proj|mlp\.fc[12])\.weight$",
+            name,
+        ):
+            return gguf.GGMLQuantizationType.I2_S
+
+        return False
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith(("action_head.", "proprio_projector.")):
+            yield name, data_torch
+            return
+
+        # LlavaVisionModel permutes Q/K for language-model-style attention. A
+        # SigLIP encoder uses ordinary multi-head attention, so retain the HF
+        # Q/K layout and only pass vision/projector tensors to the base mapper.
+        if name.startswith(("vision_tower.", "vision_model.", "multi_modal_projector.", "mm_projector.")):
+            if re.match(
+                r"^vision_tower\.vision_model\.encoder\.layers\.\d+\."
+                r"(?:self_attn\.(?:q|k|v|out)_proj|mlp\.fc[12])\.weight$",
+                name,
+            ):
+                data_torch = self.weight_quant(data_torch)
+
+            # TensorNameMap numbers this sequence from the source suffix
+            # (linear_1 -> mm.1), while clip.cpp uses the LLaVA convention
+            # linear_1 -> mm.0 and linear_2 -> mm.2.
+            if name.startswith("multi_modal_projector.linear_1."):
+                for mapped_name, mapped_tensor in MmprojModel.modify_tensors(self, data_torch, name, bid):
+                    yield mapped_name.replace("mm.1.", "mm.0.", 1), mapped_tensor
+            else:
+                yield from MmprojModel.modify_tensors(self, data_torch, name, bid)
+        return
+
+
 @ModelBase.register("Idefics3ForConditionalGeneration", "SmolVLMForConditionalGeneration")
 class SmolVLMModel(MmprojModel):
     def __init__(self, *args, **kwargs):

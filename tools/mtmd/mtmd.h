@@ -129,6 +129,24 @@ MTMD_API bool mtmd_support_audio(mtmd_context * ctx);
 // return -1 if audio is not supported
 MTMD_API int mtmd_get_audio_bitrate(mtmd_context * ctx);
 
+struct mtmd_action_info {
+    int32_t llm_dim;
+    int32_t action_dim;
+    int32_t action_chunk;
+    int32_t proprio_dim;
+};
+
+// Optional continuous-action policy stored in the multimodal projector file.
+MTMD_API bool mtmd_support_action(mtmd_context * ctx);
+MTMD_API bool mtmd_get_action_info(mtmd_context * ctx, struct mtmd_action_info * info);
+
+// `embedding` must hold info.llm_dim floats.
+MTMD_API int32_t mtmd_project_proprio(mtmd_context * ctx, const float * proprio, float * embedding);
+
+// `hidden_states` must hold info.action_chunk * info.action_dim * info.llm_dim floats.
+// `actions` receives info.action_chunk * info.action_dim normalized actions.
+MTMD_API int32_t mtmd_predict_action(mtmd_context * ctx, const float * hidden_states, float * actions);
+
 // mtmd_bitmap
 //
 // if bitmap is image:

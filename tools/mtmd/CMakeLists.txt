@@ -44,6 +44,14 @@ target_include_directories(mtmd PRIVATE ../..)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
+# The BitVLA mmproj loader uses the CPU AME extra buffer type when it is
+# available, so its BF16 vision/action linear weights can use the same backend
+# as the I2_S language-model weights.  Keep the reference out of non-AME
+# builds: the implementation is only linked when GGML_RV_AME is enabled.
+if (GGML_RV_AME)
+    target_compile_definitions(mtmd PRIVATE GGML_USE_RV_AME)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties     (mtmd PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(mtmd PRIVATE LLAMA_BUILD)
@@ -88,6 +96,15 @@ add_executable(llama-qwen2vl-cli  deprecation-warning.cpp)
 set(TARGET llama-mtmd-cli)
 add_executable         (${TARGET} mtmd-cli.cpp)
 set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-mtmd-cli)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries  (${TARGET} PRIVATE common mtmd Threads::Threads)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+set(TARGET llama-bitvla-cli)
+add_executable         (${TARGET} bitvla-cli.cpp)
+set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-bitvla-cli)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()

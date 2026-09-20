@@ -28,12 +28,22 @@ if [ "${1:-}" = "huge" ]; then
     echo "Include BIG and HUGE models..."
 fi
 
+# Run the local BitVLA image-loading test with: ./tests.sh bitvla
+RUN_BITVLA_TESTS=false
+if [ "${1:-}" = "bitvla" ]; then
+    RUN_BITVLA_TESTS=true
+    echo "Include BitVLA vision test..."
+fi
+
 ###############
 
 arr_prefix=()
 arr_hf=()
 arr_extra_args=()
 arr_file=()
+arr_model=()
+arr_mmproj=()
+arr_check=()
 
 add_test_vision() {
     local hf=$1
@@ -46,6 +56,9 @@ add_test_vision() {
     arr_hf+=("$hf")
     arr_extra_args+=("$extra_args")
     arr_file+=("test-1.jpeg")
+    arr_model+=("")
+    arr_mmproj+=("")
+    arr_check+=("answer")
 }
 
 add_test_audio() {
@@ -59,8 +72,29 @@ add_test_audio() {
     arr_hf+=("$hf")
     arr_extra_args+=("$extra_args")
     arr_file+=("test-2.mp3")
+    arr_model+=("")
+    arr_mmproj+=("")
+    arr_check+=("answer")
 }
 
+add_test_local_vision() {
+    local model=$1
+    local mmproj=$2
+    shift 2
+    local extra_args=""
+    if [ $# -gt 0 ]; then
+        extra_args=$(printf " %q" "$@")
+    fi
+    arr_prefix+=("[vision-local]")
+    arr_hf+=("")
+    arr_extra_args+=("$extra_args")
+    arr_file+=("test-1.jpeg")
+    arr_model+=("$model")
+    arr_mmproj+=("$mmproj")
+    arr_check+=("vision")
+}
+
+if [ "$RUN_BITVLA_TESTS" = false ]; then
 add_test_vision "ggml-org/SmolVLM-500M-Instruct-GGUF:Q8_0"
 add_test_vision "ggml-org/SmolVLM2-2.2B-Instruct-GGUF:Q4_K_M"
 add_test_vision "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF:Q8_0"
@@ -112,6 +146,18 @@ if [ "$RUN_HUGE_TESTS" = true ]; then
     add_test_vision "ggml-org/Qwen2.5-VL-72B-Instruct-GGUF:Q4_K_M"
     add_test_vision "ggml-org/Llama-4-Scout-17B-16E-Instruct-GGUF:IQ1_S"
 fi
+fi
+
+if [ "$RUN_BITVLA_TESTS" = true ]; then
+    bitvla_text_gguf="${BITVLA_TEXT_GGUF:-$PROJ_ROOT/../models/bitnet-model-gguf/ggml-model-i2s-bitnet.gguf}"
+    bitvla_mmproj_gguf="${BITVLA_MMPROJ_GGUF:-$PROJ_ROOT/../models/ft-bitvla-bitsiglipL-224px-libero_object-bf16/gguf/mmproj-bitvla-f16.gguf}"
+    if [ ! -f "$bitvla_text_gguf" ] || [ ! -f "$bitvla_mmproj_gguf" ]; then
+        echo "BitVLA test requires a text GGUF and an mmproj GGUF."
+        echo "Set BITVLA_TEXT_GGUF and BITVLA_MMPROJ_GGUF to override the defaults."
+        exit 1
+    fi
+    add_test_local_vision "$bitvla_text_gguf" "$bitvla_mmproj_gguf" --jinja --no-warmup -c 512
+fi
 
 # these models always give the wrong answer, not sure why
 # add_test_vision "ggml-org/SmolVLM-Instruct-GGUF:Q4_K_M"
@@ -134,33 +180,61 @@ for i in "${!arr_hf[@]}"; do
     hf="${arr_hf[$i]}"
     extra_args="${arr_extra_args[$i]}"
     inp_file="${arr_file[$i]}"
+    model="${arr_model[$i]}"
+    mmproj="${arr_mmproj[$i]}"
+    check="${arr_check[$i]}"
 
-    echo "Running test with binary: $bin and HF model: $hf"
+    test_id="$hf"
+    if [ -n "$model" ]; then
+        test_id="$model"
+    fi
+
+    echo "Running test with binary: $bin and model: $test_id"
     echo ""
     echo ""
 
-    cmd="$(printf %q "$PROJ_ROOT/build/bin/$bin") \
-        -hf $(printf %q "$hf") \
-        --image $(printf %q "$SCRIPT_DIR/$inp_file") \
-        --temp 0 -n 128 \
-        ${extra_args}"
+    if [ -n "$model" ]; then
+        cmd="$(printf %q "$PROJ_ROOT/build/bin/$bin") \
+            -m $(printf %q "$model") \
+            --mmproj $(printf %q "$mmproj") \
+            --image $(printf %q "$SCRIPT_DIR/$inp_file") \
+            --temp 0 -n 128 \
+            ${extra_args}"
+    else
+        cmd="$(printf %q "$PROJ_ROOT/build/bin/$bin") \
+            -hf $(printf %q "$hf") \
+            --image $(printf %q "$SCRIPT_DIR/$inp_file") \
+            --temp 0 -n 128 \
+            ${extra_args}"
+    fi
 
     # if extra_args does not contain -p, we add a default prompt
     if ! [[ "$extra_args" =~ "-p" ]]; then
         cmd+=" -p \"what is the publisher name of the newspaper?\""
     fi
 
-    output=$(eval "$cmd" 2>&1 | tee /dev/tty)
-
-    echo "$output" > $SCRIPT_DIR/output/$bin-$(echo "$hf" | tr '/' '-').log
-
-    # either contains "new york" or both "men" and "walk"
-    if echo "$output" | grep -iq "new york" \
-            || (echo "$output" | grep -iq "men" && echo "$output" | grep -iq "walk")
-    then
-        result="$prefix \033[32mOK\033[0m:   $hf"
+    if [ -t 1 ] && [ -e /dev/tty ]; then
+        output=$(eval "$cmd" 2>&1 | tee /dev/tty)
     else
-        result="$prefix \033[31mFAIL\033[0m: $hf"
+        output=$(eval "$cmd" 2>&1)
+        printf '%s\n' "$output"
+    fi
+
+    echo "$output" > $SCRIPT_DIR/output/$bin-$(echo "$test_id" | tr '/' '-').log
+
+    # Remote tests check the generated answer; local BitVLA checks vision loading.
+    if [ "$check" = "vision" ]; then
+        if echo "$output" | grep -q "has vision encoder" \
+                && echo "$output" | grep -q "image decoded"; then
+            result="$prefix \033[32mOK\033[0m:   $test_id"
+        else
+            result="$prefix \033[31mFAIL\033[0m: $test_id"
+        fi
+    elif echo "$output" | grep -iq "new york" \
+            || (echo "$output" | grep -iq "men" && echo "$output" | grep -iq "walk"); then
+        result="$prefix \033[32mOK\033[0m:   $test_id"
+    else
+        result="$prefix \033[31mFAIL\033[0m: $test_id"
     fi
     echo -e "$result"
     arr_res+=("$result")
