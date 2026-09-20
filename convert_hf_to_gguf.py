@@ -555,6 +555,7 @@ class ModelBase:
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
+                logical_shape = data.shape
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
@@ -634,7 +635,12 @@ class ModelBase:
                     data_qtype = gguf.GGMLQuantizationType.F16
                     data = gguf.quants.quantize(data, data_qtype)
 
-                shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+                # I2_S carries a tensor-global scale suffix, so its packed byte
+                # shape cannot be used to reconstruct logical dimensions.
+                # Preserve the source shape explicitly for the GGUF writer.
+                shape = logical_shape if data_qtype == gguf.GGMLQuantizationType.I2_S else (
+                    gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
+                )
 
                 # reverse shape to make it similar to the internal ggml dimension order
                 shape_str = f"{{{', '.join(str(n) for n in reversed(shape))}}}"
@@ -642,7 +648,12 @@ class ModelBase:
                 # n_dims is implicit in the shape
                 logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
-                self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+                self.gguf_writer.add_tensor(
+                    new_name,
+                    data,
+                    raw_shape=shape if data_qtype == gguf.GGMLQuantizationType.I2_S else None,
+                    raw_dtype=data_qtype,
+                )
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
@@ -3187,6 +3198,29 @@ class BitnetModel(TextModel):
             # transform weight into 1/0/-1 (in fp32)
             data_torch = self.weight_quant(data_torch)
 
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("BitNetForCausalLM")
+class Bitnet25Model(BitnetModel):
+    model_arch = gguf.MODEL_ARCH.BITNET_25
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        TextModel.set_gguf_parameters(self)
+        self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+        head_dim = self.hparams.get(
+            "head_dim",
+            self.hparams["hidden_size"] // self.hparams["num_attention_heads"],
+        )
+        self.gguf_writer.add_rope_dimension_count(head_dim)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if not name.startswith("language_model."):
+            return
+        name = name.removeprefix("language_model.")
         yield from super().modify_tensors(data_torch, name, bid)
 
 

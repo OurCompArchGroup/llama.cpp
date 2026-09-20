@@ -155,6 +155,11 @@ llm_build_bitnet::llm_build_bitnet(const llama_model & model, const llm_graph_pa
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
+    if (is_bitnet_25 && cparams.embeddings) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     // lm_head
     cur = build_lora_mm(model.tok_embd, cur);
 

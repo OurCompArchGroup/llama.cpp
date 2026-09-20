@@ -354,7 +354,16 @@ class GGUFWriter:
         else:
             dtype = raw_dtype
             if tensor_dtype == np.uint8:
-                tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
+                if raw_dtype == GGMLQuantizationType.I2_S:
+                    n_elements = prod(tensor_shape)
+                    expected_nbytes = n_elements // 4 + 32
+                    if n_elements % 4 != 0 or tensor_nbytes != expected_nbytes:
+                        raise ValueError(
+                            f"Invalid I2_S tensor: shape {tuple(tensor_shape)} needs "
+                            f"{expected_nbytes} bytes, got {tensor_nbytes}"
+                        )
+                else:
+                    tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
 
         # make sure there is at least one tensor before splitting
         if len(self.tensors[-1]) > 0:

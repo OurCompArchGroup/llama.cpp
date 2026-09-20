@@ -12,6 +12,8 @@ import numpy as np
 
 
 def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    if quant_type == GGMLQuantizationType.I2_S:
+        raise ValueError("I2_S has tensor-global scale data and no row-wise byte shape")
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % block_size != 0:
         raise ValueError(f"Quantized tensor row size ({shape[-1]}) is not a multiple of {quant_type.name} block size ({block_size})")
@@ -19,6 +21,8 @@ def quant_shape_to_byte_shape(shape: Sequence[int], quant_type: GGMLQuantization
 
 
 def quant_shape_from_byte_shape(shape: Sequence[int], quant_type: GGMLQuantizationType) -> tuple[int, ...]:
+    if quant_type == GGMLQuantizationType.I2_S:
+        raise ValueError("I2_S byte shape does not uniquely encode its logical tensor shape")
     block_size, type_size = GGML_QUANT_SIZES[quant_type]
     if shape[-1] % type_size != 0:
         raise ValueError(f"Quantized tensor bytes per row ({shape[-1]}) is not a multiple of {quant_type.name} type size ({type_size})")
@@ -58,10 +62,65 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         return data.astype(np.float32, copy=False)
     elif qtype == GGMLQuantizationType.F16:
         return data.astype(np.float16, copy=False)
+    elif qtype == GGMLQuantizationType.I2_S:
+        return quantize_i2_s(data)
     elif (q := _type_traits.get(qtype)) is not None:
         return q.quantize(data)
     else:
         raise NotImplementedError(f"Quantization for {qtype.name} is not yet implemented")
+
+
+def _quantize_i2_s_array(data: np.ndarray) -> np.ndarray:
+    """Encode ternary weights in llama.cpp's tensor-global-scale I2_S format.
+
+    I2_S is not row-block quantization: all values share one FP32 scale stored
+    in a 32-byte tail.  Its four 32-element groups in each 128-element block
+    are interleaved bitwise, matching ggml's quantize_i2_s().
+    """
+    values = np.asarray(data, dtype=np.float32)
+    if values.size == 0 or values.size % 128 != 0:
+        raise QuantError(f"I2_S requires a non-empty tensor with a multiple of 128 elements, got {values.size}")
+
+    flat = values.reshape(-1)
+    scale = np.float32(np.max(np.abs(flat)))
+    blocks = flat.reshape((-1, 128))
+
+    # GGML I2_S codes: 00 -> -1, 01/11 -> 0, 10 -> +1.  BitVLA's
+    # BitLinear tensors are ternary already; using signs here preserves that
+    # trained representation while recording its tensor-global magnitude.
+    codes = np.where(
+        blocks > np.float32(1e-6), np.uint8(2),
+        np.where(blocks < np.float32(-1e-6), np.uint8(0), np.uint8(1)),
+    ).reshape((-1, 4, 32))
+
+    packed = (
+        (codes[:, 0, :] << 6) |
+        (codes[:, 1, :] << 4) |
+        (codes[:, 2, :] << 2) |
+        codes[:, 3, :]
+    ).astype(np.uint8, copy=False).reshape(-1)
+
+    # The C implementation writes eight identical FP32 values, reserving a
+    # fixed 32-byte suffix even though only the first one is consumed.
+    return np.concatenate((packed, np.full(8, scale, dtype=np.float32).view(np.uint8)))
+
+
+def quantize_i2_s(data: np.ndarray | LazyNumpyTensor) -> np.ndarray | LazyNumpyTensor:
+    if isinstance(data, LazyNumpyTensor):
+        def packed_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
+            n_elements = int(np.prod(shape))
+            if n_elements == 0 or n_elements % 128 != 0:
+                raise QuantError(
+                    f"I2_S requires a non-empty tensor with a multiple of 128 elements, got {n_elements}"
+                )
+            return (n_elements // 4 + 32,)
+
+        return LazyNumpyTensor._wrap_fn(
+            _quantize_i2_s_array,
+            meta_noop=(np.uint8, packed_shape),
+        )(data)
+
+    return _quantize_i2_s_array(data)
 
 
 def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
