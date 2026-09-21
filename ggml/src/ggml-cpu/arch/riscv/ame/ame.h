@@ -77,14 +77,15 @@ static inline int ggml_ame_can_use_i2_s(int M, int N, int K) {
     return 1;
 }
 
-// The ordinary I2_S implementation consumes row-local 128-element blocks.
-// The native FP2PACK4 path can instead decode the legacy flat stream and pad
-// its final K block in a temporary tile.  Keep this separate from the normal
-// predicate: the portable CPU/AME paths still require K to be 128-aligned.
+// The ordinary I2_S implementation consumes full row-local 128-element
+// blocks.  The native FP2PACK4 path supports a partial final row block by
+// consuming its zero-encoded physical padding in a temporary tile.  Keep this
+// separate from the normal predicate: the portable CPU/AME paths still
+// require K to be 128-aligned.
 static inline int ggml_ame_can_use_i2_s_native_padded(int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return 0;
-    // I2_S has four 2-bit values per byte.  The on-disk flat stream cannot
-    // represent a row whose logical length is not byte-aligned.
+    // I2_S has four 2-bit values per byte, so logical rows must be byte
+    // aligned before their final 128-element block is padded.
     if (K % 4 != 0) return 0;
     if (M < AME_TILE_M) return 0;
     if (N < AME_TILE_N) return 0;

@@ -55,6 +55,33 @@ class TestI2SGGUF(unittest.TestCase):
             self.assertEqual(tensor.n_bytes, packed.size)
             np.testing.assert_array_equal(tensor.data, packed)
 
+    def test_row_local_tail_padding(self) -> None:
+        shape = (3, 4304)
+        source = np.zeros(shape, dtype=np.float32)
+        source[0, -1] = -1.0
+        source[1, 0] = 1.0
+        packed = quantize_i2_s(source)
+
+        # K=4304 has a 80-element final block.  Each row reserves a complete
+        # 128-element block (1088 bytes), so row one's tail cannot overlap
+        # row two's first block.
+        row_bytes = ((shape[-1] + 127) // 128) * 32
+        self.assertEqual(packed.size, shape[0] * row_bytes + 32)
+        self.assertEqual(packed[row_bytes], 0x95)
+        self.assertTrue(np.all(packed[row_bytes - 12:row_bytes] == 0x55))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "i2_s_tail.gguf"
+            writer = GGUFWriter(path, "clip")
+            writer.add_tensor("weight", packed, raw_shape=shape, raw_dtype=GGMLQuantizationType.I2_S)
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            tensor = GGUFReader(path).tensors[0]
+            self.assertEqual(tensor.n_bytes, packed.size)
+            np.testing.assert_array_equal(tensor.data, packed)
+
     def test_rejects_missing_scale_storage(self) -> None:
         writer = GGUFWriter("unused.gguf", "clip")
         with self.assertRaisesRegex(ValueError, "Invalid I2_S tensor"):

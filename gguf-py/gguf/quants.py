@@ -78,12 +78,20 @@ def _quantize_i2_s_array(data: np.ndarray) -> np.ndarray:
     are interleaved bitwise, matching ggml's quantize_i2_s().
     """
     values = np.asarray(data, dtype=np.float32)
-    if values.size == 0 or values.size % 128 != 0:
-        raise QuantError(f"I2_S requires a non-empty tensor with a multiple of 128 elements, got {values.size}")
+    if values.size == 0 or values.ndim == 0 or values.shape[-1] % 4 != 0:
+        raise QuantError(
+            f"I2_S requires a non-empty tensor with a row size that is a multiple of 4, got shape {values.shape}"
+        )
 
-    flat = values.reshape(-1)
-    scale = np.float32(np.max(np.abs(flat)))
-    blocks = flat.reshape((-1, 128))
+    rows = values.reshape((-1, values.shape[-1]))
+    k = rows.shape[-1]
+    row_bytes = ((k + 127) // 128) * 32
+    scale = np.float32(np.max(np.abs(rows)))
+    # A physical tail is read by full-tile kernels, so use zero values rather
+    # than leaving the unused 2-bit lanes as the encoding for -1.
+    padded = np.zeros((rows.shape[0], row_bytes * 4), dtype=np.float32)
+    padded[:, :k] = rows
+    blocks = padded.reshape((-1, 128))
 
     # GGML I2_S codes: 00 -> -1, 01/11 -> 0, 10 -> +1.  BitVLA's
     # BitLinear tensors are ternary already; using signs here preserves that
@@ -98,22 +106,23 @@ def _quantize_i2_s_array(data: np.ndarray) -> np.ndarray:
         (codes[:, 1, :] << 4) |
         (codes[:, 2, :] << 2) |
         codes[:, 3, :]
-    ).astype(np.uint8, copy=False).reshape(-1)
+    ).astype(np.uint8, copy=False).reshape((rows.shape[0], -1))
 
     # The C implementation writes eight identical FP32 values, reserving a
     # fixed 32-byte suffix even though only the first one is consumed.
-    return np.concatenate((packed, np.full(8, scale, dtype=np.float32).view(np.uint8)))
+    return np.concatenate((packed.reshape(-1), np.full(8, scale, dtype=np.float32).view(np.uint8)))
 
 
 def quantize_i2_s(data: np.ndarray | LazyNumpyTensor) -> np.ndarray | LazyNumpyTensor:
     if isinstance(data, LazyNumpyTensor):
         def packed_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
             n_elements = int(np.prod(shape))
-            if n_elements == 0 or n_elements % 128 != 0:
+            if n_elements == 0 or len(shape) == 0 or shape[-1] % 4 != 0:
                 raise QuantError(
-                    f"I2_S requires a non-empty tensor with a multiple of 128 elements, got {n_elements}"
+                    f"I2_S requires a non-empty tensor with a row size that is a multiple of 4, got shape {shape}"
                 )
-            return (n_elements // 4 + 32,)
+            row_bytes = ((shape[-1] + 127) // 128) * 32
+            return (n_elements // shape[-1] * row_bytes + 32,)
 
         return LazyNumpyTensor._wrap_fn(
             _quantize_i2_s_array,

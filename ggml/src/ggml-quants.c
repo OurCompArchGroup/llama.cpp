@@ -2274,10 +2274,11 @@ size_t quantize_i2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     GGML_UNUSED(imatrix);
 
     GGML_ASSERT(nrow > 0);
-    GGML_ASSERT(n_per_row % 128 == 0);
+    GGML_ASSERT(n_per_row % 4 == 0);
 
     const int64_t n = nrow * n_per_row;
     uint8_t * out = (uint8_t *) dst;
+    const size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
 
     double max = 0.0;
     for (int64_t i = 0; i < n; ++i) {
@@ -2285,28 +2286,40 @@ size_t quantize_i2_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     }
 
     const float scale = (float) max;
-    memset(out, 0, (size_t) n / 4);
+    // Code 01 denotes zero.  Initialize every complete row-local block with
+    // it so the physical tail of a partial final block is safe for kernels
+    // that consume a full K tile.
+    memset(out, 0x55, (size_t) nrow * row_size);
 
-    for (int64_t blk = 0; blk < n / 128; ++blk) {
-        for (int64_t j = 0; j < 128; ++j) {
-            const int group_idx = (int) (j / 32);
-            const int group_pos = (int) (j % 32);
-            const float v = src[blk * 128 + j];
-            uint8_t q = 1;
-            if (fabsf(v) >= 1e-6f) {
-                q = (v * scale > 0.0f) ? 2 : 0;
+    for (int64_t row = 0; row < nrow; ++row) {
+        uint8_t * row_out = out + (size_t) row * row_size;
+        const float * row_src = src + row * n_per_row;
+        for (int64_t blk = 0; blk < (n_per_row + 127) / 128; ++blk) {
+            const int64_t row_offset = blk * 128;
+            const int64_t valid = MIN((int64_t) 128, n_per_row - row_offset);
+            for (int64_t j = 0; j < valid; ++j) {
+                const int group_idx = (int) (j / 32);
+                const int group_pos = (int) (j % 32);
+                const float v = row_src[row_offset + j];
+                uint8_t q = 1;
+                if (fabsf(v) >= 1e-6f) {
+                    q = (v * scale > 0.0f) ? 2 : 0;
+                }
+                const uint8_t shift = (uint8_t) (6 - 2 * group_idx);
+                const uint8_t mask = (uint8_t) (0x3u << shift);
+                uint8_t * packed = &row_out[blk * 32 + group_pos];
+                *packed = (uint8_t) ((*packed & ~mask) | (q << shift));
             }
-            out[blk * 32 + group_pos] |= (uint8_t) (q << (6 - 2 * group_idx));
         }
     }
 
-    float * scale_ptr = (float *) (out + n / 4);
+    float * scale_ptr = (float *) (out + (size_t) nrow * row_size);
     scale_ptr[0] = scale;
     for (int i = 1; i < 8; ++i) {
         scale_ptr[i] = scale;
     }
 
-    return (size_t) n / 4 + 32;
+    return (size_t) nrow * row_size + 32;
 }
 
 void dequantize_row_i2_s(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, float scale) {

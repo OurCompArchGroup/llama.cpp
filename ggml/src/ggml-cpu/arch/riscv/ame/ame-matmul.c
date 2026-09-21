@@ -262,7 +262,8 @@ static inline void ggml_ame_quantize_block_f32_to_i8_scale(const float * x, int 
 
 static inline float ggml_ame_i2_s_tensor_scale(const void * src0, int64_t M, int64_t K) {
     const uint8_t * base = (const uint8_t *) src0;
-    const size_t packed_bytes_total = (size_t) M * (size_t) K / 4;
+    const size_t row_bytes = (size_t) ((K + 127) / 128) * 32;
+    const size_t packed_bytes_total = (size_t) M * row_bytes;
     return *(const float *) (base + packed_bytes_total);
 }
 
@@ -734,19 +735,6 @@ static inline uint8_t ggml_ame_i2_s_to_fp2pack4_code(const uint8_t * row, int64_
     return code == 0 ? 3 : (code == 2 ? 1 : 0);
 }
 
-// I2_S GGUFs produced before row-tail support pack the entire tensor as one
-// stream of 128-element blocks.  For K % 128 != 0, a matrix row therefore
-// starts part way through a packed block.  Decode by logical tensor index
-// before creating the row-local FP2PACK4 tile; treating src + row*K/4 as a
-// normal I2_S row would use the wrong weights after row zero.
-static inline uint8_t ggml_ame_i2_s_flat_to_fp2pack4_code(
-        const uint8_t * packed_weights, int64_t logical_index) {
-    const uint8_t packed = packed_weights[(size_t) (logical_index / 128) * 32 +
-                                          (size_t) (logical_index % 32)];
-    const uint8_t code = (packed >> (6 - 2 * ((logical_index % 128) / 32))) & 0x3;
-    return code == 0 ? 3 : (code == 2 ? 1 : 0);
-}
-
 static inline void ggml_ame_pack_i2_s_fp2pack4_row64(
         const uint8_t * row, int64_t k0, uint8_t * dst) {
     GGML_ASSERT((k0 % AME_I2_NATIVE_TILE_K) == 0);
@@ -755,26 +743,6 @@ static inline void ggml_ame_pack_i2_s_fp2pack4_row64(
         const uint8_t q1 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 1);
         const uint8_t q2 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 2);
         const uint8_t q3 = ggml_ame_i2_s_to_fp2pack4_code(row, k0 + k + 3);
-        dst[k / 4] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
-    }
-}
-
-static inline void ggml_ame_pack_i2_s_flat_fp2pack4_row64(
-        const uint8_t * packed_weights, int64_t row, int64_t K,
-        int64_t k0, uint8_t * dst) {
-    const int valid = (int) MIN(AME_I2_NATIVE_TILE_K, K - k0);
-
-    GGML_ASSERT(valid >= 0 && valid <= AME_I2_NATIVE_TILE_K);
-    GGML_ASSERT((valid % 4) == 0);
-
-    // The caller zeroes dst first.  Its remaining bytes are the K tail's
-    // zero padding and must stay encoded as FP2PACK4 zero.
-    for (int k = 0; k < valid; k += 4) {
-        const int64_t base = row * K + k0 + k;
-        const uint8_t q0 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 0);
-        const uint8_t q1 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 1);
-        const uint8_t q2 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 2);
-        const uint8_t q3 = ggml_ame_i2_s_flat_to_fp2pack4_code(packed_weights, base + 3);
         dst[k / 4] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
     }
 }
@@ -795,7 +763,6 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
     const int64_t N = ne11; // tokens / activation rows
     const int64_t K = ne00;
     const int64_t Kpad = ((K + 127) / 128) * 128;
-    const int row_aligned_128 = (K % 128) == 0;
 
     GGML_ASSERT(ne00 == ne10);
     GGML_ASSERT((K % 4) == 0);
@@ -804,7 +771,7 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
     const float * restrict activations = (const float *) src1;
     float * restrict out = (float *) dst;
     const float i2_scale = ggml_ame_i2_s_tensor_scale(src0, M, K);
-    const size_t weight_row_bytes = (size_t) K / 4;
+    const size_t weight_row_bytes = (size_t) ((K + 127) / 128) * 32;
 
     const size_t required_wsize = ggml_ame_i2_s_fp2pack4_workspace_size();
     uint8_t * workspace = (uint8_t *) work_data;
@@ -835,8 +802,8 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
     }
 
     ame_assert_phys_contiguous();
-    if (!row_aligned_128) {
-        AME_LOG("native I2_S: padding flat K=%lld to Kpad=%lld for row-local FP2PACK4 tiles",
+    if (Kpad != K) {
+        AME_LOG("native I2_S: padding row K=%lld to Kpad=%lld for FP2PACK4 tiles",
                 (long long) K, (long long) Kpad);
     }
 
@@ -871,13 +838,8 @@ void ggml_ame_mul_mat_i2_s_fp2pack4(
                 for (int m = 0; m < mmax; ++m) {
                     uint8_t * dst_row = &tile_b[m * (AME_I2_NATIVE_TILE_K / 4)];
                     if (k0 < K) {
-                        if (row_aligned_128) {
-                            const uint8_t * row = weights + (size_t) (m0 + m) * weight_row_bytes;
-                            ggml_ame_pack_i2_s_fp2pack4_row64(row, k0, dst_row);
-                        } else {
-                            ggml_ame_pack_i2_s_flat_fp2pack4_row64(
-                                weights, m0 + m, K, k0, dst_row);
-                        }
+                        const uint8_t * row = weights + (size_t) (m0 + m) * weight_row_bytes;
+                        ggml_ame_pack_i2_s_fp2pack4_row64(row, k0, dst_row);
                     }
                 }
 

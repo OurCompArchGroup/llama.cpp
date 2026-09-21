@@ -8336,7 +8336,7 @@ int32_t llama_model_get_token_embedding(
         case GGML_TYPE_I2_S:
             {
                 float scale;
-                const size_t scale_offset = (size_t) ggml_nelements(tensor) / 4;
+                const size_t scale_offset = ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) ggml_nrows(tensor);
                 ggml_backend_tensor_get(tensor, &scale, scale_offset, sizeof(scale));
                 dequantize_row_i2_s(row.data(), embedding, n_embd, scale);
             } break;

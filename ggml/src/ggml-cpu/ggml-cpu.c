@@ -1179,7 +1179,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-    const float * i2_scale = type == GGML_TYPE_I2_S ? (const float *) ((const uint8_t *) src0->data + (ggml_nelements(src0) / 4)) : NULL;
+    const float * i2_scale = type == GGML_TYPE_I2_S
+        ? (const float *) ((const uint8_t *) src0->data + ggml_row_size(type, ne00) * ggml_nrows(src0))
+        : NULL;
     const float * act_scales = type == GGML_TYPE_I2_S && src1->type != vec_dot_type ? (const float *) ((const char *) params->wdata + ne13*row_size*ne11*ne12) : NULL;
     const int32_t * act_sums = type == GGML_TYPE_I2_S && src1->type != vec_dot_type ? (const int32_t *) ((const char *) act_scales + ne13*ne11*ne12*sizeof(float)) : NULL;
 

@@ -14,7 +14,7 @@
 
 static inline float ggml_i2_s_scale(const ggml_tensor * tensor) {
     const uint8_t * base = (const uint8_t *) tensor->data;
-    const size_t packed_bytes_total = (size_t) ggml_nelements(tensor) / 4;
+    const size_t packed_bytes_total = ggml_row_size(tensor->type, tensor->ne[0]) * ggml_nrows(tensor);
     return *(const float *) (base + packed_bytes_total);
 }
 
@@ -4713,7 +4713,7 @@ static void ggml_compute_forward_get_rows_i2_s(
     const int ir1 = MIN(ir0 + dr, nr);
 
     const uint8_t * base = (const uint8_t *) src0->data;
-    const size_t packed_bytes_total = (size_t) ggml_nelements(src0) / 4;
+    const size_t packed_bytes_total = ggml_row_size(src0->type, src0->ne[0]) * ggml_nrows(src0);
     const float scale = *(const float *) (base + packed_bytes_total);
 
     for (int64_t i = ir0; i < ir1; ++i) {

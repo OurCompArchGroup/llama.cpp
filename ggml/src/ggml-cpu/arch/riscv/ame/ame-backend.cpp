@@ -133,9 +133,9 @@ static bool ame_use_native_i2_s() {
 }
 
 static bool ame_can_use_i2_s_shape(int M, int N, int K) {
-    // NEMU's native FP2PACK4 wrapper has an internal tail-padding path for
-    // legacy flat I2_S tensors.  Do not expose this to the portable AME or
-    // generic CPU kernels: both still require full 128-element I2_S rows.
+    // NEMU's native FP2PACK4 wrapper consumes I2_S's row-local zero padding
+    // for a partial final 128-element block.  Do not expose this to the
+    // portable AME path, which still requires full I2_S rows.
     return ame_use_native_i2_s()
         ? ggml_ame_can_use_i2_s_native_padded(M, N, K)
         : ggml_ame_can_use_i2_s(M, N, K);

@@ -1296,7 +1296,10 @@ size_t ggml_type_size(enum ggml_type type) {
 size_t ggml_row_size(enum ggml_type type, int64_t ne) {
     assert(ne % ggml_blck_size(type) == 0);
     if (type == GGML_TYPE_I2_S) {
-        return (size_t) ne/4;
+        // I2_S rows are independently packed into 128-element blocks.  A
+        // partial final block still occupies its complete 32-byte payload so
+        // the next row can never be consumed as tail data.
+        return (size_t) ((ne + 127) / 128) * 32;
     }
     return ggml_type_size(type)*ne/ggml_blck_size(type);
 }
@@ -7582,6 +7585,12 @@ size_t ggml_quantize_chunk(
 
     GGML_ASSERT(start % type_traits[type].blck_size == 0);
     GGML_ASSERT(start % n_per_row == 0);
+
+    // I2_S carries one scale suffix for the complete logical tensor.  It
+    // therefore cannot be split into independently quantized chunks: every
+    // chunk would calculate a different scale and append an overlapping
+    // suffix.  Its caller must pass every row at once.
+    GGML_ASSERT(type != GGML_TYPE_I2_S || start == 0);
 
     ggml_quantize_init(type); // this is noop if already initialized
 

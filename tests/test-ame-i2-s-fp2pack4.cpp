@@ -130,24 +130,61 @@ static bool test_host_and_fp2_equivalence() {
     return true;
 }
 
-static bool test_flat_tail_decode() {
+static bool test_row_local_tail_storage() {
     constexpr int64_t M = 3;
-    constexpr int64_t K = 4304; // deliberately not a multiple of 128
-    const int64_t elements = M * K;
-    std::vector<uint8_t> packed((size_t) ((elements + 127) / 128) * 32 + 32, 0);
-
-    for (int64_t index = 0; index < elements; ++index) {
-        const uint8_t code = (uint8_t) ((index % 3) == 0 ? 0 : (index % 3) == 1 ? 1 : 2);
-        packed[(size_t) (index / 128) * 32 + (size_t) (index % 32)] |=
-            (uint8_t) (code << (6 - 2 * ((index % 128) / 32)));
-    }
-
+    constexpr int64_t K = 4304;
+    std::vector<float> source((size_t) M * K);
     for (int64_t row = 0; row < M; ++row) {
         for (int64_t k = 0; k < K; ++k) {
-            const int64_t index = row * K + k;
-            const uint8_t expected = (uint8_t) ((index % 3) == 0 ? 0 : (index % 3) == 1 ? 1 : 2);
-            if (code_at(packed.data(), index) != expected) {
-                std::fprintf(stderr, "flat I2_S tail decode mismatch at row=%lld k=%lld\n",
+            source[(size_t) row * K + k] = (float) (((row + k) % 3) - 1);
+        }
+    }
+    const size_t row_bytes = (size_t) ((K + 127) / 128) * 32;
+    if (ggml_row_size(GGML_TYPE_I2_S, K) != row_bytes) {
+        std::fprintf(stderr, "I2_S row stride mismatch\n");
+        return false;
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4096,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    ggml_tensor * tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I2_S, K, M);
+    if (ggml_nbytes(tensor) != (size_t) M * row_bytes + 32) {
+        std::fprintf(stderr, "I2_S tensor storage size mismatch\n");
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_free(ctx);
+
+    std::vector<uint8_t> packed((size_t) M * row_bytes + 32);
+    if (quantize_i2_s(source.data(), packed.data(), M, K, nullptr) != packed.size()) {
+        std::fprintf(stderr, "row-local I2_S storage size mismatch\n");
+        return false;
+    }
+    // Exercise the public whole-tensor quantization entry point as well.  It
+    // must preserve the same row-local stride and one trailing scale area.
+    std::vector<uint8_t> packed_chunk(packed.size());
+    if (ggml_quantize_chunk(GGML_TYPE_I2_S, source.data(), packed_chunk.data(), 0, M, K, nullptr) != packed.size() ||
+            packed_chunk != packed) {
+        std::fprintf(stderr, "public I2_S quantization layout mismatch\n");
+        return false;
+    }
+    const float scale = *(const float *) (packed.data() + M * row_bytes);
+    for (int64_t row = 0; row < M; ++row) {
+        std::vector<float> decoded((size_t) K);
+        dequantize_row_i2_s(packed.data() + (size_t) row * row_bytes, decoded.data(), K, scale);
+        for (int64_t k = 0; k < K; ++k) {
+            if (decoded[(size_t) k] != source[(size_t) row * K + k]) {
+                std::fprintf(stderr, "row-local I2_S tail mismatch row=%lld k=%lld\n",
+                             (long long) row, (long long) k);
+                return false;
+            }
+        }
+        for (int64_t k = K; k < (int64_t) row_bytes * 4; ++k) {
+            if (code_at(packed.data() + (size_t) row * row_bytes, k) != 1) {
+                std::fprintf(stderr, "row-local I2_S padding is not zero at row=%lld k=%lld\n",
                              (long long) row, (long long) k);
                 return false;
             }
@@ -157,7 +194,7 @@ static bool test_flat_tail_decode() {
 }
 
 int main() {
-    if (!test_host_and_fp2_equivalence() || !test_flat_tail_decode()) {
+    if (!test_host_and_fp2_equivalence() || !test_row_local_tail_storage()) {
         return 1;
     }
     std::puts("AME I2_S/FP2PACK4 host equivalence: PASS");

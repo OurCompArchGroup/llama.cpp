@@ -355,9 +355,14 @@ class GGUFWriter:
             dtype = raw_dtype
             if tensor_dtype == np.uint8:
                 if raw_dtype == GGMLQuantizationType.I2_S:
+                    if not tensor_shape or tensor_shape[-1] % 4 != 0:
+                        raise ValueError(
+                            f"Invalid I2_S tensor: shape {tuple(tensor_shape)} needs a row size that is a multiple of 4"
+                        )
                     n_elements = prod(tensor_shape)
-                    expected_nbytes = n_elements // 4 + 32
-                    if n_elements % 4 != 0 or tensor_nbytes != expected_nbytes:
+                    row_bytes = ((tensor_shape[-1] + 127) // 128) * 32
+                    expected_nbytes = (n_elements // tensor_shape[-1]) * row_bytes + 32
+                    if tensor_nbytes != expected_nbytes:
                         raise ValueError(
                             f"Invalid I2_S tensor: shape {tuple(tensor_shape)} needs "
                             f"{expected_nbytes} bytes, got {tensor_nbytes}"

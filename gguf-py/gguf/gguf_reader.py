@@ -326,7 +326,14 @@ class GGUFReader:
             n_elems = int(np.prod(dims))
             np_dims = tuple(reversed(dims.tolist()))
             block_size, type_size = GGML_QUANT_SIZES[ggml_type]
-            n_bytes = n_elems // 4 + 32 if ggml_type == GGMLQuantizationType.I2_S else n_elems * type_size // block_size
+            if ggml_type == GGMLQuantizationType.I2_S:
+                if dims.size == 0 or dims[0] == 0 or dims[0] % 4 != 0:
+                    raise ValueError(f"Invalid I2_S tensor shape {tuple(dims)}")
+                n_rows = n_elems // int(dims[0])
+                row_bytes = ((int(dims[0]) + 127) // 128) * 32
+                n_bytes = n_rows * row_bytes + 32
+            else:
+                n_bytes = n_elems * type_size // block_size
             data_offs = int(start_offs + offset_tensor[0])
             item_type: npt.DTypeLike
             if ggml_type == GGMLQuantizationType.F16:

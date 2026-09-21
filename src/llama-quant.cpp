@@ -120,8 +120,16 @@ static void llama_tensor_dequantize_impl(
     const ggml_type_traits * qtype = ggml_get_type_traits(tensor->type);
     if (tensor->type == GGML_TYPE_I2_S) {
         const uint8_t * data = (const uint8_t *) tensor->data;
-        const float * scale = (const float *) (data + nelements/4);
-        dequantize_row_i2_s(data, f32_output, nelements, scale[0]);
+        const size_t row_bytes = ((size_t) tensor->ne[0] + 127) / 128 * 32;
+        const float * scale = (const float *) (data + row_bytes * (size_t) ggml_nrows(tensor));
+        const int64_t row_elems = tensor->ne[0];
+        const int64_t nrows = ggml_nrows(tensor);
+        GGML_ASSERT(nelements == (size_t) row_elems * nrows);
+        for (int64_t row = 0; row < nrows; ++row) {
+            dequantize_row_i2_s(data + (size_t) row * row_bytes,
+                                f32_output + row * row_elems,
+                                row_elems, scale[0]);
+        }
         return;
     }
     if (ggml_is_quantized(tensor->type)) {
@@ -437,6 +445,17 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
 }
 
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+    // I2_S has a single tensor-global scale suffix, so row chunks are not
+    // independently representable.  Keep the whole tensor in one call even
+    // when the generic quantizer is configured with worker threads.
+    if (new_type == GGML_TYPE_I2_S) {
+        size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
+        if (!ggml_validate_row_data(new_type, new_data, new_size)) {
+            throw std::runtime_error("quantized data validation failed");
+        }
+        return new_size;
+    }
+
     if (nthread < 2) {
         // single-thread
         size_t new_size = ggml_quantize_chunk(new_type, f32_data, new_data, 0, nrows, n_per_row, imatrix);
