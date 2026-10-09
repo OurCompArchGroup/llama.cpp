@@ -473,6 +473,26 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/arch/riscv/ame/ame-backend.h
                 ggml-cpu/arch/riscv/ame/ame.h
             )
+            if (XSAI_BLAS_HOME)
+                if (NOT XSAI_BLAS_LIBRARY)
+                    set(XSAI_BLAS_LIBRARY "${XSAI_BLAS_HOME}/build/linux-xsai/xsai-blas-riscv64-xs.a")
+                endif()
+                if (NOT EXISTS "${XSAI_BLAS_HOME}/include/xsai_blas.h")
+                    message(FATAL_ERROR "xsai-blas headers not found under ${XSAI_BLAS_HOME}/include")
+                endif()
+                if (NOT EXISTS "${XSAI_BLAS_LIBRARY}")
+                    message(FATAL_ERROR "xsai-blas library not found: ${XSAI_BLAS_LIBRARY}")
+                endif()
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_XSAI_BLAS)
+                target_include_directories(${GGML_CPU_NAME} PRIVATE
+                    "${XSAI_BLAS_HOME}/include"
+                    "${XSAI_BLAS_HOME}/3rdparty/dlpack/include")
+                target_link_libraries(${GGML_CPU_NAME} PRIVATE "${XSAI_BLAS_LIBRARY}")
+                target_sources(${GGML_CPU_NAME} PRIVATE
+                    ggml-cpu/arch/riscv/ame/ame-xsai-plan.cpp
+                    ggml-cpu/arch/riscv/ame/ame-xsai-plan.h)
+                message(STATUS "RISC-V AME using xsai-blas: ${XSAI_BLAS_LIBRARY}")
+            endif()
         endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
             set(MARCH_STR "rv64g")

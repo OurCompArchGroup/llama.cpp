@@ -186,6 +186,8 @@ option(GGML_RV_ZVFBFWMA      "ggml: enable riscv zvfbfwma"   OFF)
 option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"     ON)
 option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause "  ON)
 option(GGML_RV_AME           "ggml: enable riscv ame"        OFF)
+set(XSAI_BLAS_HOME "" CACHE PATH "Path to xsai-blas for the RISC-V AME backend")
+set(XSAI_BLAS_LIBRARY "" CACHE FILEPATH "Path to the xsai-blas static archive")
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ${GGML_NATIVE})
 

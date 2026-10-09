@@ -682,17 +682,6 @@ void ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
 void ggml_ame_bf16_profile_reset(void);
 void ggml_ame_bf16_profile_snapshot(ggml_ame_bf16_profile * profile);
 
-// Core AME GEMM function for INT8 matrix multiplication
-// C(M×N) += A(M×K) × B(K×N), where B is transposed in memory
-void ggml_ame_gemm_q8_0(
-    const int8_t * A,
-    const int8_t * B,
-    int32_t * C,
-    int M,
-    int K,
-    int N
-);
-
 void ggml_ame_profile_reset(void);
 void ggml_ame_profile_dump_now(void);
 
@@ -721,20 +710,6 @@ void ggml_ame_repack_q8_0_to_ame64_whole_k(
     int64_t k
 );
 
-// GGML integration wrapper for Q8_0 quantized matrix multiplication
-void ggml_ame_mul_mat_q8_0(
-    const void * src0,
-    const void * src1,
-    void * dst,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne10,
-    int64_t ne11,
-    size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
-    void * work_data,
-    size_t work_size
-);
-
 void ggml_ame_mul_mat_bf16(
     const void * src0,
     const void * src1,
@@ -745,25 +720,6 @@ void ggml_ame_mul_mat_bf16(
     int64_t ne11,
     size_t src1_stride,
     enum ggml_type src1_type,
-    void * work_data,
-    size_t work_size
-);
-
-void ggml_ame_mul_mat_q8_0_ame64(
-    const void * src0,
-    const void * src1_key,
-    const void * src1,
-    void * dst,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne10,
-    int64_t ne11,
-    size_t src1_stride,
-    const int8_t * src0_tile_a,
-    const float * src0_tile_scales,
-    int graph_id,
-    const void * graph_key,
-    uint64_t src1_generation,
     void * work_data,
     size_t work_size
 );
