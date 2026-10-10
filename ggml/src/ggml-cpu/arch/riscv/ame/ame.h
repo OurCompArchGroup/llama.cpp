@@ -43,12 +43,7 @@ static inline int ame_log_enabled(void) {
 #define AME_TILE_M 64
 #define AME_TILE_K 64
 #define AME_TILE_N 64
-#define AME_TILE_M_MAX 128
-#define AME_TILE_N_MAX 128
 #define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
-
-#define AME_Q8_BLOCK_K 32
-#define AME_Q8_PACK_K 64
 
 typedef struct {
     uint64_t tlenb;
@@ -275,11 +270,6 @@ typedef struct {
     uint16_t d;         // scale factor FP16 (same format as block_q4_0)
     int8_t qs[32];      // pre-unpacked 4-bit values to int8 [-8, 7]
 } block_q4_0_ame;
-
-typedef struct {
-    uint16_t d;
-    int8_t qs[AME_Q8_PACK_K];
-} block_q8_ame64;
 
 #define AME_MCFG_INT8  0x02
 #define AME_MCFG_UINT8 0x03
@@ -571,21 +561,6 @@ void ggml_ame_repack_q4_0(
     void * dst,              // Output: block_q4_0_ame array
     const void * src,        // Input: block_q4_0 array
     int64_t nblocks          // Number of Q4_0 blocks
-);
-
-// Experimental Q8_0 -> AME-native packed K64 repack.
-void ggml_ame_repack_q8_0_to_ame64(
-    void * dst,
-    const void * src,
-    int64_t nrows,
-    int64_t k
-);
-
-void ggml_ame_repack_q8_0_to_ame64_whole_k(
-    void * dst,
-    const void * src,
-    int64_t nrows,
-    int64_t k
 );
 
 void ggml_ame_mul_mat_bf16(

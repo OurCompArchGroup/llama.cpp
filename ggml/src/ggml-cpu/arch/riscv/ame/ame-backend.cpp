@@ -144,20 +144,10 @@ static bool ame_parse_env_bool(const char * name) {
 }
 
 
-struct ame_packed_q8_info {
-    void * data = nullptr;
-    size_t size = 0;
-    void * tile_a = nullptr;
-    size_t tile_a_size = 0;
-    float * tile_scales = nullptr;
-    size_t tile_scales_count = 0;
-};
-
 struct ame_buffer_context {
     void * base = nullptr;
     size_t base_size = 0;
     uint64_t generation = 1;
-    std::unordered_map<const ggml_tensor *, ame_packed_q8_info> packed_q8;
     std::vector<ggml_tensor *> tensors;
 };
 
@@ -641,17 +631,6 @@ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struc
 // AME buffer interface
 static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
-    for (auto & it : ctx->packed_q8) {
-        if (it.second.data != nullptr) {
-            ggml_aligned_free(it.second.data, it.second.size);
-        }
-        if (it.second.tile_a != nullptr) {
-            ggml_aligned_free(it.second.tile_a, it.second.tile_a_size);
-        }
-        if (it.second.tile_scales != nullptr) {
-            ggml_aligned_free(it.second.tile_scales, it.second.tile_scales_count * sizeof(float));
-        }
-    }
     if (ctx->base != nullptr) {
         ggml_aligned_free(ctx->base, ctx->base_size);
     }
