@@ -16,6 +16,7 @@
 
 #if defined(GGML_USE_XSAI_BLAS)
 #include <xsai_blas.h>
+static void ame_refresh_q8_weight(const ggml_tensor * tensor);
 #endif
 
 #include <cassert>
@@ -187,6 +188,9 @@ extern "C" void ggml_ame_host_buffer_on_write(
     state.buffers[buffer] = generation;
     if (tensor != nullptr) {
         state.tensors[tensor] = { buffer, generation };
+#if defined(GGML_USE_XSAI_BLAS)
+        ame_refresh_q8_weight(tensor);
+#endif
     }
 }
 
@@ -199,6 +203,9 @@ extern "C" void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) {
     state.buffers.erase(buffer);
     for (auto it = state.tensors.begin(); it != state.tensors.end(); ) {
         if (it->second.buffer == buffer) {
+#if defined(GGML_USE_XSAI_BLAS)
+            ame_xsai_weight_release(it->first);
+#endif
             it = state.tensors.erase(it);
         } else {
             ++it;
@@ -428,6 +435,29 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
 }
 
 #if defined(GGML_USE_XSAI_BLAS)
+static bool ame_q8_compact(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->ne[0] <= 0 ||
+        tensor->ne[1] < 0) {
+        return false;
+    }
+    const int64_t blocks = (tensor->ne[0] + 31) / 32;
+    return tensor->nb[1] == (size_t) blocks * 34u;
+}
+
+/* Buffer and tensor lifecycle only. Canonicalization stays in xsai-blas. */
+static void ame_refresh_q8_weight(const ggml_tensor * tensor) {
+    if (!ame_q8_compact(tensor) || tensor->data == nullptr) {
+        return;
+    }
+    const uint64_t generation = ame_tensor_content_generation(tensor);
+    if (ame_xsai_weight_plan(tensor) != nullptr &&
+        ame_xsai_weight_generation(tensor) == generation) {
+        return;
+    }
+    ame_xsai_weight_refresh_q8(
+        tensor, tensor->data, tensor->ne[1], tensor->ne[0], generation);
+}
+
 static bool ame_q8_plan_op(const ggml_tensor * op) {
     return op != nullptr && op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
         op->src[0] != nullptr && op->src[1] != nullptr &&
@@ -447,6 +477,9 @@ static ame_xsai_q8_key ame_q8_plan_key(const ggml_tensor * op) {
     key.act_nb3 = activation->nb[3];
     key.weight_nb0 = weight->nb[0];
     key.weight_nb1 = weight->nb[1];
+    key.weight_identity = weight;
+    ame_refresh_q8_weight(weight);
+    key.prepared_weight = ame_xsai_weight_plan(weight);
     key.weight_nb2 = weight->nb[2];
     key.weight_nb3 = weight->nb[3];
     key.dst_nb0 = op->nb[0];
@@ -631,6 +664,11 @@ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struc
 // AME buffer interface
 static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
+#if defined(GGML_USE_XSAI_BLAS)
+    for (ggml_tensor * tensor : ctx->tensors) {
+        ame_xsai_weight_release(tensor);
+    }
+#endif
     if (ctx->base != nullptr) {
         ggml_aligned_free(ctx->base, ctx->base_size);
     }
@@ -660,6 +698,9 @@ static void ggml_backend_ame_buffer_memset_tensor(
     memset((char *)tensor->data + offset, value, size);
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        ame_refresh_q8_weight(tensor);
+#endif
     }
 }
 
@@ -673,6 +714,9 @@ static void ggml_backend_ame_buffer_set_tensor(
     memcpy((char *) tensor->data + offset, data, size);
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        ame_refresh_q8_weight(tensor);
+#endif
     }
     GGML_UNUSED(data);
 }
@@ -693,6 +737,11 @@ static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     memset(ctx->base, value, buffer->size);
     if (buffer->size != 0) {
         ctx->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        for (ggml_tensor * tensor : ctx->tensors) {
+            ame_refresh_q8_weight(tensor);
+        }
+#endif
     }
 
     GGML_UNUSED(value);

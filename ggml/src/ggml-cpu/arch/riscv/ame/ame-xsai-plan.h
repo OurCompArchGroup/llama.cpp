@@ -36,6 +36,11 @@ struct ame_xsai_q8_key {
     uint64_t weight_generation;
     uint32_t explicit_options;
     uint32_t reserved;
+    /* Tensor whose bytes this plan executes. NULL for callers that do not
+     * own a prepared weight. prepared_weight is the xsai handle, not a
+     * copy of the bytes. */
+    const void * weight_identity;
+    const xsai_weight_plan_t * prepared_weight;
 };
 
 struct ame_xsai_q8_bind {
@@ -59,6 +64,25 @@ uint64_t ame_xsai_plan_cache_hit_count(void);
 void ame_xsai_plan_cache_reset_counts(void);
 void ame_xsai_plan_cache_clear(void);
 size_t ame_xsai_plan_cache_live(void);
+
+/* Q8_0 bytes -> I8_GROUP32 weight plan. Retires op plans for this tensor,
+ * waits until their execute calls return, destroys those op plans, destroys
+ * the previous weight plan, then prepares a new one. The arena is owned here.
+ * xsai destroy does not free it. */
+xsai_status_t ame_xsai_weight_refresh_q8(
+    const void * tensor,
+    const void * q8_data,
+    int64_t rows,
+    int64_t logical_k,
+    uint64_t generation);
+void ame_xsai_weight_release(const void * tensor);
+const xsai_weight_plan_t * ame_xsai_weight_plan(const void * tensor);
+uint64_t ame_xsai_weight_generation(const void * tensor);
+
+uint64_t ame_xsai_op_plan_destroy_count(void);
+uint64_t ame_xsai_weight_plan_destroy_count(void);
+int ame_xsai_destroy_order_ok(void);
+void ame_xsai_destroy_order_reset(void);
 
 #ifdef __cplusplus
 extern "C" {

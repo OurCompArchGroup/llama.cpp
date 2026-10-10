@@ -180,5 +180,72 @@ int main() {
 
     ame_xsai_plan_cache_clear();
     expect(ame_xsai_plan_cache_live() == 0, "cache clear destroys plans");
+
+    int weight_tensor = 0;
+    uint8_t q8_row[34];
+    const uint16_t one = 0x3c00;
+    std::memset(q8_row, 0, sizeof(q8_row));
+    std::memcpy(q8_row, &one, sizeof(one));
+    for (int i = 2; i < 34; ++i) {
+        q8_row[i] = 1;
+    }
+    ame_xsai_destroy_order_reset();
+    ame_xsai_plan_cache_reset_counts();
+    expect(ame_xsai_weight_refresh_q8(&weight_tensor, q8_row, 1, 32, 1) ==
+               XSAI_STATUS_SUCCESS,
+           "Q8 refresh prepares a weight plan");
+    ame_xsai_q8_key life = make_key(1, 1, 32, 1);
+    life.weight_identity = &weight_tensor;
+    life.prepared_weight = ame_xsai_weight_plan(&weight_tensor);
+    const uint64_t creates_before_life = ame_xsai_plan_create_count();
+    xsai_op_plan_t * life_plan =
+        ame_xsai_q8_cache_get_or_create(&weight_tensor, &life);
+    expect(life_plan != nullptr &&
+               ame_xsai_plan_create_count() == creates_before_life + 1,
+           "op plan binds the prepared weight");
+    expect(ame_xsai_weight_refresh_q8(&weight_tensor, q8_row, 1, 32, 2) ==
+               XSAI_STATUS_SUCCESS,
+           "generation refresh replaces the weight plan");
+    expect(ame_xsai_destroy_order_ok(),
+           "generation refresh destroys the op plan before the weight plan");
+    life.weight_generation = 2;
+    life.prepared_weight = ame_xsai_weight_plan(&weight_tensor);
+    xsai_op_plan_t * life_next =
+        ame_xsai_q8_cache_get_or_create(&weight_tensor, &life);
+    expect(life_next != nullptr && life_next != life_plan &&
+               ame_xsai_plan_create_count() == creates_before_life + 2,
+           "generation change creates another op plan");
+    float life_activation[32];
+    float life_out = 0.0f;
+    for (float & value : life_activation) {
+        value = 1.0f;
+    }
+    xsai_op_requirements_t life_requirements{};
+    life_requirements.struct_size = sizeof(life_requirements);
+    life_requirements.abi_version = XSAI_BLAS_ABI_VERSION;
+    expect(xsai_op_plan_get_requirements(life_next, &life_requirements) ==
+               XSAI_STATUS_SUCCESS,
+           "rebuilt op plan reports workspace");
+    std::vector<unsigned char> life_workspace(
+        life_requirements.workspace_size + life_requirements.workspace_alignment);
+    void * life_aligned = reinterpret_cast<void *>(
+        (reinterpret_cast<uintptr_t>(life_workspace.data()) +
+         life_requirements.workspace_alignment - 1) &
+        ~(uintptr_t) (life_requirements.workspace_alignment - 1));
+    ame_xsai_q8_bind life_bind = {life_activation, q8_row, &life_out, life_aligned,
+                                  life_requirements.workspace_size};
+    expect(ame_xsai_q8_cache_execute(life_next, &life, &life_bind) ==
+               XSAI_STATUS_SUCCESS,
+           "prepared weight executes");
+    expect(ame_xsai_q8_cache_execute(life_next, &life, &life_bind) ==
+               XSAI_STATUS_SUCCESS && life_out == 32.0f,
+           "same prepared weight executes twice");
+    ame_xsai_weight_release(&weight_tensor);
+    expect(ame_xsai_weight_plan(&weight_tensor) == nullptr,
+           "release drops the weight plan");
+    expect(ame_xsai_destroy_order_ok(),
+           "release destroys the op plan before the weight plan");
+
+    ame_xsai_plan_cache_clear();
     return g_failures == 0 ? 0 : 1;
 }
