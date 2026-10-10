@@ -567,9 +567,12 @@ public:
             }
             const xsai_status_t status = ame_xsai_plan_execute(
                 plan, op, params->wdata, params->wsize);
-            /* A failed execute has not written output. Do not fall back:
-             * the CPU kernel would write the same tensor. */
-            GGML_UNUSED(status);
+            /* UNSUPPORTED is returned before any output write. Let ggml CPU
+             * run that op. Any other execute failure may already have written
+             * dst, so it must not fall through. */
+            if (status == XSAI_STATUS_UNSUPPORTED) {
+                return false;
+            }
             return true;
         }
 #endif
@@ -811,9 +814,10 @@ public:
             return true;
         }
 
-        const bool shape_supported = op->src[0]->type == GGML_TYPE_Q8_0
-            ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
-            : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        /* Q8 eligibility is decided by xsai-blas plan_create. Do not
+         * pre-guess tile shape or AME capability here. */
+        const bool shape_supported = op->src[0]->type == GGML_TYPE_Q8_0 ||
+            ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
             return true;
@@ -852,28 +856,8 @@ public:
 
 }  // namespace ggml::cpu::riscv_ame
 
-// Runtime AME availability check
-static bool ggml_ame_available() {
-#ifdef GGML_USE_RV_AME
-    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
-    if (ggml_ame_select_i8_kernel(64, 64, 64) == NULL) {
-        AME_LOG("ggml_ame_available: returning false (hw probe valid=%d tlenb=%llu trlenb=%llu alenb=%llu capacity=%s)",
-            cfg->valid,
-            (unsigned long long) cfg->tlenb,
-            (unsigned long long) cfg->trlenb,
-            (unsigned long long) cfg->alenb,
-            ggml_ame_i8_capacity_name(cfg));
-        return false;
-    }
-    AME_LOG("ggml_ame_available: returning true (capacity=%s)", ggml_ame_i8_capacity_name(cfg));
-    return true;
-#else
-    AME_LOG("ggml_ame_available: returning false (GGML_USE_RV_AME not set)");
-    return false;
-#endif
-}
-
-// Public buffer type getter
+// Public buffer type getter. Q8 capability is owned by xsai-blas; this
+// registration no longer probes CSR tile limits or picks an i8 kernel.
 ggml_backend_buffer_type_t ggml_backend_cpu_riscv_ame_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv_ame = {
         /* .iface = */ {
@@ -887,13 +871,6 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv_ame_buffer_type(void) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ new ggml::cpu::riscv_ame::extra_buffer_type(),
     };
-
-    if (!ggml_ame_available()) {
-        AME_LOG("buffer_type: AME not available, returning nullptr");
-        return nullptr;
-    }
-
-    AME_LOG("buffer_type: returning AME buffer type");
 
     return &ggml_backend_cpu_buffer_type_riscv_ame;
 }
