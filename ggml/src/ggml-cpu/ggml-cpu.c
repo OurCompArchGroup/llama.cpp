@@ -16,10 +16,13 @@
 
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
+#endif
+#if defined(GGML_USE_RV_AME_MEM_TRACE)
 #include "arch/riscv/ame/ame-mem-trace.h"
 #endif
 #include "ggml.h"
 #include "common.h"
+#include "arch/riscv/ame/ame-mem-trace.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -2310,14 +2313,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
-#if defined(GGML_USE_RV_AME)
+#if defined(GGML_USE_RV_AME_MEM_TRACE)
     const bool xsai_mem_trace_target = ggml_ame_mem_trace_is_target(tensor);
     if (xsai_mem_trace_target) {
         ggml_barrier(params->threadpool);
         if (params->ith == 0) {
             fprintf(stderr, "[T] launching %s\n", ggml_ame_mem_trace_node_name(tensor));
             fflush(stderr);
-            ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_BEGIN);
+            GGML_AME_MEM_TRACE_BEGIN();
         }
         ggml_barrier(params->threadpool);
     }
@@ -2727,11 +2730,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
 done:
-#if defined(GGML_USE_RV_AME)
+#if defined(GGML_USE_RV_AME_MEM_TRACE)
     if (xsai_mem_trace_target) {
         ggml_barrier(params->threadpool);
         if (params->ith == 0) {
-            ggml_ame_mem_trace_signal(GGML_AME_MEM_TRACE_END);
+            GGML_AME_MEM_TRACE_END();
         }
         ggml_barrier(params->threadpool);
     }

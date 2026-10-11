@@ -462,6 +462,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         if (GGML_RV_AME)
             message(STATUS "RISC-V AME (Matrix Multiply Accelerate) enabled")
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RV_AME)
+            if (GGML_RV_AME_MEM_TRACE)
+                message(STATUS "RISC-V AME memory tracing enabled")
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RV_AME_MEM_TRACE)
+            endif()
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/arch/riscv/ame/ame_gemm_tile_i8_i32_bT.c
                 ggml-cpu/arch/riscv/ame/ame_gemm_tile_bf16_fp32_bT.c

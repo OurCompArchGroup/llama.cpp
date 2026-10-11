@@ -9,8 +9,10 @@
 
 // NEMU memory-trace protocol. Keep these values aligned with NEMU's special
 // instruction handler without depending on NEMU-private headers.
-#define GGML_AME_MEM_TRACE_BEGIN 0x103
-#define GGML_AME_MEM_TRACE_END   0x104
+#define GOOD_TRAP_ID                0x0
+#define GGML_AME_MEM_TRACE_BEGIN_ID 0x103
+#define GGML_AME_MEM_TRACE_END_ID   0x104
+#define CHECKPOINT_HERE_ID          0x105
 
 static inline const char * ggml_ame_mem_trace_target_name(void) {
     const char * name = getenv("GGML_XSAI_MEM_TRACE_NAME");
@@ -89,7 +91,7 @@ static inline const char * ggml_ame_mem_trace_node_name(const struct ggml_tensor
     return tensor->name[0] != '\0' ? tensor->name : ggml_op_name(tensor->op);
 }
 
-static inline void ggml_ame_mem_trace_signal(int signal_id) {
+static inline void nemu_signal(int signal_id) {
 #if defined(__riscv)
     __asm__ __volatile__(
         "mv a0, %0\n\t"
@@ -100,6 +102,22 @@ static inline void ggml_ame_mem_trace_signal(int signal_id) {
 #else
     (void) signal_id;
 #endif
+}
+
+static inline void GOOD_TRAP(void) {
+    nemu_signal(GOOD_TRAP_ID);
+}
+
+static inline void GGML_AME_MEM_TRACE_BEGIN(void) {
+    nemu_signal(GGML_AME_MEM_TRACE_BEGIN_ID);
+}
+
+static inline void GGML_AME_MEM_TRACE_END(void) {
+    nemu_signal(GGML_AME_MEM_TRACE_END_ID);
+}
+
+static inline void CHECKPOINT_HERE(void) {
+    nemu_signal(CHECKPOINT_HERE_ID);
 }
 
 #endif // GGML_RISCV_AME_MEM_TRACE_H
