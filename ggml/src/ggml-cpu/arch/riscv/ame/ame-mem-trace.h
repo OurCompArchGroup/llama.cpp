@@ -39,6 +39,21 @@ static inline int ggml_ame_mem_trace_target_layer(void) {
     return end != value && *end == '\0' && layer >= 0 && layer <= 0x7fffffff ? (int) layer : -1;
 }
 
+/** Match node names in the form <name>-<layer>[.<op>[.<sequence>]].
+ * 
+ * Parse the layer after the last '-', allowing the number to end at '\0' or '.'.
+ *
+ * For example, with NAME=Kcur, LAYER=1, OP=*:
+ *   Kcur-1           matches.
+ *   Kcur-1.mul_mat   matches.
+ *   Kcur-1.mul_mat.0 matches; 0 is a sequence number, not the layer.
+ *   Kcur-0.mul_mat   does not match.
+ *   Kcur-1abc        does not match.
+ *
+ * LAYER=-1 accepts the same suffix format across layers.
+ *
+ * NOTE: If the node naming format changes, this matching logic may need to be updated.
+ */
 static inline bool ggml_ame_mem_trace_name_matches(const char * tensor_name) {
     const char * target = ggml_ame_mem_trace_target_name();
     const int layer = ggml_ame_mem_trace_target_layer();
@@ -56,7 +71,7 @@ static inline bool ggml_ame_mem_trace_name_matches(const char * tensor_name) {
 
         char * end = NULL;
         const long parsed = strtol(layer_suffix + 1, &end, 10);
-        return end != layer_suffix + 1 && *end == '\0' && parsed == layer;
+        return end != layer_suffix + 1 && (*end == '\0' || *end == '.') && parsed == layer;
     }
 
     if (strcmp(target, "*") == 0) {
@@ -73,10 +88,10 @@ static inline bool ggml_ame_mem_trace_name_matches(const char * tensor_name) {
     }
 
     const char * suffix = tensor_name + target_len + 1;
-    if (*suffix == '\0') {
+    if (*suffix < '0' || *suffix > '9') {
         return false;
     }
-    for (; *suffix != '\0'; ++suffix) {
+    for (; *suffix != '\0' && *suffix != '.'; ++suffix) {
         if (*suffix < '0' || *suffix > '9') {
             return false;
         }
