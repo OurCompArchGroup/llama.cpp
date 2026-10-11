@@ -1,5 +1,6 @@
 #include "llama-model.h"
 
+#include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -8165,7 +8166,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs();
 
-    return llm->res->get_gf();
+    ggml_cgraph * gf = llm->res->get_gf();
+    llama_graph_auto_ensure_unique_node_names(gf);
+
+    return gf;
 }
 
 

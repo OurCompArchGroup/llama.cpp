@@ -10,9 +10,14 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -2526,4 +2531,188 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+
+// Check whether the graph contains duplicate or empty node names.
+static bool llama_graph_has_duplicate_node_names(ggml_cgraph * graph) {
+    std::unordered_set<std::string> names;
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+
+    for (int i = 0; i < n_nodes; ++i) {
+        const char * name = ggml_graph_node(graph, i)->name;
+
+        if (name[0] == '\0' || !names.insert(name).second) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Resolve duplicate node names.
+// Stage 1: Append the lowercase operation name.
+// Stage 2: Append a sequence number if ambiguity remains.
+static void llama_graph_rename_duplicate_nodes(ggml_cgraph * graph) {
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    const size_t max_len = GGML_MAX_NAME - 1;
+
+    std::unordered_map<std::string, int> name_count;
+    std::unordered_map<std::string, std::unordered_map<int, int>> name_op_count;
+    std::unordered_map<std::string, std::unordered_map<int, int>> next_sequence;
+    std::unordered_set<std::string> used_names;
+
+    // Count original names and (name, operation) pairs.
+    // Reserve all existing names to avoid collisions.
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        const std::string name = node->name;
+        const int op = static_cast<int>(node->op);
+
+        ++name_count[name];
+        ++name_op_count[name][op];
+
+        if (!name.empty()) {
+            used_names.insert(name);
+        }
+    }
+
+    int renamed = 0;
+
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+
+        const std::string original = node->name;
+        const int op = static_cast<int>(node->op);
+
+        // Keep unique, non-empty names unchanged.
+        if (!original.empty() && name_count.at(original) == 1) {
+            continue;
+        }
+
+        // Get the lowercase operation name.
+        std::string op_name = ggml_op_name(node->op);
+
+        std::transform(op_name.begin(), op_name.end(), op_name.begin(),
+            [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+
+        // Generate a fallback name for unnamed nodes.
+        const std::string base = original.empty()
+            ? "node_" + std::to_string(i)
+            : original;
+
+        const std::string op_suffix = "." + op_name;
+
+        // Ensure the result fits within GGML_MAX_NAME.
+        auto make_name = [&](const std::string & suffix) {
+            if (suffix.size() > max_len) {
+                throw std::runtime_error(
+                    "XSAI: graph node name suffix exceeds GGML_MAX_NAME"
+                );
+            }
+
+            return base.substr(0, max_len - suffix.size()) + suffix;
+        };
+
+        // Stage 1: Append the operation name.
+        std::string new_name = make_name(op_suffix);
+
+        // Stage 2: Append a sequence number when needed.
+        if (name_op_count.at(original).at(op) > 1 ||
+            used_names.count(new_name) != 0) {
+
+            int & sequence = next_sequence[original][op];
+
+            do {
+                const std::string suffix =
+                    op_suffix + "." + std::to_string(sequence++);
+
+                new_name = make_name(suffix);
+            } while (used_names.count(new_name) != 0);
+        }
+
+        ggml_set_name(node, new_name.c_str());
+        used_names.insert(new_name);
+        ++renamed;
+
+        LLAMA_LOG_INFO(
+            "[GGML_XSAI_NODE_RENAME] node=%d: \"%s\" -> \"%s\"\n",
+            i, original.c_str(), new_name.c_str()
+        );
+    }
+
+    LLAMA_LOG_INFO(
+        "[GGML_XSAI_NODE_RENAME] renamed=%d, total=%d\n",
+        renamed, n_nodes
+    );
+}
+
+/**
+ * Ensure that every node in the computation graph has a unique name.
+ *
+ * Motivation:
+ * The original GGML computation graph may contain multiple nodes sharing
+ * the same name. This is particularly problematic for the
+ * GGML_EASY_SIM_WINDOW_AFTER_CHECKPOINT mode, where the insertion points
+ * of CHECKPOINT_HERE and GOOD_TRAP are determined solely by node names.
+ * Therefore, unique node names are required for reliable instrumentation.
+ *
+ * Workflow:
+ *   1. Check  - Detect duplicate or empty node names.
+ *   2. Rename - Resolve duplicates by appending the lowercase operation
+ *               name, followed by a sequence number if still ambiguous.
+ *   3. Verify - Run the same check again to ensure uniqueness.
+ *
+ *   Check -> Rename -> Verify
+ *
+ * If no conflicts are detected, the function returns immediately.
+ * If conflicts remain after renaming, an error is raised.
+ *
+ * Examples:
+ *   Case 1: Different operations sharing the same name
+ *     Kcur-1 (MUL_MAT) -> Kcur-1.mul_mat
+ *     Kcur-1 (ROPE)    -> Kcur-1.rope
+ *
+ *   Case 2: Same name and operation, requiring sequence numbers
+ *     norm-1 (RMS_NORM) -> norm-1.rms_norm.0
+ *     norm-1 (RMS_NORM) -> norm-1.rms_norm.1
+ *
+ * NOTE:
+ * These three functions were all AI-generated.
+ * Human developers are not expected to spend substantial time studying
+ * their implementation details. Understanding the high-level behavior
+ * and verifying the resulting node names should be sufficient for
+ * routine use. Thorough validation is still required before relying
+ * on this mechanism in new environments.
+ */
+void llama_graph_auto_ensure_unique_node_names(ggml_cgraph * graph) {
+    if (!graph) {
+        throw std::invalid_argument("XSAI: graph is null");
+    }
+
+    // First check: Return immediately if all names are unique.
+    if (!llama_graph_has_duplicate_node_names(graph)) {
+        return;
+    }
+
+    // Resolve duplicate and empty names.
+    llama_graph_rename_duplicate_nodes(graph);
+
+    // Second check: Verify that all conflicts have been resolved.
+    if (llama_graph_has_duplicate_node_names(graph)) {
+        LLAMA_LOG_ERROR(
+            "[GGML_XSAI_NODE_RENAME] name validation failed after renaming\n"
+        );
+
+        throw std::runtime_error(
+            "XSAI: duplicate or empty graph node names remain"
+        );
+    }
+
+    LLAMA_LOG_INFO(
+        "[GGML_XSAI_NODE_RENAME] uniqueness verified\n"
+    );
 }

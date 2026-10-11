@@ -990,3 +990,8 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// Ensure all computation graph nodes have unique, non-empty names.
+// Resolve duplicates by appending the operation name and,
+// if necessary, a sequence number.
+void llama_graph_auto_ensure_unique_node_names(ggml_cgraph * graph);
