@@ -14,6 +14,10 @@
 #define GGML_AME_MEM_TRACE_END_ID   0x104
 #define CHECKPOINT_HERE_ID          0x105
 
+// Log print colors
+#define LOG_ORANGE "\033[38;5;208m"
+#define LOG_RESET  "\033[0m"
+
 static inline const char * ggml_ame_mem_trace_target_name(void) {
     const char * name = getenv("GGML_XSAI_MEM_TRACE_NAME");
     return name != NULL && name[0] != '\0' ? name : "*";

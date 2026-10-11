@@ -187,6 +187,7 @@ option(GGML_RV_ZICBOP        "ggml: enable riscv zicbop"     ON)
 option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause "  ON)
 option(GGML_RV_AME           "ggml: enable riscv ame"        OFF)
 option(GGML_RV_AME_MEM_TRACE "ggml: enable riscv ame memory tracing" OFF)
+option(GGML_EASY_SIM_WINDOW_AFTER_CHECKPOINT "ggml: enable simulation window selection after checkpoint" OFF)
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ${GGML_NATIVE})
 

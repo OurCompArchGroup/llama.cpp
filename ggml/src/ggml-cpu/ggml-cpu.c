@@ -3609,8 +3609,52 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         xsai_detail_graph = ++g_ggml_xsai_op_profile_detail.graphs;
     }
 
+#if defined(GGML_EASY_SIM_WINDOW_AFTER_CHECKPOINT)
+    // Read checkpoint targets from the Guest process environment.
+    // These names MUST match the original node->name exactly.
+    const char * checkpoint_target = getenv("CHECKPOINT_HERE_BEFORE");
+    const char * good_trap_target  = getenv("GOOD_TRAP_BEFORE");
+#endif
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+
+#if defined(GGML_EASY_SIM_WINDOW_AFTER_CHECKPOINT)
+        // Define a simulation window depending solely on unique Compute Graph node names.
+        // CHECKPOINT_HERE marks the start, while GOOD_TRAP marks the end of the simulation window.
+        // Users can flexibly select the execution range by simply specifying the target node names.
+        //
+        // NOTE: All Compute Graph nodes must have unique names before execution.
+        //       Instrumentation decisions depend exclusively on exact node name matching.
+        const bool do_checkpoint = strcmp(node->name, checkpoint_target) == 0;
+        const bool do_good_trap = strcmp(node->name, good_trap_target) == 0;
+
+        if (do_checkpoint || do_good_trap) {
+            ggml_barrier(tp); // Wait until all worker threads reach the target node.
+
+            // Only thread 0 triggers the nemu trap instrumentation.
+            if (state->ith == 0) {
+                if (do_checkpoint) {
+                    fprintf(stderr, "\n[NEMU TRAP] CHECKPOINT_HERE triggered at node=" LOG_ORANGE "%s" LOG_RESET "\n", node->name);
+                    fflush(stderr);
+
+                    CHECKPOINT_HERE();
+                    
+                    fprintf(stderr, "\n[NEMU TRAP] Returned from CHECKPOINT_HERE at node=" LOG_ORANGE "%s" LOG_RESET "\n", node->name);
+                    fflush(stderr);
+                }
+
+                if (do_good_trap) {
+                    fprintf(stderr, "\n[NEMU TRAP] GOOD_TRAP triggered at node=" LOG_ORANGE "%s" LOG_RESET " \n", node->name);
+                    fflush(stderr);
+
+                    GOOD_TRAP();
+                }
+            }
+
+            ggml_barrier(tp); // Prevent other threads from entering the target node early.
+        }
+#endif
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
