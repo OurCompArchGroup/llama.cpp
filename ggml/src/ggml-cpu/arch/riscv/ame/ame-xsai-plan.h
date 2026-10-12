@@ -59,6 +59,11 @@ xsai_status_t ame_xsai_q8_cache_execute(xsai_op_plan_t * plan,
                                         const ame_xsai_q8_key * key,
                                         const ame_xsai_q8_bind * bind);
 
+/* Reads the frozen workspace record. Does not select a kernel. */
+xsai_status_t ame_xsai_plan_read_requirements(
+    const xsai_op_plan_t * plan,
+    xsai_op_requirements_t * requirements);
+
 uint64_t ame_xsai_plan_create_count(void);
 uint64_t ame_xsai_plan_cache_hit_count(void);
 void ame_xsai_plan_cache_reset_counts(void);

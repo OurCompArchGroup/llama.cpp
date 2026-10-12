@@ -545,7 +545,7 @@ public:
             xsai_op_requirements_t requirements = {};
             requirements.struct_size = sizeof(requirements);
             requirements.abi_version = XSAI_BLAS_ABI_VERSION;
-            if (xsai_op_plan_get_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
+            if (ame_xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
                 return false;
             }
             size = requirements.workspace_size;

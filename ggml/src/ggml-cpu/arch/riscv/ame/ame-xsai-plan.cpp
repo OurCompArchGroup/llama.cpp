@@ -1,4 +1,5 @@
 #include "ame-xsai-plan.h"
+#include "ame-xsai-observe.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -11,6 +12,17 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+struct ObserveSpan {
+    int phase;
+    uint64_t token;
+    explicit ObserveSpan(int phase_in) : phase(phase_in), token(UINT64_MAX) {
+        ame_xsai_observe_span_begin(phase, &token);
+    }
+    ~ObserveSpan() {
+        ame_xsai_observe_span_end(phase, token);
+    }
+};
 
 namespace {
 
@@ -221,7 +233,11 @@ xsai_op_plan_t * ame_xsai_q8_cache_get_or_create(const void * op,
     xsai_op_call_t call;
     build_call(key, nullptr, inputs, &output, shapes, out_strides, &call);
     xsai_op_plan_t * plan = nullptr;
-    const xsai_status_t status = xsai_op_plan_create(&call, &plan);
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    {
+        ObserveSpan span(AME_XSAI_OBS_PLAN_CREATE);
+        status = xsai_op_plan_create(&call, &plan);
+    }
     if (status != XSAI_STATUS_SUCCESS || plan == nullptr) {
         xsai_op_plan_destroy(plan);
         return nullptr;
@@ -291,10 +307,20 @@ xsai_status_t ame_xsai_q8_cache_execute(xsai_op_plan_t * plan,
     int64_t out_strides[2];
     xsai_op_call_t call;
     build_call(key, bind, inputs, &output, shapes, out_strides, &call);
-    const xsai_status_t status = xsai_op_plan_execute(plan, &call);
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    {
+        ObserveSpan span(AME_XSAI_OBS_EXECUTE);
+        status = xsai_op_plan_execute(plan, &call);
+    }
     inflight->fetch_sub(1);
     g_cv.notify_all();
     return status;
+}
+
+xsai_status_t ame_xsai_plan_read_requirements(
+    const xsai_op_plan_t * plan, xsai_op_requirements_t * requirements) {
+    ObserveSpan span(AME_XSAI_OBS_WORKSPACE);
+    return xsai_op_plan_get_requirements(plan, requirements);
 }
 
 uint64_t ame_xsai_plan_create_count(void) {
@@ -414,6 +440,7 @@ xsai_status_t ame_xsai_weight_refresh_q8(
             }
         }
         if (status == XSAI_STATUS_SUCCESS) {
+            ObserveSpan span(AME_XSAI_OBS_PREPARE);
             status = xsai_weight_plan_prepare(plan, arena, requirements.arena_size);
         }
     }
