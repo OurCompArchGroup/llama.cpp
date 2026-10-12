@@ -490,7 +490,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 target_link_libraries(${GGML_CPU_NAME} PRIVATE "${XSAI_BLAS_LIBRARY}")
                 target_sources(${GGML_CPU_NAME} PRIVATE
                     ggml-cpu/arch/riscv/ame/ame-xsai-plan.cpp
-                    ggml-cpu/arch/riscv/ame/ame-xsai-plan.h)
+                    ggml-cpu/arch/riscv/ame/ame-xsai-plan.h
+                    ggml-cpu/arch/riscv/ame/ame-xsai-fusion.cpp
+                    ggml-cpu/arch/riscv/ame/ame-xsai-fusion.h)
                 message(STATUS "RISC-V AME using xsai-blas: ${XSAI_BLAS_LIBRARY}")
             endif()
         endif()
