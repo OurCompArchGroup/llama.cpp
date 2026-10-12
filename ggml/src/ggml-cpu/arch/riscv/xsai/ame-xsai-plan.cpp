@@ -34,11 +34,15 @@ struct CacheEntry {
     ame_xsai_q8_key key;
     xsai_op_plan_t * plan = nullptr;
     std::shared_ptr<std::atomic<int>> inflight = std::make_shared<std::atomic<int>>(0);
+    bool general = false;
+    std::vector<uint8_t> general_key;
 };
 
 std::unordered_map<const void *, CacheEntry> g_cache;
 uint64_t g_create_count = 0;
 uint64_t g_hit_count = 0;
+uint64_t g_key_miss_count = 0;
+uint64_t g_execute_count = 0;
 uint64_t g_seq = 0;
 uint64_t g_last_op_seq = 0;
 uint64_t g_last_weight_seq = 0;
@@ -50,6 +54,7 @@ struct WeightSlot {
     xsai_weight_plan_t * plan = nullptr;
     void * arena = nullptr;
     uint64_t generation = 0;
+    size_t arena_bytes = 0;
 };
 
 std::mutex g_weight_mu;
@@ -209,7 +214,7 @@ xsai_op_plan_t * ame_xsai_q8_cache_get_or_create(const void * op,
             return nullptr;
         }
         const auto it = g_cache.find(op);
-        if (it != g_cache.end() && key_equal(it->second.key, *key)) {
+        if (it != g_cache.end() && !it->second.general && key_equal(it->second.key, *key)) {
             ++g_hit_count;
             return it->second.plan;
         }
@@ -235,6 +240,10 @@ xsai_op_plan_t * ame_xsai_q8_cache_get_or_create(const void * op,
     xsai_op_plan_t * plan = nullptr;
     xsai_status_t status = XSAI_STATUS_SUCCESS;
     {
+        std::lock_guard<std::mutex> lock(g_mu);
+        ++g_key_miss_count;
+    }
+    {
         ObserveSpan span(AME_XSAI_OBS_PLAN_CREATE);
         status = xsai_op_plan_create(&call, &plan);
     }
@@ -251,14 +260,16 @@ xsai_op_plan_t * ame_xsai_q8_cache_get_or_create(const void * op,
             return nullptr;
         }
         const auto existing = g_cache.find(op);
+        CacheEntry created;
+        created.key = *key;
+        created.plan = plan;
+        created.inflight = std::make_shared<std::atomic<int>>(0);
         if (existing != g_cache.end()) {
             stale = std::move(existing->second);
-            existing->second =
-                CacheEntry{*key, plan, std::make_shared<std::atomic<int>>(0)};
+            existing->second = std::move(created);
             have_stale = true;
         } else {
-            g_cache.emplace(op, CacheEntry{*key, plan,
-                                           std::make_shared<std::atomic<int>>(0)});
+            g_cache.emplace(op, std::move(created));
         }
         ++g_create_count;
     }
@@ -275,7 +286,7 @@ xsai_op_plan_t * ame_xsai_q8_cache_lookup(const void * op,
     }
     std::lock_guard<std::mutex> lock(g_mu);
     const auto it = g_cache.find(op);
-    if (it == g_cache.end() || !key_equal(it->second.key, *key)) {
+    if (it == g_cache.end() || it->second.general || !key_equal(it->second.key, *key)) {
         return nullptr;
     }
     return it->second.plan;
@@ -312,6 +323,131 @@ xsai_status_t ame_xsai_q8_cache_execute(xsai_op_plan_t * plan,
         ObserveSpan span(AME_XSAI_OBS_EXECUTE);
         status = xsai_op_plan_execute(plan, &call);
     }
+    if (status == XSAI_STATUS_SUCCESS) {
+        std::lock_guard<std::mutex> lock(g_mu);
+        ++g_execute_count;
+    }
+    inflight->fetch_sub(1);
+    g_cv.notify_all();
+    return status;
+}
+
+static bool general_key_equal(const CacheEntry & entry, const void * key, size_t key_nbytes) {
+    return entry.general && entry.general_key.size() == key_nbytes &&
+        (key_nbytes == 0 || std::memcmp(entry.general_key.data(), key, key_nbytes) == 0);
+}
+
+xsai_op_plan_t * ame_xsai_general_cache_get_or_create(const void * op,
+                                                      const void * key,
+                                                      size_t key_nbytes,
+                                                      const xsai_op_call_t * call_template) {
+    if (op == nullptr || call_template == nullptr || (key == nullptr && key_nbytes != 0)) {
+        return nullptr;
+    }
+    CacheEntry replaced;
+    bool have_replaced = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto it = g_cache.find(op);
+        if (it != g_cache.end() && general_key_equal(it->second, key, key_nbytes)) {
+            ++g_hit_count;
+            return it->second.plan;
+        }
+        if (it != g_cache.end()) {
+            replaced = std::move(it->second);
+            g_cache.erase(it);
+            have_replaced = true;
+        }
+    }
+    if (have_replaced) {
+        wait_and_destroy(std::move(replaced));
+    }
+
+    xsai_op_plan_t * plan = nullptr;
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        ++g_key_miss_count;
+    }
+    {
+        ObserveSpan span(AME_XSAI_OBS_PLAN_CREATE);
+        status = xsai_op_plan_create(call_template, &plan);
+    }
+    if (status != XSAI_STATUS_SUCCESS || plan == nullptr) {
+        xsai_op_plan_destroy(plan);
+        return nullptr;
+    }
+
+    CacheEntry created;
+    created.plan = plan;
+    created.inflight = std::make_shared<std::atomic<int>>(0);
+    created.general = true;
+    if (key_nbytes != 0) {
+        const auto * bytes = static_cast<const uint8_t *>(key);
+        created.general_key.assign(bytes, bytes + key_nbytes);
+    }
+    CacheEntry stale;
+    bool have_stale = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        const auto existing = g_cache.find(op);
+        if (existing != g_cache.end()) {
+            stale = std::move(existing->second);
+            existing->second = std::move(created);
+            have_stale = true;
+        } else {
+            g_cache.emplace(op, std::move(created));
+        }
+        ++g_create_count;
+    }
+    if (have_stale) {
+        wait_and_destroy(std::move(stale));
+    }
+    return plan;
+}
+
+xsai_op_plan_t * ame_xsai_general_cache_lookup(const void * op,
+                                               const void * key,
+                                               size_t key_nbytes) {
+    if (op == nullptr || (key == nullptr && key_nbytes != 0)) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_mu);
+    const auto it = g_cache.find(op);
+    if (it == g_cache.end() || !general_key_equal(it->second, key, key_nbytes)) {
+        return nullptr;
+    }
+    return it->second.plan;
+}
+
+xsai_status_t ame_xsai_general_cache_execute(xsai_op_plan_t * plan,
+                                             const xsai_op_call_t * call) {
+    if (plan == nullptr || call == nullptr) {
+        return XSAI_STATUS_INVALID_ARGUMENT;
+    }
+    std::shared_ptr<std::atomic<int>> inflight;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        for (auto & entry : g_cache) {
+            if (entry.second.plan == plan && entry.second.general) {
+                inflight = entry.second.inflight;
+                inflight->fetch_add(1);
+                break;
+            }
+        }
+    }
+    if (!inflight) {
+        return XSAI_STATUS_UNSUPPORTED;
+    }
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    {
+        ObserveSpan span(AME_XSAI_OBS_EXECUTE);
+        status = xsai_op_plan_execute(plan, call);
+    }
+    if (status == XSAI_STATUS_SUCCESS) {
+        std::lock_guard<std::mutex> lock(g_mu);
+        ++g_execute_count;
+    }
     inflight->fetch_sub(1);
     g_cv.notify_all();
     return status;
@@ -333,10 +469,31 @@ uint64_t ame_xsai_plan_cache_hit_count(void) {
     return g_hit_count;
 }
 
+uint64_t ame_xsai_plan_key_miss_count(void) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_key_miss_count;
+}
+
+uint64_t ame_xsai_plan_execute_count(void) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_execute_count;
+}
+
+uint64_t ame_xsai_prepared_bytes(void) {
+    std::lock_guard<std::mutex> lock(g_weight_mu);
+    uint64_t bytes = 0;
+    for (const auto & entry : g_weights) {
+        bytes += entry.second.arena_bytes;
+    }
+    return bytes;
+}
+
 void ame_xsai_plan_cache_reset_counts(void) {
     std::lock_guard<std::mutex> lock(g_mu);
     g_create_count = 0;
     g_hit_count = 0;
+    g_key_miss_count = 0;
+    g_execute_count = 0;
 }
 
 void ame_xsai_plan_cache_clear(void) {
@@ -427,6 +584,7 @@ xsai_status_t ame_xsai_weight_refresh_q8(
     xsai_weight_plan_t * plan = nullptr;
     xsai_status_t status = xsai_weight_plan_create(&desc, &plan);
     void * arena = nullptr;
+    size_t arena_bytes = 0;
     if (status == XSAI_STATUS_SUCCESS) {
         xsai_weight_requirements_t requirements{};
         requirements.struct_size = sizeof(requirements);
@@ -440,6 +598,7 @@ xsai_status_t ame_xsai_weight_refresh_q8(
             }
         }
         if (status == XSAI_STATUS_SUCCESS) {
+            arena_bytes = requirements.arena_size;
             ObserveSpan span(AME_XSAI_OBS_PREPARE);
             status = xsai_weight_plan_prepare(plan, arena, requirements.arena_size);
         }
@@ -455,7 +614,7 @@ xsai_status_t ame_xsai_weight_refresh_q8(
     }
     {
         std::lock_guard<std::mutex> lock(g_weight_mu);
-        g_weights[tensor] = WeightSlot{plan, arena, generation};
+        g_weights[tensor] = WeightSlot{plan, arena, generation, arena_bytes};
     }
     std::lock_guard<std::mutex> lock(g_mu);
     if (g_refreshing == tensor) {

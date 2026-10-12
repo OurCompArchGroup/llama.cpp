@@ -66,6 +66,12 @@ xsai_status_t ame_xsai_plan_read_requirements(
 
 uint64_t ame_xsai_plan_create_count(void);
 uint64_t ame_xsai_plan_cache_hit_count(void);
+/* plan_create calls. Equals key misses: a hit does not create. */
+uint64_t ame_xsai_plan_key_miss_count(void);
+/* Successful plan_execute calls. Larger than create when a plan is reused. */
+uint64_t ame_xsai_plan_execute_count(void);
+/* Sum of prepared-weight arena bytes still owned by the cache. */
+uint64_t ame_xsai_prepared_bytes(void);
 void ame_xsai_plan_cache_reset_counts(void);
 void ame_xsai_plan_cache_clear(void);
 size_t ame_xsai_plan_cache_live(void);
@@ -98,3 +104,15 @@ void ame_xsai_plan_cache_retain(const void * const * ops, size_t count);
 #ifdef __cplusplus
 }
 #endif
+
+/* Same cache as the Q8 entries. The key bytes are the miss identity.
+ * call_template is read only during plan_create. Data pointers may be null. */
+xsai_op_plan_t * ame_xsai_general_cache_get_or_create(const void * op,
+                                                      const void * key,
+                                                      size_t key_nbytes,
+                                                      const xsai_op_call_t * call_template);
+xsai_op_plan_t * ame_xsai_general_cache_lookup(const void * op,
+                                               const void * key,
+                                               size_t key_nbytes);
+xsai_status_t ame_xsai_general_cache_execute(xsai_op_plan_t * plan,
+                                             const xsai_op_call_t * call);

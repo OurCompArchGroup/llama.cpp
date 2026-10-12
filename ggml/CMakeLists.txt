@@ -188,6 +188,7 @@ option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause "  ON)
 option(GGML_RV_AME           "ggml: enable riscv ame"        OFF)
 set(XSAI_BLAS_HOME "" CACHE PATH "Path to xsai-blas for the RISC-V AME backend")
 set(XSAI_BLAS_LIBRARY "" CACHE FILEPATH "Path to the xsai-blas static archive")
+option(GGML_XSAI_BACKEND     "ggml: xsai backend on a non-RISC-V host (reference/generic). Off by default; RISC-V uses GGML_RV_AME plus XSAI_BLAS_HOME." OFF)
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ${GGML_NATIVE})
 

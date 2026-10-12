@@ -4,7 +4,8 @@
 #include "ame-backend.h"
 #include "ame.h"
 #if defined(GGML_USE_XSAI_BLAS)
-#include "ame-xsai-plan.h"
+#include "../xsai/ame-xsai-plan.h"
+#include "../xsai/xsai-backend.h"
 #endif
 
 #include "ggml-backend-impl.h"
@@ -13,11 +14,6 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "traits.h"
-
-#if defined(GGML_USE_XSAI_BLAS)
-#include <xsai_blas.h>
-static void ame_refresh_q8_weight(const ggml_tensor * tensor);
-#endif
 
 #include <cassert>
 #include <cmath>
@@ -156,63 +152,6 @@ static inline ame_buffer_context * ame_buffer_ctx(ggml_backend_buffer_t buffer) 
     return static_cast<ame_buffer_context *>(buffer->context);
 }
 
-struct ame_host_tensor_generation {
-    ggml_backend_buffer_t buffer = nullptr;
-    uint64_t generation = 0;
-};
-
-struct ame_host_generation_state {
-    uint64_t next_generation = 1;
-    std::unordered_map<const ggml_tensor *, ame_host_tensor_generation> tensors;
-    std::unordered_map<ggml_backend_buffer_t, uint64_t> buffers;
-};
-
-static ame_host_generation_state & ame_host_generations() {
-    static ame_host_generation_state state;
-    return state;
-}
-
-extern "C" void ggml_ame_host_buffer_on_write(
-    ggml_backend_buffer_t buffer,
-    struct ggml_tensor * tensor,
-    size_t offset,
-    size_t size
-) {
-    GGML_UNUSED(offset);
-    if (buffer == nullptr || size == 0) {
-        return;
-    }
-
-    ame_host_generation_state & state = ame_host_generations();
-    const uint64_t generation = ++state.next_generation;
-    state.buffers[buffer] = generation;
-    if (tensor != nullptr) {
-        state.tensors[tensor] = { buffer, generation };
-#if defined(GGML_USE_XSAI_BLAS)
-        ame_refresh_q8_weight(tensor);
-#endif
-    }
-}
-
-extern "C" void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) {
-    if (buffer == nullptr) {
-        return;
-    }
-
-    ame_host_generation_state & state = ame_host_generations();
-    state.buffers.erase(buffer);
-    for (auto it = state.tensors.begin(); it != state.tensors.end(); ) {
-        if (it->second.buffer == buffer) {
-#if defined(GGML_USE_XSAI_BLAS)
-            ame_xsai_weight_release(it->first);
-#endif
-            it = state.tensors.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 static uint64_t ame_tensor_content_generation(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->buffer == nullptr) {
         return 0;
@@ -223,19 +162,11 @@ static uint64_t ame_tensor_content_generation(const ggml_tensor * tensor) {
         return ame_buffer_ctx(tensor->buffer)->generation;
     }
 
-    ame_host_generation_state & state = ame_host_generations();
-    uint64_t generation = 0;
-    const auto bit = state.buffers.find(tensor->buffer);
-    if (bit != state.buffers.end()) {
-        generation = bit->second;
-    }
-
-    const auto tit = state.tensors.find(tensor);
-    if (tit != state.tensors.end() && tit->second.buffer == tensor->buffer) {
-        generation = std::max(generation, tit->second.generation);
-    }
-
-    return generation;
+#if defined(GGML_USE_XSAI_BLAS)
+    return xsai_backend_host_generation(tensor);
+#else
+    return 0;
+#endif
 }
 
 
@@ -434,99 +365,6 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     GGML_UNUSED(params);
 }
 
-#if defined(GGML_USE_XSAI_BLAS)
-static bool ame_q8_compact(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->ne[0] <= 0 ||
-        tensor->ne[1] < 0) {
-        return false;
-    }
-    const int64_t blocks = (tensor->ne[0] + 31) / 32;
-    return tensor->nb[1] == (size_t) blocks * 34u;
-}
-
-/* Buffer and tensor lifecycle only. Canonicalization stays in xsai-blas. */
-static void ame_refresh_q8_weight(const ggml_tensor * tensor) {
-    if (!ame_q8_compact(tensor) || tensor->data == nullptr) {
-        return;
-    }
-    const uint64_t generation = ame_tensor_content_generation(tensor);
-    if (ame_xsai_weight_plan(tensor) != nullptr &&
-        ame_xsai_weight_generation(tensor) == generation) {
-        return;
-    }
-    ame_xsai_weight_refresh_q8(
-        tensor, tensor->data, tensor->ne[1], tensor->ne[0], generation);
-}
-
-static bool ame_q8_plan_op(const ggml_tensor * op) {
-    return op != nullptr && op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
-        op->src[0] != nullptr && op->src[1] != nullptr &&
-        op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32;
-}
-
-static ame_xsai_q8_key ame_q8_plan_key(const ggml_tensor * op) {
-    ame_xsai_q8_key key = {};
-    const ggml_tensor * weight = op->src[0];
-    const ggml_tensor * activation = op->src[1];
-    key.k = weight->ne[0];
-    key.n = weight->ne[1];
-    key.m = activation->ne[1];
-    key.act_nb0 = activation->nb[0];
-    key.act_nb1 = activation->nb[1];
-    key.act_nb2 = activation->nb[2];
-    key.act_nb3 = activation->nb[3];
-    key.weight_nb0 = weight->nb[0];
-    key.weight_nb1 = weight->nb[1];
-    key.weight_identity = weight;
-    ame_refresh_q8_weight(weight);
-    key.prepared_weight = ame_xsai_weight_plan(weight);
-    key.weight_nb2 = weight->nb[2];
-    key.weight_nb3 = weight->nb[3];
-    key.dst_nb0 = op->nb[0];
-    key.dst_nb1 = op->nb[1];
-    key.dst_nb2 = op->nb[2];
-    key.dst_nb3 = op->nb[3];
-    key.src0_ne2 = weight->ne[2];
-    key.src0_ne3 = weight->ne[3];
-    key.src1_ne2 = activation->ne[2];
-    key.src1_ne3 = activation->ne[3];
-    key.dst_ne2 = op->ne[2];
-    key.dst_ne3 = op->ne[3];
-    key.weight_generation = ame_tensor_content_generation(weight);
-    key.explicit_options = 0;
-    return key;
-}
-
-static xsai_op_plan_t * ame_xsai_plan_get_or_create(const ggml_tensor * op) {
-    if (!ame_q8_plan_op(op)) {
-        return nullptr;
-    }
-    const ame_xsai_q8_key key = ame_q8_plan_key(op);
-    return ame_xsai_q8_cache_get_or_create(op, &key);
-}
-
-static xsai_op_plan_t * ame_xsai_plan_lookup(const ggml_tensor * op) {
-    if (!ame_q8_plan_op(op)) {
-        return nullptr;
-    }
-    const ame_xsai_q8_key key = ame_q8_plan_key(op);
-    return ame_xsai_q8_cache_lookup(op, &key);
-}
-
-static xsai_status_t ame_xsai_plan_execute(xsai_op_plan_t * plan, const ggml_tensor * op,
-                                           void * workspace, size_t workspace_size) {
-    const ame_xsai_q8_key key = ame_q8_plan_key(op);
-    const ame_xsai_q8_bind bind = {
-        op->src[1]->data,
-        op->src[0]->data,
-        op->data,
-        workspace,
-        workspace_size,
-    };
-    return ame_xsai_q8_cache_execute(plan, &key, &bind);
-}
-#endif
-
 // AME tensor_traits implementation
 namespace ggml::cpu::riscv_ame {
 
@@ -538,18 +376,8 @@ public:
         }
 #if defined(GGML_USE_XSAI_BLAS)
         if (op->src[0]->type == GGML_TYPE_Q8_0) {
-            xsai_op_plan_t * plan = ame_xsai_plan_get_or_create(op);
-            if (plan == nullptr) {
-                return false;
-            }
-            xsai_op_requirements_t requirements = {};
-            requirements.struct_size = sizeof(requirements);
-            requirements.abi_version = XSAI_BLAS_ABI_VERSION;
-            if (ame_xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
-                return false;
-            }
-            size = requirements.workspace_size;
-            return true;
+            return xsai_backend_q8_work_size(
+                op, ame_tensor_content_generation(op->src[0]), size);
         }
 #else
         if (op->src[0]->type == GGML_TYPE_Q8_0) {
@@ -581,22 +409,9 @@ public:
 
 #if defined(GGML_USE_XSAI_BLAS)
         if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_Q8_0) {
-            xsai_op_plan_t * plan = ame_xsai_plan_lookup(op);
-            if (plan == nullptr) {
-                return false;
-            }
-            if (params->ith != 0) {
-                return true;
-            }
-            const xsai_status_t status = ame_xsai_plan_execute(
-                plan, op, params->wdata, params->wsize);
-            /* UNSUPPORTED is returned before any output write. Let ggml CPU
-             * run that op. Any other execute failure may already have written
-             * dst, so it must not fall through. */
-            if (status == XSAI_STATUS_UNSUPPORTED) {
-                return false;
-            }
-            return true;
+            /* Q8 key, plan cache, and before-write fallback live in the xsai backend. */
+            return xsai_backend_q8_compute(
+                params, op, ame_tensor_content_generation(op->src[0]));
         }
 #endif
 
@@ -699,7 +514,7 @@ static void ggml_backend_ame_buffer_memset_tensor(
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
 #if defined(GGML_USE_XSAI_BLAS)
-        ame_refresh_q8_weight(tensor);
+        xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
 #endif
     }
 }
@@ -715,7 +530,7 @@ static void ggml_backend_ame_buffer_set_tensor(
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
 #if defined(GGML_USE_XSAI_BLAS)
-        ame_refresh_q8_weight(tensor);
+        xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
 #endif
     }
     GGML_UNUSED(data);
@@ -739,7 +554,7 @@ static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
         ctx->generation++;
 #if defined(GGML_USE_XSAI_BLAS)
         for (ggml_tensor * tensor : ctx->tensors) {
-            ame_refresh_q8_weight(tensor);
+            xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
         }
 #endif
     }
