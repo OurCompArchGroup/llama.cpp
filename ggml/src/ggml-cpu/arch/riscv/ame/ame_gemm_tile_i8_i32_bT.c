@@ -34,7 +34,8 @@ static int ame_tile_progress_enabled(void) {
 // C(MxN) = A(MxK) × B^T(NxK), where B is transposed in memory
 // This function computes a single MxN tile output
 #define DEFINE_AME_GEMM_TILE(FUNC, TILE_M_VALUE, TILE_K_VALUE, TILE_N_VALUE, TAG)       \
-void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                            \
+void FUNC(const int8_t * A, ptrdiff_t a_row_stride,                                     \
+    const int8_t * B, ptrdiff_t b_row_stride, int32_t * C) {                            \
     const int TILE_M = (TILE_M_VALUE);                                                  \
     const int TILE_K = (TILE_K_VALUE);                                                  \
     const int TILE_N = (TILE_N_VALUE);                                                  \
@@ -58,14 +59,14 @@ void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                    
                                                                                         \
     const int8_t * addr_a = A;                                                          \
     AME_TILE_PROGRESS_LOG("mla_begin%s A=%p stride=%d", TAG,                           \
-        (const void *) addr_a, TILE_K);                                                 \
-    MLA(tr0, addr_a, TILE_K);                                                           \
+        (const void *) addr_a, (int) a_row_stride);                                     \
+    MLA(tr0, addr_a, a_row_stride);                                                     \
     AME_TILE_PROGRESS_LOG("mla_done%s", TAG);                                          \
                                                                                         \
     const int8_t * addr_b = B;                                                          \
     AME_TILE_PROGRESS_LOG("mlb_begin%s B=%p stride=%d", TAG,                           \
-        (const void *) addr_b, TILE_K);                                                 \
-    MLB(tr1, addr_b, TILE_K);                                                           \
+        (const void *) addr_b, (int) b_row_stride);                                     \
+    MLB(tr1, addr_b, b_row_stride);                                                     \
     AME_TILE_PROGRESS_LOG("mlb_done%s", TAG);                                          \
                                                                                         \
     AME_TILE_PROGRESS_LOG("mmacc_begin%s", TAG);                                       \
@@ -89,8 +90,10 @@ DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT_128_64_128, 128, 64, 128, "_12
 void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C,
     int transpose_c,
@@ -116,21 +119,21 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     // Keep both tensor-register pairs busy and remove the per-tile parity
     // branch from the issue stream.
     for (; kb + 1 < k_tiles; kb += 2) {
-        MLA(tr0, addr_a, AME_TILE_K);
-        MLB(tr1, addr_b, AME_TILE_K);
+        MLA(tr0, addr_a, a_row_stride);
+        MLB(tr1, addr_b, b_row_stride);
         MMACC(acc0, tr0, tr1);
         addr_a += a_tile_stride;
         addr_b += b_tile_stride;
 
-        MLA(tr2, addr_a, AME_TILE_K);
-        MLB(tr3, addr_b, AME_TILE_K);
+        MLA(tr2, addr_a, a_row_stride);
+        MLB(tr3, addr_b, b_row_stride);
         MMACC(acc0, tr2, tr3);
         addr_a += a_tile_stride;
         addr_b += b_tile_stride;
     }
     if (kb < k_tiles) {
-        MLA(tr0, addr_a, AME_TILE_K);
-        MLB(tr1, addr_b, AME_TILE_K);
+        MLA(tr0, addr_a, a_row_stride);
+        MLB(tr1, addr_b, b_row_stride);
         MMACC(acc0, tr0, tr1);
     }
 
@@ -160,20 +163,26 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
 void ggml_ame_gemm_tile_i8_i32_bT_kloop(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C
 ) {
     ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
-        a_tiles, a_tile_stride, b_tiles, b_tile_stride, k_tiles, C, 0, NULL, NULL);
+        a_tiles, a_tile_stride, a_row_stride,
+        b_tiles, b_tile_stride, b_row_stride,
+        k_tiles, C, 0, NULL, NULL);
 }
 
 void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C
 ) {
@@ -194,21 +203,21 @@ void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
     const int8_t * addr_b = b_tiles;
     int kb = 0;
     for (; kb + 1 < k_tiles; kb += 2) {
-        MLA(tr0, addr_a, 64);
-        MLB(tr1, addr_b, 64);
+        MLA(tr0, addr_a, a_row_stride);
+        MLB(tr1, addr_b, b_row_stride);
         MMACC(acc0, tr0, tr1);
         addr_a += a_tile_stride;
         addr_b += b_tile_stride;
 
-        MLA(tr2, addr_a, 64);
-        MLB(tr3, addr_b, 64);
+        MLA(tr2, addr_a, a_row_stride);
+        MLB(tr3, addr_b, b_row_stride);
         MMACC(acc0, tr2, tr3);
         addr_a += a_tile_stride;
         addr_b += b_tile_stride;
     }
     if (kb < k_tiles) {
-        MLA(tr0, addr_a, 64);
-        MLB(tr1, addr_b, 64);
+        MLA(tr0, addr_a, a_row_stride);
+        MLB(tr1, addr_b, b_row_stride);
         MMACC(acc0, tr0, tr1);
     }
 
@@ -225,20 +234,20 @@ void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
     const int8_t * addr_b = b_tiles;                                     \
     int kb = 0;                                                          \
     for (; kb + 1 < k_tiles; kb += 2) {                                  \
-        MLA(tr0, addr_a, AME_TILE_K);                                     \
-        MLB(tr1, addr_b, AME_TILE_K);                                     \
+        MLA(tr0, addr_a, a_row_stride);                                     \
+        MLB(tr1, addr_b, b_row_stride);                                     \
         MMACC(ACC, tr0, tr1);                                             \
         addr_a += a_tile_stride;                                          \
         addr_b += b_tile_stride;                                          \
-        MLA(tr2, addr_a, AME_TILE_K);                                     \
-        MLB(tr3, addr_b, AME_TILE_K);                                     \
+        MLA(tr2, addr_a, a_row_stride);                                     \
+        MLB(tr3, addr_b, b_row_stride);                                     \
         MMACC(ACC, tr2, tr3);                                             \
         addr_a += a_tile_stride;                                          \
         addr_b += b_tile_stride;                                          \
     }                                                                     \
     if (kb < k_tiles) {                                                    \
-        MLA(tr0, addr_a, AME_TILE_K);                                     \
-        MLB(tr1, addr_b, AME_TILE_K);                                     \
+        MLA(tr0, addr_a, a_row_stride);                                     \
+        MLB(tr1, addr_b, b_row_stride);                                     \
         MMACC(ACC, tr0, tr1);                                             \
     }                                                                     \
 } while (0)
@@ -247,8 +256,10 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
     const int8_t * a_panels,
     ptrdiff_t a_panel_stride,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C0,
     int32_t * C1,
@@ -326,7 +337,8 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
 // owns the output buffer until ggml_ame_sync_acquire_wait() reaches the
 // returned token, so several submissions can share the AMU queue safely.
 #define DEFINE_AME_GEMM_TILE_SUBMIT(FUNC, TILE_M_VALUE, TILE_K_VALUE, TILE_N_VALUE, ACC, TRA, TRB, TAG) \
-unsigned long FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                                   \
+unsigned long FUNC(const int8_t * A, ptrdiff_t a_row_stride,                                            \
+    const int8_t * B, ptrdiff_t b_row_stride, int32_t * C) {                                            \
     const int TILE_M = (TILE_M_VALUE);                                                                  \
     const int TILE_K = (TILE_K_VALUE);                                                                  \
     const int TILE_N = (TILE_N_VALUE);                                                                  \
@@ -342,9 +354,9 @@ unsigned long FUNC(const int8_t * A, const int8_t * B, int32_t * C) {           
     MZERO(ACC);                                                                                         \
     AME_MLOAD_FENCE_BEFORE_LOAD(TAG);                                                                   \
     const int8_t * addr_a = A;                                                                          \
-    MLA(TRA, addr_a, TILE_K);                                                                           \
+    MLA(TRA, addr_a, a_row_stride);                                                                           \
     const int8_t * addr_b = B;                                                                          \
-    MLB(TRB, addr_b, TILE_K);                                                                           \
+    MLB(TRB, addr_b, b_row_stride);                                                                           \
     MMACC(ACC, TRA, TRB);                                                                               \
     MSC(ACC, addr_c, stride_c * 4);                                                                     \
     const unsigned long release_target = ggml_ame_sync_release();                                      \

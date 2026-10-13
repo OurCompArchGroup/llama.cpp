@@ -87,34 +87,10 @@ static inline void ame_nemu_signal(int a) {
 #endif
 }
 
-static int ame_skip_tile_b_zero(void) {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_env_enabled("GGML_AME_SKIP_TILE_B_ZERO") ? 1 : 0;
-    }
-    return cached;
-}
-
 static int ame_skip_tile_c_zero(void) {
     static int cached = -1;
     if (cached == -1) {
         cached = ame_env_enabled("GGML_AME_SKIP_TILE_C_ZERO") ? 1 : 0;
-    }
-    return cached;
-}
-
-static int ame_use_packed_b_panel(void) {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_env_enabled("GGML_AME_USE_PACKED_B_PANEL") ? 1 : 0;
-    }
-    return cached;
-}
-
-static int ame_disable_packed_a_tiles(void) {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_env_enabled("GGML_AME_DISABLE_PACKED_A_TILES") ? 1 : 0;
     }
     return cached;
 }
@@ -345,6 +321,84 @@ static void ame_ckpt_rebase_after_tile(void) {
     ggml_ame_sync_begin_op();
 }
 
+// Q8_0 ame64 直读路径的模式判定：plan 侧（ame-backend 的 ggml_backend_ame_desired_wsize）
+// 与运行期 kernel（ggml_ame_mul_mat_q8_0_ame64）共用同一份实现。
+// 历史教训：两侧曾各自判定，desired_wsize 少了 packed-B 区域 → 每次调用都退回
+// kernel 内部 ggml_aligned_malloc 兜底（profile 里表现为每 call 一次分配）。
+struct ame_q8_ame64_modes {
+    const ggml_ame_i8_kernel * kernel;
+    int async_batch_requested;
+    int async_reg_pairs;
+    int async_batch;
+    int use_whole_k_kloop;
+    int use_whole_k_fused_epilogue;
+    int use_whole_k_output_pipeline;
+    int use_whole_k_acc_pipeline;
+    int use_transposed_c_epilogue;
+    int async_c_slots;
+};
+
+static struct ame_q8_ame64_modes ame_q8_ame64_modes_for(int64_t M, int64_t N, int64_t K) {
+    struct ame_q8_ame64_modes m = {0};
+    const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+
+    m.kernel = ggml_ame_select_i8_kernel(M, N, K);
+    if (m.kernel == NULL) {
+        return m;
+    }
+
+    const int async_batch_requested = ame_async_batch_size();
+    const int async_reg_pairs_requested = ame_async_register_pairs();
+    m.async_batch_requested = async_batch_requested;
+    m.async_reg_pairs = async_reg_pairs_requested >= 2 && m.kernel->submit_alt != NULL ? 2 : 1;
+    const int async_batch_limit = m.async_reg_pairs >= 2 ? 2 : 4;
+    // B 直读后已无逐 tile 拷贝需要串行化：submit 可用即可走异步批处理
+    m.async_batch = m.kernel->submit != NULL ?
+        (async_batch_requested < async_batch_limit ? async_batch_requested : async_batch_limit) : 0;
+
+    const int sparse_progress =
+        ame_sparse_progress_interval() > 0 && ame_sparse_progress_shape_matches(M, N, K);
+    m.use_whole_k_kloop =
+        ame_whole_k_q8_enabled() &&
+        m.async_batch == 0 &&
+        !sparse_progress &&
+        !ame_ckpt_tile_enabled() &&
+        nb64 <= INT_MAX &&
+        K <= INT32_MAX / (127 * 127);
+    m.use_whole_k_fused_epilogue =
+        m.use_whole_k_kloop && ame_whole_k_fused_epilogue_enabled();
+    m.use_whole_k_output_pipeline =
+        m.use_whole_k_fused_epilogue &&
+        m.kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
+        ame_whole_k_output_pipeline_enabled();
+    m.use_whole_k_acc_pipeline =
+        m.use_whole_k_output_pipeline &&
+        ame_whole_k_acc_pipeline_enabled() &&
+        !ame_ckpt_rebase_every_tile_enabled();
+    m.use_transposed_c_epilogue =
+        m.use_whole_k_output_pipeline && ame_transposed_c_epilogue_enabled();
+    m.async_c_slots = m.use_whole_k_output_pipeline ? 2 : (m.async_batch > 1 ? m.async_batch : 1);
+    return m;
+}
+
+// 直读路径 workspace：64 对齐 + async_c_slots 个 tile_c 槽位。
+// A/B 以基址+offset 直读 repack 大数组，不再有 tile_a/tile_b 拷贝缓冲。
+static size_t ame_q8_ame64_workspace_size_for_modes(const struct ame_q8_ame64_modes * modes) {
+    if (modes->kernel == NULL) {
+        return 0;
+    }
+    size_t size = 64;
+    size += (size_t) modes->async_c_slots *
+        (size_t) modes->kernel->tile_m * (size_t) modes->kernel->tile_n * sizeof(int32_t);
+    return size;
+}
+
+// 供 plan 侧（ame-backend.cpp）调用的外部入口；必须与运行期 kernel 用同一实现
+size_t ggml_ame_q8_ame64_workspace_size(int64_t M, int64_t N, int64_t K) {
+    const struct ame_q8_ame64_modes modes = ame_q8_ame64_modes_for(M, N, K);
+    return ame_q8_ame64_workspace_size_for_modes(&modes);
+}
+
 static void ame_ckpt_notify_start(int64_t M, int64_t N, int64_t K, int64_t j0) {
     static int emitted = 0;
     static int64_t occurrence = 0;
@@ -494,6 +548,9 @@ static void ame_profile_dump(void) {
 
     const uint64_t ops = g_ame_profile.logical_macs * 2;
     const uint64_t cycles_total = g_ame_profile.cycles_baseline_total + g_ame_profile.cycles_packed_total;
+    // 直读路径带宽模型：AME 每次 tile 调用读 A(tile_m*tile_k) + B(tile_n*tile_k) 字节、
+    // 读回 tile_c；A/B 流量现在来自对 repack 大数组（entry.data / xq）的基址+offset
+    // 直读，不再是 workspace 拷贝缓冲 —— 每 tile 字节数与旧模型相同，仅访问局部性变化。
     const uint64_t tile_a_bytes = AME_TILE_M * AME_TILE_K * (uint64_t) sizeof(int8_t);
     const uint64_t tile_b_bytes = AME_TILE_N * AME_TILE_K * (uint64_t) sizeof(int8_t);
     const uint64_t tile_c_i32_bytes = AME_TILE_M * AME_TILE_N * (uint64_t) sizeof(int32_t);
@@ -598,9 +655,10 @@ static void ame_profile_accumulate(const struct ame_profile_counters * local) {
 /* Method A safety gate: CUTE AMU computes per-row addresses as
  *   PA_row = PA_base + row * stride
  * without issuing a TLB re-query for each virtual page boundary.
- * This is only correct when the tile buffers are physically contiguous.
- * tile_a = AME_TILE_M * AME_TILE_K = 128*64 = 8192 bytes spans 3 virtual
- * pages, so non-contiguous allocation silently corrupts rows >= 63 and >=127.
+ * This is only correct when the accessed buffers are physically contiguous.
+ * 直读路径下 MLA/MLB 直接跨行读 repack 大数组（entry.data / xq），
+ * 单条 MLA 覆盖 tile_m*nb64*66 字节：K=4096 时 m64 ≈ 264 KiB、m128 ≈ 528 KiB，
+ * 远超一页；非物理连续分配同样会静默读错行。
  */
 static void ame_assert_phys_contiguous(void) {
 #if defined(GGML_USE_RV_AME) && defined(GGML_XSAI_ALLOC)
@@ -612,8 +670,9 @@ static void ame_assert_phys_contiguous(void) {
             "[AME] FATAL: xsai memory pool is not physically contiguous.\n"
             "             CUTE AMU row-address formula: PA_row = PA_base + row*stride\n"
             "             (no per-row TLB re-query, LocalMMU TODO not yet implemented).\n"
-            "             tile_a (8192 B) spans 3 virtual pages; rows >=63 and >=127\n"
-            "             will read wrong physical addresses => silent data corruption.\n"
+            "             Direct-read kernels span tile_m*nb64*66 bytes per call\n"
+            "             (K=4096: ~264 KiB at m64 / ~528 KiB at m128) across many\n"
+            "             virtual pages; wrong physical addresses => silent corruption.\n"
             "             Fix: boot kernel with hugepages=512, or define\n"
             "             RESERVED_PHYS_BASE_ADDR for /dev/mem-backed pool.\n");
         abort();
@@ -628,9 +687,11 @@ static void ame_assert_phys_contiguous(void) {
 
 // Forward declaration of atomic GEMM function
 extern void ggml_ame_gemm_tile_i8_i32_bT(
-    const int8_t * A,      // Input matrix A: MxK
-    const int8_t * B,      // Input matrix B (transposed): NxK
-    int32_t * C            // Output matrix C: MxN
+    const int8_t * A,       // Input matrix A: MxK
+    ptrdiff_t a_row_stride, // Row stride of A in bytes
+    const int8_t * B,       // Input matrix B (transposed): NxK
+    ptrdiff_t b_row_stride, // Row stride of B in bytes
+    int32_t * C             // Output matrix C: MxN
 );
 
 extern void ggml_ame_gemm_tile_bf16_fp32_bT(
@@ -1075,7 +1136,7 @@ static inline void ame_store_scaled_tile_transposed(
 static inline void ame_finish_whole_k_pipeline_tile(
     float * restrict out,
     const int32_t * restrict c,
-    const float * restrict src0_tile_scales,
+    const block_q8_ame64 * restrict xa,
     const block_q8_ame64 * restrict xq,
     const float * restrict xq_scales,
     const int64_t mt,
@@ -1092,9 +1153,11 @@ static inline void ame_finish_whole_k_pipeline_tile(
     uint64_t prof_t0 = prof != NULL ? ame_read_cycle() : 0;
     float x_scales[AME_TILE_M_MAX];
     float y_scales[AME_TILE_N_MAX];
-    const float * restrict cached_scales =
-        src0_tile_scales + (size_t) mt * (size_t) nb64 * (size_t) tile_m;
-    memcpy(x_scales, cached_scales, (size_t) imax * sizeof(float));
+    // 直读：行 (mt*tile_m + i) 的 scale 取该行 kb=0 块的 d（whole-K 下每行各 kb 的 d 相同）
+    for (int i = 0; i < imax; ++i) {
+        x_scales[i] = GGML_FP16_TO_FP32(
+            xa[((size_t) mt * (size_t) tile_m + (size_t) i) * (size_t) nb64].d);
+    }
     for (int j = 0; j < jmax; ++j) {
         const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
         y_scales[j] = xq_scales != NULL ?
@@ -1113,7 +1176,7 @@ static inline void ame_finish_whole_k_pipeline_tile(
 struct ame_whole_k_overlap_context {
     float * out;
     const int32_t * c;
-    const float * src0_tile_scales;
+    const block_q8_ame64 * xa;
     const block_q8_ame64 * xq;
     const float * xq_scales;
     int64_t mt;
@@ -1134,7 +1197,7 @@ static void ame_finish_whole_k_pipeline_tile_callback(void * opaque) {
     ame_finish_whole_k_pipeline_tile(
         ctx->out,
         ctx->c,
-        ctx->src0_tile_scales,
+        ctx->xa,
         ctx->xq,
         ctx->xq_scales,
         ctx->mt,
@@ -1152,7 +1215,7 @@ static void ame_finish_whole_k_pipeline_tile_callback(void * opaque) {
 struct ame_whole_k_acc_pipeline_context {
     float * out;
     const int32_t * c_slots;
-    const float * src0_tile_scales;
+    const block_q8_ame64 * xa;
     const float * y_scales;
     int64_t nb64;
     int64_t M;
@@ -1170,8 +1233,12 @@ static void ame_finish_whole_k_acc_pipeline_tile(void * opaque, int tile_index) 
     const int64_t i0 = (int64_t) tile_index * ctx->tile_m;
     const int imax = i0 + ctx->tile_m <= ctx->M ? ctx->tile_m : (int) (ctx->M - i0);
     const int slot = tile_index & 1;
-    const float * restrict x_scales =
-        ctx->src0_tile_scales + (size_t) tile_index * (size_t) ctx->nb64 * (size_t) ctx->tile_m;
+    float x_scales_local[AME_TILE_M_MAX];
+    for (int i = 0; i < imax; ++i) {
+        x_scales_local[i] = GGML_FP16_TO_FP32(
+            ctx->xa[((size_t) i0 + (size_t) i) * (size_t) ctx->nb64].d);
+    }
+    const float * restrict x_scales = x_scales_local;
     const int32_t * restrict c = ctx->c_slots + (size_t) slot * ctx->tile_c_elements;
     const uint64_t prof_t0 = ctx->prof != NULL ? ame_read_cycle() : 0;
 
@@ -1226,7 +1293,10 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
     }
 
     const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-    const size_t blocks_count = (size_t) N * (size_t) nb64;
+    // 行数按 128（AME_TILE_M_MAX）对齐：直读路径下尾块 MLB 固定读 tile_m 行，
+    // 不足的行补零；缓存命中判定仍用原始 N（见下方 .N == N）
+    const int64_t N_pad = ((N + AME_TILE_M_MAX - 1) / AME_TILE_M_MAX) * AME_TILE_M_MAX;
+    const size_t blocks_count = (size_t) N_pad * (size_t) nb64;
 
     if (g_ame_x_q64_cache.key == src1_key &&
         g_ame_x_q64_cache.graph_key == graph_key &&
@@ -1287,6 +1357,13 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
         }
     }
 
+    // padding 行清零（量化循环只写 [0,N)）：qs=0 使累加贡献为 0，
+    // scales=0 防止 0 * 非零 scale 之外出现 0 * NaN 之类的传播
+    for (int64_t j = N; j < N_pad; ++j) {
+        memset(&g_ame_x_q64_cache.blocks[j * nb64], 0, (size_t) nb64 * sizeof(block_q8_ame64));
+        memset(&g_ame_x_q64_cache.scales[j * nb64], 0, (size_t) nb64 * sizeof(float));
+    }
+
     g_ame_x_q64_cache.key = src1_key;
     g_ame_x_q64_cache.graph_key = graph_key;
     g_ame_x_q64_cache.graph_id = graph_id;
@@ -1300,189 +1377,6 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
     return g_ame_x_q64_cache.blocks;
 }
 
-// Wrapper for AME-accelerated Q8_0 GEMM
-void ggml_ame_mul_mat_q8_0(
-    const void * src0,  // Weight matrix (Q8_0)
-    const void * src1,  // Input matrix (F32)
-    void * dst,         // Output (F32)
-    int64_t ne00,       // K
-    int64_t ne01,       // M
-    int64_t ne10,       // K (unused)
-    int64_t ne11,       // N
-    size_t src1_stride,
-    void * work_data,
-    size_t work_size
-) {
-    const int64_t M = ne01;
-    const int64_t N = ne11;
-    const int64_t K = ne00;
-    
-    const int qk = 32;
-    const int64_t nb_x = K / qk;
-    const int prof = ame_profile_enabled();
-    struct ame_profile_counters prof_local = {0};
-    uint64_t prof_total_start = 0;
-    if (prof) {
-        prof_total_start = ame_read_cycle();
-        prof_local.baseline_calls = 1;
-        prof_local.logical_macs = (uint64_t) M * (uint64_t) N * (uint64_t) K;
-    }
-
-    const block_q8_0 * restrict x = (const block_q8_0 *)src0;
-    float * restrict out = (float *)dst;
-
-    const ggml_ame_i8_kernel * kernel = ggml_ame_select_i8_kernel(M, N, K);
-    if (kernel == NULL) {
-        return;
-    }
-    const int tile_m = kernel->tile_m;
-    const int tile_k = kernel->tile_k;
-    const int tile_n = kernel->tile_n;
-    const size_t required_wsize = ggml_ame_i8_kernel_workspace_size(kernel, N, K, 0);
-    uint8_t * workspace = (uint8_t *)work_data;
-    int allocated_workspace = 0;
-
-    if (workspace == NULL || work_size < required_wsize) {
-        workspace = (uint8_t *)ggml_aligned_malloc(required_wsize);
-        if (!workspace) return;
-        work_size = required_wsize;
-        allocated_workspace = 1;
-    }
-
-    uintptr_t ws_ptr = (uintptr_t)workspace;
-    uintptr_t ws_end = ws_ptr + work_size;
-
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int8_t * tile_a = (int8_t *)ws_ptr;
-    ws_ptr += (size_t) tile_m * tile_k * sizeof(int8_t);
-
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int8_t * tile_b = (int8_t *)ws_ptr;
-    ws_ptr += (size_t) tile_n * tile_k * sizeof(int8_t);
-
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int32_t * tile_c = (int32_t *)ws_ptr;
-    ws_ptr += (size_t) tile_m * tile_n * sizeof(int32_t);
-
-    if (ws_ptr > ws_end) {
-        if (allocated_workspace) {
-            ggml_aligned_free(workspace, work_size);
-        }
-        return;
-    }
-
-    // Method A: verify physical contiguity contract before first AME instruction
-    ame_assert_phys_contiguous();
-    ggml_ame_sync_begin_op();
-    memset(tile_a, 0, (size_t) tile_m * tile_k * sizeof(int8_t));
-    memset(tile_b, 0, (size_t) tile_n * tile_k * sizeof(int8_t));
-
-    for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
-        const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
-
-        for (int64_t j0 = 0; j0 < N; j0 += tile_n) {
-            const int jmax = (j0 + tile_n <= N) ? tile_n : (N - j0);
-            
-            // Full AME Path for full tiles
-            float acc_f32[AME_TILE_M_MAX * AME_TILE_N_MAX];
-            uint64_t prof_t0 = prof ? ame_read_cycle() : 0;
-            memset(acc_f32, 0, sizeof(acc_f32));
-            if (prof) {
-                prof_local.cycles_accumulator_initialization += ame_read_cycle() - prof_t0;
-            }
-
-            for (int64_t kb = 0; kb < nb_x; kb++) {
-                float y_scales[AME_TILE_N_MAX];
-                float x_scales[AME_TILE_M_MAX];
-                memset(y_scales, 0, sizeof(y_scales));
-                memset(x_scales, 0, sizeof(x_scales));
-
-                // Prepare Tile A (16 x 32)
-                prof_t0 = prof ? ame_read_cycle() : 0;
-                for (int i = 0; i < tile_m; i++) {
-                     if (i < imax) {
-                         const block_q8_0 * b = &x[(i0 + i) * nb_x + kb];
-                         memcpy(&tile_a[i * tile_k], b->qs, qk);
-                     } else {
-                         memset(&tile_a[i * tile_k], 0, qk);
-                     }
-                }
-                if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
-
-                // Prepare Tile B (16 x 32)
-                 prof_t0 = prof ? ame_read_cycle() : 0;
-                 if (!ame_skip_tile_b_zero()) {
-                     memset(tile_b, 0, (size_t) tile_n * tile_k * sizeof(int8_t));
-                 }
-                 for (int j = 0; j < jmax; j++) {
-                     const float * src1_col = (const float *)((const char *)src1 + (j0 + j) * src1_stride);
-                     block_q8_0 tmp_block;
-                     ggml_ame_quantize_row_f32_to_q8_0(src1_col + kb * qk, &tmp_block, qk);
-                     y_scales[j] = GGML_FP16_TO_FP32(tmp_block.d);
-                     memcpy(&tile_b[j * tile_k], tmp_block.qs, qk);
-                 }
-                if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
-
-                prof_t0 = prof ? ame_read_cycle() : 0;
-                if (!ame_skip_tile_c_zero()) {
-                    memset(tile_c, 0, (size_t) tile_m * tile_n * sizeof(int32_t));
-                    if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
-                }
-
-                prof_t0 = prof ? ame_read_cycle() : 0;
-                kernel->gemm(tile_a, tile_b, tile_c);
-                ame_ckpt_rebase_after_tile();
-                if (prof) {
-                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
-                    prof_local.tile_calls++;
-                    if (imax < tile_m || jmax < tile_n) {
-                        prof_local.edge_tile_calls++;
-                    }
-                }
-
-                // Accumulate scaling factors
-                prof_t0 = prof ? ame_read_cycle() : 0;
-                for (int i = 0; i < imax; i++) {
-                     const block_q8_0 * bx = &x[(i0 + i) * nb_x + kb];
-                     x_scales[i] = GGML_FP16_TO_FP32(bx->d);
-                }
-                ame_accumulate_scaled_tile(
-                    acc_f32,
-                    tile_c,
-                    x_scales,
-                    y_scales,
-                    tile_n,
-                    imax,
-                    jmax);
-                if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
-            }
-
-            // Copy back
-            prof_t0 = prof ? ame_read_cycle() : 0;
-            ame_store_acc_tile(
-                out + j0 * M + i0,
-                acc_f32,
-                M,
-                tile_n,
-                imax,
-                jmax);
-            if (prof) {
-                prof_local.cycles_store += ame_read_cycle() - prof_t0;
-                prof_local.output_tile_calls++;
-            }
-        }
-    }
-
-    if (prof) {
-        prof_local.cycles_baseline_total = ame_read_cycle() - prof_total_start;
-        ame_profile_accumulate(&prof_local);
-    }
-
-    if (allocated_workspace) {
-        ggml_aligned_free(workspace, work_size);
-    }
-}
-
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
     const void * src1_key,
@@ -1493,8 +1387,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne10,
     int64_t ne11,
     size_t src1_stride,
-    const int8_t * src0_tile_a,
-    const float * src0_tile_scales,
     int graph_id,
     const void * graph_key,
     uint64_t src1_generation,
@@ -1505,6 +1397,12 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int64_t N = ne11;
     const int64_t K = ne00;
     const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+    // 直读布局（A 侧 = 权重 repack 数组）：块 = {uint16 d; int8 qs[64]}，块长 ablock。
+    // A 第 m 行第 kb 块的 qs 地址 = (const int8_t *) x + (m*nb64 + kb)*ablock + a_qs_off；
+    // 行距 a_row_stride = nb64*ablock（同一 kb 的相邻行），相邻 k 块增量 = ablock。
+    const size_t ablock = sizeof(block_q8_ame64);
+    const size_t a_qs_off = offsetof(block_q8_ame64, qs);
+    const ptrdiff_t a_row_stride = (ptrdiff_t) ((size_t) nb64 * ablock);
     const ggml_ame_i8_kernel * kernel = ggml_ame_select_i8_kernel(M, N, K);
     if (kernel == NULL) {
         return;
@@ -1512,52 +1410,24 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int tile_m = kernel->tile_m;
     const int tile_k = kernel->tile_k;
     const int tile_n = kernel->tile_n;
-    const int use_packed_b_panel = ame_use_packed_b_panel();
-    const int use_packed_a_tiles =
-        (kernel->kind == GGML_AME_I8_KERNEL_64_64_64 ||
-         kernel->kind == GGML_AME_I8_KERNEL_128_64_128) &&
-        !ame_disable_packed_a_tiles() &&
-        src0_tile_a != NULL &&
-        src0_tile_scales != NULL;
-    const int async_batch_requested = ame_async_batch_size();
-    const int async_reg_pairs_requested = ame_async_register_pairs();
-    const int async_reg_pairs =
-        async_reg_pairs_requested >= 2 && kernel->submit_alt != NULL ? 2 : 1;
-    const int async_batch_limit = async_reg_pairs >= 2 ? 2 : 4;
-    const int async_batch =
-        use_packed_b_panel && use_packed_a_tiles && kernel->submit != NULL ?
-        (async_batch_requested < async_batch_limit ? async_batch_requested : async_batch_limit) : 0;
+    // 模式判定与 workspace 规划共享同一实现（见文件上方 ame_q8_ame64_modes_for）
+    const struct ame_q8_ame64_modes modes = ame_q8_ame64_modes_for(M, N, K);
+    const int async_batch_requested = modes.async_batch_requested;
+    const int async_reg_pairs = modes.async_reg_pairs;
+    const int async_batch = modes.async_batch;
     const int64_t sparse_interval = ame_sparse_progress_interval();
     const int sparse_progress = sparse_interval > 0 && ame_sparse_progress_shape_matches(M, N, K);
-    const int use_whole_k_kloop =
-        use_packed_b_panel &&
-        use_packed_a_tiles &&
-        ame_whole_k_q8_enabled() &&
-        async_batch == 0 &&
-        !sparse_progress &&
-        !ame_ckpt_tile_enabled() &&
-        nb64 <= INT_MAX &&
-        K <= INT32_MAX / (127 * 127);
-    const int use_whole_k_fused_epilogue =
-        use_whole_k_kloop && ame_whole_k_fused_epilogue_enabled();
-    const int use_whole_k_output_pipeline =
-        use_whole_k_fused_epilogue &&
-        kernel->kind == GGML_AME_I8_KERNEL_64_64_64 &&
-        ame_whole_k_output_pipeline_enabled();
-    const int use_whole_k_acc_pipeline =
-        use_whole_k_output_pipeline &&
-        ame_whole_k_acc_pipeline_enabled() &&
-        !ame_ckpt_rebase_every_tile_enabled();
-    const int use_transposed_c_epilogue =
-        use_whole_k_output_pipeline && ame_transposed_c_epilogue_enabled();
+    const int use_whole_k_kloop = modes.use_whole_k_kloop;
+    const int use_whole_k_fused_epilogue = modes.use_whole_k_fused_epilogue;
+    const int use_whole_k_output_pipeline = modes.use_whole_k_output_pipeline;
+    const int use_whole_k_acc_pipeline = modes.use_whole_k_acc_pipeline;
+    const int use_transposed_c_epilogue = modes.use_transposed_c_epilogue;
     const uint64_t sparse_total_tiles =
         (uint64_t) ((M + tile_m - 1) / tile_m) *
         (uint64_t) ((N + tile_n - 1) / tile_n) *
         (uint64_t) nb64;
     const uint64_t sparse_op = sparse_progress ? ++g_ame_sparse_op_sequence : 0;
     uint64_t sparse_tile = 0;
-    const size_t tile_b_size = (size_t) tile_n * tile_k * sizeof(int8_t);
-    const size_t packed_b_panel_size = (size_t) nb64 * tile_b_size;
     const int prof = ame_profile_enabled();
     struct ame_profile_counters prof_local = {0};
     uint64_t prof_total_start = 0;
@@ -1571,16 +1441,14 @@ void ggml_ame_mul_mat_q8_0_ame64(
     float * restrict out = (float *) dst;
 
     const size_t tile_c_bytes = (size_t) tile_m * tile_n * sizeof(int32_t);
-    const int async_c_slots = use_whole_k_output_pipeline ? 2 : (async_batch > 1 ? async_batch : 1);
-    const size_t required_wsize =
-        ggml_ame_i8_kernel_workspace_size(kernel, N, K, use_packed_b_panel) +
-        (size_t) (async_c_slots - 1) * tile_c_bytes;
+    const int async_c_slots = modes.async_c_slots;
+    const size_t required_wsize = ame_q8_ame64_workspace_size_for_modes(&modes);
     uint8_t * workspace = (uint8_t *) work_data;
     int allocated_workspace = 0;
     AME_PANEL_PROGRESS_LOG(
-        "ame64 start: kernel=%s M=%lld N=%lld K=%lld nb64=%lld use_packed_b_panel=%d whole_k_kloop=%d fused_epilogue=%d output_pipeline=%d acc_pipeline=%d transposed_c=%d async_batch=%d requested=%d reg_pairs=%d work_data=%p work_size=%zu",
+        "ame64 start: kernel=%s M=%lld N=%lld K=%lld nb64=%lld whole_k_kloop=%d fused_epilogue=%d output_pipeline=%d acc_pipeline=%d transposed_c=%d async_batch=%d requested=%d reg_pairs=%d work_data=%p work_size=%zu",
         kernel->name, (long long) M, (long long) N, (long long) K, (long long) nb64,
-        use_packed_b_panel, use_whole_k_kloop, use_whole_k_fused_epilogue, use_whole_k_output_pipeline,
+        use_whole_k_kloop, use_whole_k_fused_epilogue, use_whole_k_output_pipeline,
         use_whole_k_acc_pipeline, use_transposed_c_epilogue, async_batch, async_batch_requested,
         async_reg_pairs, work_data, work_size);
 
@@ -1603,14 +1471,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
     uintptr_t ws_ptr = (uintptr_t) workspace;
     uintptr_t ws_end = ws_ptr + work_size;
 
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int8_t * tile_a = (int8_t *) ws_ptr;
-    ws_ptr += (size_t) tile_m * tile_k * sizeof(int8_t);
-
-    ws_ptr = ame_align_up_size(ws_ptr, 64);
-    int8_t * tile_b = (int8_t *) ws_ptr;
-    ws_ptr += use_packed_b_panel ? packed_b_panel_size : tile_b_size;
-
+    // 直读路径：A/B 已不再进 workspace，仅保留 tile_c 槽位
     ws_ptr = ame_align_up_size(ws_ptr, 64);
     int32_t * tile_c = (int32_t *) ws_ptr;
     ws_ptr += (size_t) async_c_slots * tile_c_bytes;
@@ -1626,8 +1487,8 @@ void ggml_ame_mul_mat_q8_0_ame64(
     }
 
     AME_PANEL_PROGRESS_LOG(
-        "ame64 workspace_ready: tile_a=%p tile_b=%p tile_c=%p tile_m=%d tile_n=%d tile_k=%d",
-        (void *) tile_a, (void *) tile_b, (void *) tile_c, tile_m, tile_n, tile_k);
+        "ame64 workspace_ready: tile_c=%p tile_m=%d tile_n=%d tile_k=%d",
+        (void *) tile_c, tile_m, tile_n, tile_k);
     AME_PANEL_PROGRESS_LOG("ame64 assert_phys_begin");
     ame_assert_phys_contiguous();
     AME_PANEL_PROGRESS_LOG("ame64 assert_phys_done");
@@ -1649,7 +1510,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
     if (sparse_progress) {
         fprintf(stderr,
                 "[AME_SPARSE] op=%llu phase=begin tiles=%llu interval=%lld range=%llu..%llu "
-                "M=%lld N=%lld K=%lld packed_b=%d kernel=%s\n",
+                "M=%lld N=%lld K=%lld kernel=%s\n",
                 (unsigned long long) sparse_op,
                 (unsigned long long) sparse_total_tiles,
                 (long long) sparse_interval,
@@ -1658,16 +1519,11 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 (long long) M,
                 (long long) N,
                 (long long) K,
-                use_packed_b_panel,
                 kernel->name);
         fflush(stderr);
     }
-    AME_PANEL_PROGRESS_LOG("ame64 clear_tiles_begin");
-    memset(tile_a, 0, (size_t) tile_m * tile_k * sizeof(int8_t));
-    if (!use_packed_b_panel) {
-        memset(tile_b, 0, tile_b_size);
-    }
-    AME_PANEL_PROGRESS_LOG("ame64 clear_tiles_done");
+    // 直读路径下 A/B 均不进 workspace（尾块由 repack 阶段的 padding 零行兜底），
+    // workspace 中只有 tile_c 槽位，无需预清零。
 
     uint64_t prof_t0 = prof ? ame_read_cycle() : 0;
     const float * xq_scales = NULL;
@@ -1717,460 +1573,246 @@ void ggml_ame_mul_mat_q8_0_ame64(
     if (prof) prof_local.cycles_prepare_cache += ame_read_cycle() - prof_t0;
     AME_PANEL_PROGRESS_LOG("ame64 prepare_cache_done");
 
-    if (use_packed_b_panel) {
-        int8_t * packed_b_panel = tile_b;
-        AME_PANEL_LOG("ame64 packed_b_panel: kernel=%s M=%lld N=%lld K=%lld nb64=%lld panel_bytes=%zu",
-            kernel->name, (long long) M, (long long) N, (long long) K, (long long) nb64, packed_b_panel_size);
+    // B 直读（原 packed_b_panel 拷贝路径已删除）：xq 按 [N][nb64] 块排布，块长 ablock、
+    // qs 偏移 a_qs_off；行距 nb64*ablock（= a_row_stride），相邻 k 块增量 ablock。
+    // 尾块（j 超出 N 的行）由 xq 的 128 行对齐零行兜底。
+    for (int64_t j0 = 0; j0 < N; j0 += tile_n) {
+        const int jmax = (j0 + tile_n <= N) ? tile_n : (N - j0);
 
-        for (int64_t j0 = 0; j0 < N; j0 += tile_n) {
-            const int jmax = (j0 + tile_n <= N) ? tile_n : (N - j0);
-
-            prof_t0 = prof ? ame_read_cycle() : 0;
-            memset(packed_b_panel, 0, packed_b_panel_size);
-            for (int64_t kb = 0; kb < nb64; ++kb) {
-                int8_t * panel_tile_b = packed_b_panel + kb * tile_b_size;
+        if (use_whole_k_output_pipeline) {
+            if (use_whole_k_acc_pipeline) {
+                float y_scales[AME_TILE_N_MAX];
+                const int output_tiles = (int) ((M + tile_m - 1) / tile_m);
                 for (int j = 0; j < jmax; ++j) {
-                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                    memcpy(&panel_tile_b[j * tile_k], bx->qs, AME_Q8_PACK_K);
+                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
+                    y_scales[j] = xq_scales != NULL ?
+                        xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
                 }
+                struct ame_whole_k_acc_pipeline_context pipeline_ctx = {
+                    .out = out + j0 * M,
+                    .c_slots = tile_c,
+                    .xa = x,
+                    .y_scales = y_scales,
+                    .nb64 = nb64,
+                    .M = M,
+                    .tile_c_elements = tile_c_bytes / sizeof(int32_t),
+                    .tile_m = tile_m,
+                    .tile_n = tile_n,
+                    .jmax = jmax,
+                    .transposed_c = use_transposed_c_epilogue,
+                    .prof = prof ? &prof_local : NULL,
+                };
+
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
+                    (const int8_t *) x + a_qs_off,
+                    (ptrdiff_t) ((size_t) tile_m * (size_t) nb64 * ablock),
+                    (ptrdiff_t) ablock,
+                    a_row_stride,
+                    (const int8_t *) xq + ((size_t) j0 * (size_t) nb64) * ablock + a_qs_off,
+                    (ptrdiff_t) ablock,
+                    a_row_stride,
+                    (int) nb64,
+                    tile_c,
+                    tile_c + tile_c_bytes / sizeof(int32_t),
+                    output_tiles,
+                    use_transposed_c_epilogue,
+                    ame_finish_whole_k_acc_pipeline_tile,
+                    &pipeline_ctx);
+                if (prof) {
+                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
+                    prof_local.tile_calls += (uint64_t) output_tiles * (uint64_t) nb64;
+                    prof_local.whole_k_kloop_calls += (uint64_t) output_tiles;
+                    prof_local.whole_k_pipeline_calls += (uint64_t) output_tiles;
+                    if (jmax < tile_n || K % AME_Q8_PACK_K != 0) {
+                        prof_local.edge_tile_calls += (uint64_t) output_tiles * (uint64_t) nb64;
+                    } else if (M % tile_m != 0) {
+                        prof_local.edge_tile_calls += (uint64_t) nb64;
+                    }
+                }
+                sparse_tile += (uint64_t) output_tiles * (uint64_t) nb64;
+                AME_PANEL_LOG("ame64 whole-K acc pipeline: j0=%lld done", (long long) j0);
+                continue;
             }
-            if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
-            AME_PANEL_LOG("ame64 packed_b_panel: j0=%lld jmax=%d packed", (long long) j0, jmax);
 
-            if (use_whole_k_output_pipeline) {
-                const size_t tile_bytes = (size_t) tile_m * tile_k * sizeof(int8_t);
+            int pending_slot = -1;
+            int64_t pending_i0 = 0;
+            int pending_imax = 0;
+            int submitted = 0;
 
-                if (use_whole_k_acc_pipeline) {
-                    float y_scales[AME_TILE_N_MAX];
-                    const int output_tiles = (int) ((M + tile_m - 1) / tile_m);
-                    for (int j = 0; j < jmax; ++j) {
-                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
-                        y_scales[j] = xq_scales != NULL ?
-                            xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
-                    }
-                    struct ame_whole_k_acc_pipeline_context pipeline_ctx = {
-                        .out = out + j0 * M,
-                        .c_slots = tile_c,
-                        .src0_tile_scales = src0_tile_scales,
-                        .y_scales = y_scales,
-                        .nb64 = nb64,
-                        .M = M,
-                        .tile_c_elements = tile_c_bytes / sizeof(int32_t),
-                        .tile_m = tile_m,
-                        .tile_n = tile_n,
-                        .jmax = jmax,
-                        .transposed_c = use_transposed_c_epilogue,
-                        .prof = prof ? &prof_local : NULL,
-                    };
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
-                        src0_tile_a,
-                        (ptrdiff_t) ((size_t) nb64 * tile_bytes),
-                        (ptrdiff_t) tile_bytes,
-                        packed_b_panel,
-                        (ptrdiff_t) tile_b_size,
-                        (int) nb64,
-                        tile_c,
-                        tile_c + tile_c_bytes / sizeof(int32_t),
-                        output_tiles,
-                        use_transposed_c_epilogue,
-                        ame_finish_whole_k_acc_pipeline_tile,
-                        &pipeline_ctx);
-                    if (prof) {
-                        prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
-                        prof_local.tile_calls += (uint64_t) output_tiles * (uint64_t) nb64;
-                        prof_local.whole_k_kloop_calls += (uint64_t) output_tiles;
-                        prof_local.whole_k_pipeline_calls += (uint64_t) output_tiles;
-                        if (jmax < tile_n || K % AME_Q8_PACK_K != 0) {
-                            prof_local.edge_tile_calls += (uint64_t) output_tiles * (uint64_t) nb64;
-                        } else if (M % tile_m != 0) {
-                            prof_local.edge_tile_calls += (uint64_t) nb64;
-                        }
-                    }
-                    sparse_tile += (uint64_t) output_tiles * (uint64_t) nb64;
-                    AME_PANEL_LOG("ame64 whole-K acc pipeline: j0=%lld done", (long long) j0);
-                    continue;
-                }
-
-                int pending_slot = -1;
-                int64_t pending_i0 = 0;
-                int pending_imax = 0;
-                int submitted = 0;
-
-                // All A/B panels are immutable at this point.  One fence is
-                // sufficient before the stream.  Both memory slots deliberately
-                // reuse acc0.  The overlap helper keeps its stack frame and C
-                // address live until macquire, while its callback scales the
-                // completed previous slot as the current AME submission drains.
+            // All A/B panels are immutable at this point.  One fence is
+            // sufficient before the stream.  Both memory slots deliberately
+            // reuse acc0.  The overlap helper keeps its stack frame and C
+            // address live until macquire, while its callback scales the
+            // completed previous slot as the current AME submission drains.
 #if defined(__riscv)
-                asm volatile("fence rw, rw" ::: "memory");
+            asm volatile("fence rw, rw" ::: "memory");
 #endif
-                for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
-                    const int slot = submitted & 1;
-                    const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
-                    const int64_t mt = i0 / tile_m;
-                    const int8_t * packed_a_panel =
-                        src0_tile_a + (size_t) mt * (size_t) nb64 * tile_bytes;
-                    int32_t * c_slot = tile_c + (size_t) slot * (tile_c_bytes / sizeof(int32_t));
-                    struct ame_whole_k_overlap_context overlap_ctx = {0};
-                    if (pending_slot >= 0) {
-                        overlap_ctx.out = out + j0 * M + pending_i0;
-                        overlap_ctx.c = tile_c +
-                            (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t));
-                        overlap_ctx.src0_tile_scales = src0_tile_scales;
-                        overlap_ctx.xq = xq;
-                        overlap_ctx.xq_scales = xq_scales;
-                        overlap_ctx.mt = pending_i0 / tile_m;
-                        overlap_ctx.j0 = j0;
-                        overlap_ctx.nb64 = nb64;
-                        overlap_ctx.M = M;
-                        overlap_ctx.tile_m = tile_m;
-                        overlap_ctx.tile_n = tile_n;
-                        overlap_ctx.imax = pending_imax;
-                        overlap_ctx.jmax = jmax;
-                        overlap_ctx.transposed_c = use_transposed_c_epilogue;
-                        overlap_ctx.prof = prof ? &prof_local : NULL;
-                    }
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
-                        packed_a_panel, (ptrdiff_t) tile_bytes,
-                        packed_b_panel, (ptrdiff_t) tile_b_size,
-                        (int) nb64, c_slot,
-                        use_transposed_c_epilogue,
-                        pending_slot >= 0 ? ame_finish_whole_k_pipeline_tile_callback : NULL,
-                        pending_slot >= 0 ? &overlap_ctx : NULL);
-                    if (prof) {
-                        prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
-                        prof_local.tile_calls += (uint64_t) nb64;
-                        prof_local.whole_k_kloop_calls++;
-                        prof_local.whole_k_pipeline_calls++;
-                        if (imax < tile_m || jmax < tile_n) {
-                            prof_local.edge_tile_calls += (uint64_t) nb64;
-                        } else if (K % AME_Q8_PACK_K != 0) {
-                            prof_local.edge_tile_calls++;
-                        }
-                    }
-                    sparse_tile += (uint64_t) nb64;
-                    if (pending_slot >= 0) {
-                        ame_ckpt_rebase_after_tile();
-                        if (prof) {
-                            prof_local.output_tile_calls++;
-                        }
-                    }
-                    pending_slot = slot;
-                    pending_i0 = i0;
-                    pending_imax = imax;
-                    submitted++;
+            for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
+                const int slot = submitted & 1;
+                const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
+                const int64_t mt = i0 / tile_m;
+                const int8_t * packed_a_panel =
+                    (const int8_t *) x +
+                    ((size_t) mt * (size_t) tile_m * (size_t) nb64) * ablock + a_qs_off;
+                int32_t * c_slot = tile_c + (size_t) slot * (tile_c_bytes / sizeof(int32_t));
+                struct ame_whole_k_overlap_context overlap_ctx = {0};
+                if (pending_slot >= 0) {
+                    overlap_ctx.out = out + j0 * M + pending_i0;
+                    overlap_ctx.c = tile_c +
+                        (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t));
+                    overlap_ctx.xa = x;
+                    overlap_ctx.xq = xq;
+                    overlap_ctx.xq_scales = xq_scales;
+                    overlap_ctx.mt = pending_i0 / tile_m;
+                    overlap_ctx.j0 = j0;
+                    overlap_ctx.nb64 = nb64;
+                    overlap_ctx.M = M;
+                    overlap_ctx.tile_m = tile_m;
+                    overlap_ctx.tile_n = tile_n;
+                    overlap_ctx.imax = pending_imax;
+                    overlap_ctx.jmax = jmax;
+                    overlap_ctx.transposed_c = use_transposed_c_epilogue;
+                    overlap_ctx.prof = prof ? &prof_local : NULL;
                 }
 
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
+                    packed_a_panel, (ptrdiff_t) ablock, a_row_stride,
+                    (const int8_t *) xq + ((size_t) j0 * (size_t) nb64) * ablock + a_qs_off,
+                    (ptrdiff_t) ablock, a_row_stride,
+                    (int) nb64, c_slot,
+                    use_transposed_c_epilogue,
+                    pending_slot >= 0 ? ame_finish_whole_k_pipeline_tile_callback : NULL,
+                    pending_slot >= 0 ? &overlap_ctx : NULL);
+                if (prof) {
+                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
+                    prof_local.tile_calls += (uint64_t) nb64;
+                    prof_local.whole_k_kloop_calls++;
+                    prof_local.whole_k_pipeline_calls++;
+                    if (imax < tile_m || jmax < tile_n) {
+                        prof_local.edge_tile_calls += (uint64_t) nb64;
+                    } else if (K % AME_Q8_PACK_K != 0) {
+                        prof_local.edge_tile_calls++;
+                    }
+                }
+                sparse_tile += (uint64_t) nb64;
                 if (pending_slot >= 0) {
-                    ame_finish_whole_k_pipeline_tile(
-                        out + j0 * M + pending_i0,
-                        tile_c + (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t)),
-                        src0_tile_scales,
-                        xq,
-                        xq_scales,
-                        pending_i0 / tile_m,
-                        j0,
-                        nb64,
-                        M,
-                        tile_m,
-                        tile_n,
-                        pending_imax,
-                        jmax,
-                        use_transposed_c_epilogue,
-                        prof ? &prof_local : NULL);
                     ame_ckpt_rebase_after_tile();
                     if (prof) {
                         prof_local.output_tile_calls++;
                     }
                 }
-                AME_PANEL_LOG("ame64 whole-K output pipeline: j0=%lld done", (long long) j0);
-                continue;
+                pending_slot = slot;
+                pending_i0 = i0;
+                pending_imax = imax;
+                submitted++;
             }
 
-            for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
-                const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
-                const int64_t mt = i0 / tile_m;
-                float acc_f32[AME_TILE_M_MAX * AME_TILE_N_MAX];
-                if (!use_whole_k_fused_epilogue) {
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    memset(acc_f32, 0, sizeof(acc_f32));
-                    if (prof) {
-                        prof_local.cycles_accumulator_initialization += ame_read_cycle() - prof_t0;
+            if (pending_slot >= 0) {
+                ame_finish_whole_k_pipeline_tile(
+                    out + j0 * M + pending_i0,
+                    tile_c + (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t)),
+                    x,
+                    xq,
+                    xq_scales,
+                    pending_i0 / tile_m,
+                    j0,
+                    nb64,
+                    M,
+                    tile_m,
+                    tile_n,
+                    pending_imax,
+                    jmax,
+                    use_transposed_c_epilogue,
+                    prof ? &prof_local : NULL);
+                ame_ckpt_rebase_after_tile();
+                if (prof) {
+                    prof_local.output_tile_calls++;
+                }
+            }
+            AME_PANEL_LOG("ame64 whole-K output pipeline: j0=%lld done", (long long) j0);
+            continue;
+        }
+
+        for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
+            const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
+            const int64_t mt = i0 / tile_m;
+            float acc_f32[AME_TILE_M_MAX * AME_TILE_N_MAX];
+            if (!use_whole_k_fused_epilogue) {
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                memset(acc_f32, 0, sizeof(acc_f32));
+                if (prof) {
+                    prof_local.cycles_accumulator_initialization += ame_read_cycle() - prof_t0;
+                }
+            }
+            AME_PANEL_PROGRESS_LOG(
+                "ame64 b_direct: M=%lld N=%lld K=%lld j0=%lld i0=%lld begin",
+                (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
+
+            if (use_whole_k_kloop) {
+                float x_scales[AME_TILE_M_MAX];
+                float y_scales[AME_TILE_N_MAX];
+                const int8_t * packed_a_panel =
+                    (const int8_t *) x +
+                    ((size_t) mt * (size_t) tile_m * (size_t) nb64) * ablock + a_qs_off;
+
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                if (kernel->kind == GGML_AME_I8_KERNEL_128_64_128) {
+                    ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
+                        packed_a_panel,
+                        (ptrdiff_t) ablock,
+                        a_row_stride,
+                        (const int8_t *) xq + ((size_t) j0 * (size_t) nb64) * ablock + a_qs_off,
+                        (ptrdiff_t) ablock,
+                        a_row_stride,
+                        (int) nb64,
+                        tile_c);
+                } else {
+                    ggml_ame_gemm_tile_i8_i32_bT_kloop(
+                        packed_a_panel,
+                        (ptrdiff_t) ablock,
+                        a_row_stride,
+                        (const int8_t *) xq + ((size_t) j0 * (size_t) nb64) * ablock + a_qs_off,
+                        (ptrdiff_t) ablock,
+                        a_row_stride,
+                        (int) nb64,
+                        tile_c);
+                }
+                ame_ckpt_rebase_after_tile();
+                sparse_tile += (uint64_t) nb64;
+                if (prof) {
+                    prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
+                    prof_local.tile_calls += (uint64_t) nb64;
+                    prof_local.whole_k_kloop_calls++;
+                    if (imax < tile_m || jmax < tile_n) {
+                        prof_local.edge_tile_calls += (uint64_t) nb64;
+                    } else if (K % AME_Q8_PACK_K != 0) {
+                        prof_local.edge_tile_calls++;
                     }
                 }
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld begin",
-                    (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
 
-                if (use_whole_k_kloop) {
-                    float x_scales[AME_TILE_M_MAX];
-                    float y_scales[AME_TILE_N_MAX];
-                    const size_t tile_bytes = (size_t) tile_m * tile_k * sizeof(int8_t);
-                    const int8_t * packed_a_panel =
-                        src0_tile_a + (size_t) mt * (size_t) nb64 * tile_bytes;
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    if (kernel->kind == GGML_AME_I8_KERNEL_128_64_128) {
-                        ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
-                            packed_a_panel,
-                            (ptrdiff_t) tile_bytes,
-                            packed_b_panel,
-                            (ptrdiff_t) tile_b_size,
-                            (int) nb64,
-                            tile_c);
-                    } else {
-                        ggml_ame_gemm_tile_i8_i32_bT_kloop(
-                            packed_a_panel,
-                            (ptrdiff_t) tile_bytes,
-                            packed_b_panel,
-                            (ptrdiff_t) tile_b_size,
-                            (int) nb64,
-                            tile_c);
-                    }
-                    ame_ckpt_rebase_after_tile();
-                    sparse_tile += (uint64_t) nb64;
-                    if (prof) {
-                        prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
-                        prof_local.tile_calls += (uint64_t) nb64;
-                        prof_local.whole_k_kloop_calls++;
-                        if (imax < tile_m || jmax < tile_n) {
-                            prof_local.edge_tile_calls += (uint64_t) nb64;
-                        } else if (K % AME_Q8_PACK_K != 0) {
-                            prof_local.edge_tile_calls++;
-                        }
-                    }
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    const float * restrict cached_scales =
-                        src0_tile_scales + (size_t) mt * (size_t) nb64 * tile_m;
-                    memcpy(x_scales, cached_scales, (size_t) imax * sizeof(float));
-                    for (int j = 0; j < jmax; ++j) {
-                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
-                        y_scales[j] = xq_scales != NULL ?
-                            xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
-                    }
-                    if (use_whole_k_fused_epilogue) {
-                        ame_store_scaled_tile(
-                            out + j0 * M + i0,
-                            tile_c,
-                            x_scales,
-                            y_scales,
-                            M,
-                            tile_n,
-                            imax,
-                            jmax);
-                    } else {
-                        ame_accumulate_scaled_tile(
-                            acc_f32,
-                            tile_c,
-                            x_scales,
-                            y_scales,
-                            tile_n,
-                            imax,
-                            jmax);
-                    }
-                    if (prof) {
-                        prof_local.cycles_scale += ame_read_cycle() - prof_t0;
-                    }
-                } else if (async_batch > 1) {
-                    unsigned long pending_targets[4] = {0};
-                    uint64_t pending_ordinals[4] = {0};
-                    uint64_t pending_ckpt[4] = {0};
-                    int pending_sparse_log[4] = {0};
-                    int32_t * pending_c[4] = {0};
-                    const int8_t * pending_a[4] = {0};
-                    const int8_t * pending_b[4] = {0};
-                    float pending_x_scales[4][AME_TILE_M_MAX] = {{0}};
-                    float pending_y_scales[4][AME_TILE_N_MAX] = {{0}};
-                    uint64_t batch_start = 0;
-                    int pending_count = 0;
-                    const size_t tile_bytes = (size_t) tile_m * tile_k * sizeof(int8_t);
-
-                    for (int64_t kb = 0; kb < nb64; ++kb) {
-                        if (pending_count == 0 && prof) {
-                            batch_start = ame_read_cycle();
-                        }
-                        const int slot = pending_count++;
-                        const int64_t kb_for_slot = kb;
-                        if ((kb & 7) == 0 || kb + 1 == nb64) {
-                            AME_PANEL_PROGRESS_LOG(
-                                "ame64 async: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld slot=%d/%d",
-                                (long long) M, (long long) N, (long long) K,
-                                (long long) j0, (long long) i0, (long long) kb, (long long) nb64,
-                                slot, async_batch);
-                        }
-
-                        prof_t0 = prof ? ame_read_cycle() : 0;
-                        pending_a[slot] =
-                            src0_tile_a + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_bytes;
-                        if (prof) {
-                            prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
-                        }
-
-                        for (int j = 0; j < jmax; ++j) {
-                            const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                            pending_y_scales[slot][j] =
-                                xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
-                        }
-                        const float * restrict cached_scales =
-                            src0_tile_scales + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_m;
-                        memcpy(pending_x_scales[slot], cached_scales, (size_t) imax * sizeof(float));
-
-                        pending_c[slot] = tile_c + (size_t) slot * (tile_c_bytes / sizeof(int32_t));
-                        prof_t0 = prof ? ame_read_cycle() : 0;
-                        if (!ame_skip_tile_c_zero()) {
-                            memset(pending_c[slot], 0, tile_c_bytes);
-                            if (prof) {
-                                prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
-                            }
-                        }
-
-                        pending_b[slot] = packed_b_panel + kb * tile_b_size;
-                        const uint64_t tile_ordinal = sparse_tile++;
-                        pending_ordinals[slot] = tile_ordinal;
-                        pending_sparse_log[slot] = sparse_progress &&
-                            ame_sparse_progress_should_log(tile_ordinal, sparse_total_tiles, sparse_interval);
-                        if (pending_sparse_log[slot]) {
-                            ame_sparse_progress_log(
-                                sparse_op, "before", tile_ordinal, sparse_total_tiles,
-                                M, N, K, i0, j0, kb_for_slot);
-                        }
-                        pending_ckpt[slot] = ame_ckpt_notify_tile_start(
-                            M, N, K, tile_ordinal, i0, j0, kb_for_slot);
-                        ggml_ame_gemm_tile_i8_i32_bT_submit_fn submit =
-                            async_reg_pairs >= 2 && slot == 1 ? kernel->submit_alt : kernel->submit;
-                        pending_targets[slot] = submit(
-                            pending_a[slot], pending_b[slot], pending_c[slot]);
-
-                        if (pending_count == async_batch || kb + 1 == nb64) {
-                            const int batch_count = pending_count;
-                            // The token is monotonic, so acquiring the newest
-                            // release drains every older tile in this batch.
-                            ggml_ame_sync_acquire_wait(pending_targets[batch_count - 1]);
-                            if (prof) {
-                                prof_local.cycles_ame_tile_call += ame_read_cycle() - batch_start;
-                                prof_local.tile_calls += (uint64_t) batch_count;
-                                for (int q = 0; q < batch_count; ++q) {
-                                    const int64_t qkb = kb - (batch_count - 1 - q);
-                                    if (imax < tile_m || jmax < tile_n ||
-                                            (qkb + 1) * AME_Q8_PACK_K > K) {
-                                        prof_local.edge_tile_calls++;
-                                    }
-                                }
-                            }
-
-                            for (int q = 0; q < batch_count; ++q) {
-                                if (pending_ckpt[q] != 0) {
-                                    ame_ckpt_notify_tile_stop(
-                                        pending_ckpt[q], M, N, K, pending_ordinals[q],
-                                        i0, j0, kb - (batch_count - 1 - q));
-                                }
-                                if (pending_sparse_log[q]) {
-                                    ame_sparse_progress_log(
-                                        sparse_op, "after", pending_ordinals[q], sparse_total_tiles,
-                                        M, N, K, i0, j0, kb - (batch_count - 1 - q));
-                                }
-                                prof_t0 = prof ? ame_read_cycle() : 0;
-                                ame_accumulate_scaled_tile(
-                                    acc_f32,
-                                    pending_c[q],
-                                    pending_x_scales[q],
-                                    pending_y_scales[q],
-                                    tile_n,
-                                    imax,
-                                    jmax);
-                                if (prof) {
-                                    prof_local.cycles_scale += ame_read_cycle() - prof_t0;
-                                }
-                                ame_ckpt_rebase_after_tile();
-                            }
-                            pending_count = 0;
-                        }
-                    }
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                // 直读：行 (i0+i) 的 scale 取该行 kb=0 块的 d（whole-K 下每行各 kb 的 d 相同）
+                for (int i = 0; i < imax; ++i) {
+                    x_scales[i] = GGML_FP16_TO_FP32(x[(i0 + i) * nb64].d);
+                }
+                for (int j = 0; j < jmax; ++j) {
+                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
+                    y_scales[j] = xq_scales != NULL ?
+                        xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
+                }
+                if (use_whole_k_fused_epilogue) {
+                    ame_store_scaled_tile(
+                        out + j0 * M + i0,
+                        tile_c,
+                        x_scales,
+                        y_scales,
+                        M,
+                        tile_n,
+                        imax,
+                        jmax);
                 } else {
-                for (int64_t kb = 0; kb < nb64; ++kb) {
-                    float y_scales[AME_TILE_N_MAX];
-                    float x_scales[AME_TILE_M_MAX];
-                    if ((kb & 7) == 0 || kb + 1 == nb64) {
-                        AME_PANEL_PROGRESS_LOG(
-                            "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld",
-                            (long long) M, (long long) N, (long long) K,
-                            (long long) j0, (long long) i0, (long long) kb, (long long) nb64);
-                    }
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    const int8_t * tile_a_for_gemm = tile_a;
-                    if (use_packed_a_tiles) {
-                        const size_t tile_bytes = (size_t) tile_m * tile_k * sizeof(int8_t);
-                        tile_a_for_gemm =
-                            src0_tile_a + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_bytes;
-                    } else {
-                        for (int i = 0; i < tile_m; ++i) {
-                            if (i < imax) {
-                                const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
-                                memcpy(&tile_a[i * tile_k], b->qs, AME_Q8_PACK_K);
-                            } else {
-                                memset(&tile_a[i * tile_k], 0, AME_Q8_PACK_K);
-                            }
-                        }
-                    }
-                    if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
-
-                    for (int j = 0; j < jmax; ++j) {
-                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                        y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
-                    }
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    if (!ame_skip_tile_c_zero()) {
-                        memset(tile_c, 0, (size_t) tile_m * tile_n * sizeof(int32_t));
-                        if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
-                    }
-
-                    const int8_t * panel_tile_b = packed_b_panel + kb * tile_b_size;
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    const uint64_t tile_ordinal = sparse_tile++;
-                    const int log_sparse_tile = sparse_progress &&
-                        ame_sparse_progress_should_log(tile_ordinal, sparse_total_tiles, sparse_interval);
-                    if (log_sparse_tile) {
-                        ame_sparse_progress_log(
-                            sparse_op, "before", tile_ordinal, sparse_total_tiles,
-                            M, N, K, i0, j0, kb);
-                    }
-                    const uint64_t ckpt_tile_occurrence =
-                        ame_ckpt_notify_tile_start(M, N, K, tile_ordinal, i0, j0, kb);
-                    kernel->gemm(tile_a_for_gemm, panel_tile_b, tile_c);
-                    ame_ckpt_notify_tile_stop(
-                        ckpt_tile_occurrence, M, N, K, tile_ordinal, i0, j0, kb);
-                    if (log_sparse_tile) {
-                        ame_sparse_progress_log(
-                            sparse_op, "after", tile_ordinal, sparse_total_tiles,
-                            M, N, K, i0, j0, kb);
-                    }
-                    ame_ckpt_rebase_after_tile();
-                    if (prof) {
-                        prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
-                        prof_local.tile_calls++;
-                        if (imax < tile_m || jmax < tile_n || (kb + 1) * AME_Q8_PACK_K > K) {
-                            prof_local.edge_tile_calls++;
-                        }
-                    }
-
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    if (use_packed_a_tiles) {
-                        const float * restrict cached_scales =
-                            src0_tile_scales + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_m;
-                        memcpy(x_scales, cached_scales, (size_t) imax * sizeof(float));
-                    } else {
-                        for (int i = 0; i < imax; ++i) {
-                            const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                            x_scales[i] = GGML_FP16_TO_FP32(bx->d);
-                        }
-                    }
                     ame_accumulate_scaled_tile(
                         acc_f32,
                         tile_c,
@@ -2179,119 +1821,165 @@ void ggml_ame_mul_mat_q8_0_ame64(
                         tile_n,
                         imax,
                         jmax);
-                    if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
-                }
-                }
-
-                if (!use_whole_k_fused_epilogue) {
-                    prof_t0 = prof ? ame_read_cycle() : 0;
-                    ame_store_acc_tile(
-                        out + j0 * M + i0,
-                        acc_f32,
-                        M,
-                        tile_n,
-                        imax,
-                        jmax);
                 }
                 if (prof) {
-                    if (!use_whole_k_fused_epilogue) {
-                        prof_local.cycles_store += ame_read_cycle() - prof_t0;
-                    }
-                    prof_local.output_tile_calls++;
+                    prof_local.cycles_scale += ame_read_cycle() - prof_t0;
                 }
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 packed_b_panel: M=%lld N=%lld K=%lld j0=%lld i0=%lld done",
-                    (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
-            }
-            AME_PANEL_LOG("ame64 packed_b_panel: j0=%lld done", (long long) j0);
-        }
-        if (sparse_progress) {
-            fprintf(stderr,
-                    "[AME_SPARSE] op=%llu phase=end completed_tiles=%llu/%llu target=%lu\n",
-                    (unsigned long long) sparse_op,
-                    (unsigned long long) sparse_tile,
-                    (unsigned long long) sparse_total_tiles,
-                    ggml_ame_sync_state_global.sync0_release_target);
-            fflush(stderr);
-        }
-        ame_ckpt_notify_stop(M, N, K);
+            } else if (async_batch > 1) {
+                unsigned long pending_targets[4] = {0};
+                uint64_t pending_ordinals[4] = {0};
+                uint64_t pending_ckpt[4] = {0};
+                int pending_sparse_log[4] = {0};
+                int32_t * pending_c[4] = {0};
+                const int8_t * pending_a[4] = {0};
+                const int8_t * pending_b[4] = {0};
+                float pending_x_scales[4][AME_TILE_M_MAX] = {{0}};
+                float pending_y_scales[4][AME_TILE_N_MAX] = {{0}};
+                uint64_t batch_start = 0;
+                int pending_count = 0;
 
-        if (prof) {
-            prof_local.cycles_packed_total = ame_read_cycle() - prof_total_start;
-            ame_profile_accumulate(&prof_local);
-        }
+                for (int64_t kb = 0; kb < nb64; ++kb) {
+                    if (pending_count == 0 && prof) {
+                        batch_start = ame_read_cycle();
+                    }
+                    const int slot = pending_count++;
+                    const int64_t kb_for_slot = kb;
+                    if ((kb & 7) == 0 || kb + 1 == nb64) {
+                        AME_PANEL_PROGRESS_LOG(
+                            "ame64 async: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld slot=%d/%d",
+                            (long long) M, (long long) N, (long long) K,
+                            (long long) j0, (long long) i0, (long long) kb, (long long) nb64,
+                            slot, async_batch);
+                    }
 
-        if (allocated_workspace) {
-            ggml_aligned_free(workspace, work_size);
-        }
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    pending_a[slot] =
+                        (const int8_t *) x +
+                        ((size_t) mt * (size_t) tile_m * (size_t) nb64 + (size_t) kb) * ablock + a_qs_off;
+                    if (prof) {
+                        prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
+                    }
 
-        GGML_UNUSED(ne10);
-        return;
-    }
+                    for (int j = 0; j < jmax; ++j) {
+                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
+                        pending_y_scales[slot][j] =
+                            xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
+                    }
+                    // 直读：行 (i0+i) 第 kb 块的 d（fp16→f32）
+                    for (int i = 0; i < imax; ++i) {
+                        pending_x_scales[slot][i] = GGML_FP16_TO_FP32(x[(i0 + i) * nb64 + kb].d);
+                    }
 
-    for (int64_t i0 = 0; i0 < M; i0 += tile_m) {
-        const int imax = (i0 + tile_m <= M) ? tile_m : (M - i0);
+                    pending_c[slot] = tile_c + (size_t) slot * (tile_c_bytes / sizeof(int32_t));
+                    prof_t0 = prof ? ame_read_cycle() : 0;
+                    if (!ame_skip_tile_c_zero()) {
+                        memset(pending_c[slot], 0, tile_c_bytes);
+                        if (prof) {
+                            prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
+                        }
+                    }
 
-        for (int64_t j0 = 0; j0 < N; j0 += tile_n) {
-            const int jmax = (j0 + tile_n <= N) ? tile_n : (N - j0);
-            float acc_f32[AME_TILE_M_MAX * AME_TILE_N_MAX];
-            prof_t0 = prof ? ame_read_cycle() : 0;
-            memset(acc_f32, 0, sizeof(acc_f32));
-            if (prof) {
-                prof_local.cycles_accumulator_initialization += ame_read_cycle() - prof_t0;
-            }
-            AME_PANEL_PROGRESS_LOG(
-                "ame64 tile_output_begin: M=%lld N=%lld K=%lld i0=%lld j0=%lld imax=%d jmax=%d",
-                (long long) M, (long long) N, (long long) K,
-                (long long) i0, (long long) j0, imax, jmax);
+                    // B 直读：行 (j0+j) 第 kb 块的 qs 地址（与 A 同一布局/步长）
+                    pending_b[slot] =
+                        (const int8_t *) xq +
+                        ((size_t) j0 * (size_t) nb64 + (size_t) kb) * ablock + a_qs_off;
+                    const uint64_t tile_ordinal = sparse_tile++;
+                    pending_ordinals[slot] = tile_ordinal;
+                    pending_sparse_log[slot] = sparse_progress &&
+                        ame_sparse_progress_should_log(tile_ordinal, sparse_total_tiles, sparse_interval);
+                    if (pending_sparse_log[slot]) {
+                        ame_sparse_progress_log(
+                            sparse_op, "before", tile_ordinal, sparse_total_tiles,
+                            M, N, K, i0, j0, kb_for_slot);
+                    }
+                    pending_ckpt[slot] = ame_ckpt_notify_tile_start(
+                        M, N, K, tile_ordinal, i0, j0, kb_for_slot);
+                    ggml_ame_gemm_tile_i8_i32_bT_submit_fn submit =
+                        async_reg_pairs >= 2 && slot == 1 ? kernel->submit_alt : kernel->submit;
+                    pending_targets[slot] = submit(
+                        pending_a[slot], a_row_stride,
+                        pending_b[slot], a_row_stride,
+                        pending_c[slot]);
 
+                    if (pending_count == async_batch || kb + 1 == nb64) {
+                        const int batch_count = pending_count;
+                        // The token is monotonic, so acquiring the newest
+                        // release drains every older tile in this batch.
+                        ggml_ame_sync_acquire_wait(pending_targets[batch_count - 1]);
+                        if (prof) {
+                            prof_local.cycles_ame_tile_call += ame_read_cycle() - batch_start;
+                            prof_local.tile_calls += (uint64_t) batch_count;
+                            for (int q = 0; q < batch_count; ++q) {
+                                const int64_t qkb = kb - (batch_count - 1 - q);
+                                if (imax < tile_m || jmax < tile_n ||
+                                        (qkb + 1) * AME_Q8_PACK_K > K) {
+                                    prof_local.edge_tile_calls++;
+                                }
+                            }
+                        }
+
+                        for (int q = 0; q < batch_count; ++q) {
+                            if (pending_ckpt[q] != 0) {
+                                ame_ckpt_notify_tile_stop(
+                                    pending_ckpt[q], M, N, K, pending_ordinals[q],
+                                    i0, j0, kb - (batch_count - 1 - q));
+                            }
+                            if (pending_sparse_log[q]) {
+                                ame_sparse_progress_log(
+                                    sparse_op, "after", pending_ordinals[q], sparse_total_tiles,
+                                    M, N, K, i0, j0, kb - (batch_count - 1 - q));
+                            }
+                            prof_t0 = prof ? ame_read_cycle() : 0;
+                            ame_accumulate_scaled_tile(
+                                acc_f32,
+                                pending_c[q],
+                                pending_x_scales[q],
+                                pending_y_scales[q],
+                                tile_n,
+                                imax,
+                                jmax);
+                            if (prof) {
+                                prof_local.cycles_scale += ame_read_cycle() - prof_t0;
+                            }
+                            ame_ckpt_rebase_after_tile();
+                        }
+                        pending_count = 0;
+                    }
+                }
+            } else {
             for (int64_t kb = 0; kb < nb64; ++kb) {
                 float y_scales[AME_TILE_N_MAX];
                 float x_scales[AME_TILE_M_MAX];
-
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 tile_k_begin: M=%lld N=%lld K=%lld i0=%lld j0=%lld kb=%lld/%lld",
-                    (long long) M, (long long) N, (long long) K,
-                    (long long) i0, (long long) j0, (long long) kb, (long long) nb64);
+                if ((kb & 7) == 0 || kb + 1 == nb64) {
+                    AME_PANEL_PROGRESS_LOG(
+                        "ame64 b_direct: M=%lld N=%lld K=%lld j0=%lld i0=%lld kb=%lld/%lld",
+                        (long long) M, (long long) N, (long long) K,
+                        (long long) j0, (long long) i0, (long long) kb, (long long) nb64);
+                }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                for (int i = 0; i < tile_m; ++i) {
-                    if (i < imax) {
-                        const block_q8_ame64 * b = &x[(i0 + i) * nb64 + kb];
-                        memcpy(&tile_a[i * tile_k], b->qs, AME_Q8_PACK_K);
-                    } else {
-                        memset(&tile_a[i * tile_k], 0, AME_Q8_PACK_K);
-                    }
-                }
+                // 直读：A 的行直接取自 repack 数组；尾块超出 M 的行落在 padding 零行上，
+                // 与旧路径（tile 补零拷贝 / tile 缓存）逐位等价
+                const int8_t * tile_a_for_gemm =
+                    (const int8_t *) x +
+                    ((size_t) mt * (size_t) tile_m * (size_t) nb64 + (size_t) kb) * ablock + a_qs_off;
                 if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 pack_a_done: i0=%lld j0=%lld kb=%lld",
-                    (long long) i0, (long long) j0, (long long) kb);
 
-                prof_t0 = prof ? ame_read_cycle() : 0;
-                if (!ame_skip_tile_b_zero()) {
-                    memset(tile_b, 0, (size_t) tile_n * tile_k * sizeof(int8_t));
-                }
                 for (int j = 0; j < jmax; ++j) {
                     const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
                     y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
-                    memcpy(&tile_b[j * tile_k], bx->qs, AME_Q8_PACK_K);
                 }
-                if (prof) prof_local.cycles_pack_b += ame_read_cycle() - prof_t0;
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 pack_b_done: i0=%lld j0=%lld kb=%lld",
-                    (long long) i0, (long long) j0, (long long) kb);
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 if (!ame_skip_tile_c_zero()) {
                     memset(tile_c, 0, (size_t) tile_m * tile_n * sizeof(int32_t));
                     if (prof) prof_local.cycles_zero_c += ame_read_cycle() - prof_t0;
                 }
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 before_gemm: i0=%lld j0=%lld kb=%lld tile_a=%p tile_b=%p tile_c=%p",
-                    (long long) i0, (long long) j0, (long long) kb,
-                    (const void *) tile_a, (const void *) tile_b, (void *) tile_c);
 
+                // B 直读：行 j0 第 kb 块的 qs 地址；尾块超出 N 的行落在 xq 的 padding 零行上
+                const int8_t * tile_b_for_gemm =
+                    (const int8_t *) xq +
+                    ((size_t) j0 * (size_t) nb64 + (size_t) kb) * ablock + a_qs_off;
                 prof_t0 = prof ? ame_read_cycle() : 0;
                 const uint64_t tile_ordinal = sparse_tile++;
                 const int log_sparse_tile = sparse_progress &&
@@ -2303,7 +1991,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 }
                 const uint64_t ckpt_tile_occurrence =
                     ame_ckpt_notify_tile_start(M, N, K, tile_ordinal, i0, j0, kb);
-                kernel->gemm(tile_a, tile_b, tile_c);
+                kernel->gemm(tile_a_for_gemm, a_row_stride, tile_b_for_gemm, a_row_stride, tile_c);
                 ame_ckpt_notify_tile_stop(
                     ckpt_tile_occurrence, M, N, K, tile_ordinal, i0, j0, kb);
                 if (log_sparse_tile) {
@@ -2312,9 +2000,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
                         M, N, K, i0, j0, kb);
                 }
                 ame_ckpt_rebase_after_tile();
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 after_gemm: i0=%lld j0=%lld kb=%lld",
-                    (long long) i0, (long long) j0, (long long) kb);
                 if (prof) {
                     prof_local.cycles_ame_tile_call += ame_read_cycle() - prof_t0;
                     prof_local.tile_calls++;
@@ -2324,6 +2009,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
+                // 直读：行 (i0+i) 第 kb 块的 d（fp16→f32），与旧 tile 缓存逐位等价
                 for (int i = 0; i < imax; ++i) {
                     const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
                     x_scales[i] = GGML_FP16_TO_FP32(bx->d);
@@ -2337,30 +2023,31 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     imax,
                     jmax);
                 if (prof) prof_local.cycles_scale += ame_read_cycle() - prof_t0;
-                AME_PANEL_PROGRESS_LOG(
-                    "ame64 scale_done: i0=%lld j0=%lld kb=%lld",
-                    (long long) i0, (long long) j0, (long long) kb);
+            }
             }
 
-            prof_t0 = prof ? ame_read_cycle() : 0;
-            ame_store_acc_tile(
-                out + j0 * M + i0,
-                acc_f32,
-                M,
-                tile_n,
-                imax,
-                jmax);
+            if (!use_whole_k_fused_epilogue) {
+                prof_t0 = prof ? ame_read_cycle() : 0;
+                ame_store_acc_tile(
+                    out + j0 * M + i0,
+                    acc_f32,
+                    M,
+                    tile_n,
+                    imax,
+                    jmax);
+            }
             if (prof) {
-                prof_local.cycles_store += ame_read_cycle() - prof_t0;
+                if (!use_whole_k_fused_epilogue) {
+                    prof_local.cycles_store += ame_read_cycle() - prof_t0;
+                }
                 prof_local.output_tile_calls++;
             }
             AME_PANEL_PROGRESS_LOG(
-                "ame64 tile_output_done: M=%lld N=%lld K=%lld i0=%lld j0=%lld",
-                (long long) M, (long long) N, (long long) K,
-                (long long) i0, (long long) j0);
+                "ame64 b_direct: M=%lld N=%lld K=%lld j0=%lld i0=%lld done",
+                (long long) M, (long long) N, (long long) K, (long long) j0, (long long) i0);
         }
+        AME_PANEL_LOG("ame64 b_direct: j0=%lld done", (long long) j0);
     }
-
     if (sparse_progress) {
         fprintf(stderr,
                 "[AME_SPARSE] op=%llu phase=end completed_tiles=%llu/%llu target=%lu\n",
@@ -2370,7 +2057,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 ggml_ame_sync_state_global.sync0_release_target);
         fflush(stderr);
     }
-
     ame_ckpt_notify_stop(M, N, K);
 
     if (prof) {
@@ -2680,7 +2366,8 @@ void ggml_ame_mul_mat_q4_0(
                 }
 
                 memset(tile_c, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-                ggml_ame_gemm_tile_i8_i32_bT(tile_a, tile_b, tile_c);
+                ggml_ame_gemm_tile_i8_i32_bT(
+                    tile_a, (ptrdiff_t) AME_TILE_K, tile_b, (ptrdiff_t) AME_TILE_K, tile_c);
 
                 for (int i = 0; i < imax; i++) {
                      const block_q4_0_ame * bx = &x[(i0 + i) * nb_x + kb];

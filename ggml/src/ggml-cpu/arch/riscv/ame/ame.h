@@ -76,22 +76,28 @@ extern "C" {
 
 void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 void ggml_ame_gemm_tile_i8_i32_bT_kloop(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C);
 
 void ggml_ame_gemm_tile_i8_i32_bT_128_64_128_kloop(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C);
 
@@ -102,8 +108,10 @@ typedef void (*ggml_ame_pipeline_finish_fn)(void * opaque, int tile_index);
 void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C,
     int transpose_c,
@@ -114,8 +122,10 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
     const int8_t * a_panels,
     ptrdiff_t a_panel_stride,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int32_t * C0,
     int32_t * C1,
@@ -126,27 +136,37 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
 
 unsigned long ggml_ame_gemm_tile_i8_i32_bT_submit(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 unsigned long ggml_ame_gemm_tile_i8_i32_bT_submit_alt(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 void ggml_ame_gemm_tile_i8_i32_bT_128_64_128(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 unsigned long ggml_ame_gemm_tile_i8_i32_bT_128_64_128_submit(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 unsigned long ggml_ame_gemm_tile_i8_i32_bT_128_64_128_submit_alt(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 typedef struct {
@@ -155,12 +175,16 @@ typedef struct {
 
 typedef void (*ggml_ame_gemm_tile_i8_i32_bT_fn)(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 typedef unsigned long (*ggml_ame_gemm_tile_i8_i32_bT_submit_fn)(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C);
 
 extern ggml_ame_sync_state ggml_ame_sync_state_global;
@@ -314,29 +338,6 @@ static inline const ggml_ame_i8_kernel * ggml_ame_select_i8_kernel(int64_t M, in
         return ggml_ame_i8_kernel_for_kind(GGML_AME_I8_KERNEL_64_64_64);
     }
     return NULL;
-}
-
-static inline size_t ggml_ame_i8_kernel_workspace_size(const ggml_ame_i8_kernel * kernel, int64_t N, int64_t K, int use_packed_b_panel) {
-    (void) N;
-    if (kernel == NULL) {
-        return 0;
-    }
-
-    const int tile_m = kernel->tile_m;
-    const int tile_n = kernel->tile_n;
-    const int tile_k = kernel->tile_k;
-    const int64_t n_k_tiles = (K + tile_k - 1) / tile_k;
-
-    size_t size = 64;
-    size = (size + 63) / 64 * 64;
-    size += (size_t) tile_m * tile_k * sizeof(int8_t);
-    size = (size + 63) / 64 * 64;
-    size += use_packed_b_panel ?
-        (size_t) n_k_tiles * tile_n * tile_k * sizeof(int8_t) :
-        (size_t) tile_n * tile_k * sizeof(int8_t);
-    size = (size + 63) / 64 * 64;
-    size += (size_t) tile_m * tile_n * sizeof(int32_t);
-    return size;
 }
 
 static inline void ggml_ame_sync_begin_op(void) {
@@ -664,10 +665,17 @@ typedef struct {
 extern "C" {
 #endif
 
-// Atomic tile GEMM (16x32x16)
+// Q8_0 ame64 直读路径的 workspace 规划（定义于 ame-matmul.c）。
+// 与运行期 kernel 共用同一份模式判定，保证 plan/compute 逐字节一致：
+// 后者不一致会让 kernel 每次调用退回内部 ggml_aligned_malloc 兜底。
+size_t ggml_ame_q8_ame64_workspace_size(int64_t M, int64_t N, int64_t K);
+
+// Atomic tile GEMM (64x64x64 / 128x64x128)
 void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * A,
+    ptrdiff_t a_row_stride,
     const int8_t * B,
+    ptrdiff_t b_row_stride,
     int32_t * C
 );
 
@@ -729,20 +737,6 @@ void ggml_ame_repack_q8_0_to_ame64_whole_k(
     int64_t k
 );
 
-// GGML integration wrapper for Q8_0 quantized matrix multiplication
-void ggml_ame_mul_mat_q8_0(
-    const void * src0,
-    const void * src1,
-    void * dst,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne10,
-    int64_t ne11,
-    size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
-    void * work_data,
-    size_t work_size
-);
-
 void ggml_ame_mul_mat_bf16(
     const void * src0,
     const void * src1,
@@ -767,8 +761,6 @@ void ggml_ame_mul_mat_q8_0_ame64(
     int64_t ne10,
     int64_t ne11,
     size_t src1_stride,
-    const int8_t * src0_tile_a,
-    const float * src0_tile_scales,
     int graph_id,
     const void * graph_key,
     uint64_t src1_generation,

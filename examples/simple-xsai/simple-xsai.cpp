@@ -217,6 +217,8 @@ int main(int argc, char ** argv) {
     ctx_xsai_parms.no_perf = false;
 
     llama_context_params ctx_params = to_llama_context_params(ctx_xsai_parms);
+    // 验证挂具：注册逐层输出哈希回调（打印 [layer_hash] l_out-N fnv1a32=...，用于改动前后逐位对比）
+    ctx_params.cb_eval = layer_hash_cb;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
