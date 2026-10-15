@@ -251,6 +251,11 @@ static bool clip_dump_vit_enabled() {
     return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
 }
 
+static bool clip_dump_all_vit_layers() {
+    const char * env = getenv("BITVLA_DUMP_VIT");
+    return env != nullptr && strcmp(env, "all") == 0;
+}
+
 clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
         model(ctx->model),
         hparams(model.hparams),
@@ -281,7 +286,8 @@ clip_graph::clip_graph(clip_ctx * ctx, const clip_image_f32 & img) :
 void clip_graph::cb(ggml_tensor * cur, const char * name, int il) const {
     // Dup dump targets so later nodes cannot reuse the buffer.  Views such as
     // Qcur (reshape of the Q matmul) otherwise report stale or aliased data.
-    if (clip_dump_vit_enabled() && cur != nullptr && il < 1) {
+    if (clip_dump_vit_enabled() && cur != nullptr &&
+            (il < 1 || (clip_dump_all_vit_layers() && strcmp(name, "layer_out") == 0))) {
         cur = ggml_dup(ctx0, cur);
         ggml_set_output(cur);
         ggml_build_forward_expand(gf, cur);
@@ -3953,10 +3959,16 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             "ffn_out-0",
             "layer_out-0",
         };
-        for (const char * name : dump_names) {
-            ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+        std::vector<std::string> names(std::begin(dump_names), std::end(dump_names));
+        if (clip_dump_all_vit_layers()) {
+            for (int il = 1; il < ctx->model.hparams.n_layer; ++il) {
+                names.push_back("layer_out-" + std::to_string(il));
+            }
+        }
+        for (const std::string & name : names) {
+            ggml_tensor * t = ggml_graph_get_tensor(gf, name.c_str());
             if (t == nullptr || ggml_nbytes(t) == 0) {
-                LOG_WRN("%s: vit dump missing tensor %s\n", __func__, name);
+                LOG_WRN("%s: vit dump missing tensor %s\n", __func__, name.c_str());
                 continue;
             }
             std::vector<float> values((size_t) ggml_nelements(t));
@@ -3978,7 +3990,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             }
             LOG_INF("%s: vit dump name=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
                     "min=%.6g max=%.6g mean=%.6g absmean=%.6g checksum=%llu first8=%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g\n",
-                    __func__, name, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                    __func__, name.c_str(), t->ne[0], t->ne[1], t->ne[2], t->ne[3],
                     min_value, max_value, sum / (double) values.size(), abs_sum / (double) values.size(),
                     (unsigned long long) checksum,
                     values.size() > 0 ? values[0] : 0.0f,
@@ -3992,7 +4004,7 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             const char * dump_dir = getenv("BITVLA_DUMP_DIR");
             if (dump_dir != nullptr && dump_dir[0] != '\0') {
                 char path[1024];
-                snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, name);
+                snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, name.c_str());
                 std::ofstream out(path, std::ios::binary);
                 if (out) {
                     out.write(reinterpret_cast<const char *>(values.data()),
