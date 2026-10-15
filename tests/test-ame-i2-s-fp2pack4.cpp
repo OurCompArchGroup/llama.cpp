@@ -14,8 +14,15 @@ static uint8_t code_at(const uint8_t * packed, int64_t index) {
     return (byte >> (6 - 2 * ((index % 128) / 32))) & 0x3;
 }
 
+// FP2PACK4 uses the BitNet ternary encoding 0b11=-1, 0b10=+1, 0b01/0b00=0.
 static uint8_t i2_to_fp2(uint8_t code) {
-    return code == 0 ? 3 : (code == 2 ? 1 : 0);
+    return code == 0 ? 3 : (code == 2 ? 2 : 0);
+}
+
+// Mirror of NEMU's decoder in include/memory/host.h (host_read_matrix, msew==4).
+// Kept here so the packer above can never drift from the golden model again.
+static int8_t nemu_fp2_decode(uint8_t raw) {
+    return raw == 3 ? (int8_t) -1 : raw == 2 ? (int8_t) 1 : (int8_t) 0;
 }
 
 static void pack_fp2pack4_row64(const uint8_t * i2_row, int64_t k0, uint8_t * packed) {
@@ -49,9 +56,25 @@ static bool test_host_and_fp2_equivalence() {
     }
     const float weight_scale = reinterpret_cast<const float *>(weights.data() + (size_t) M * row_bytes)[0];
 
-    if (i2_to_fp2(0) != 3 || i2_to_fp2(1) != 0 || i2_to_fp2(2) != 1 || i2_to_fp2(3) != 0) {
+    if (i2_to_fp2(0) != 3 || i2_to_fp2(1) != 0 || i2_to_fp2(2) != 2 || i2_to_fp2(3) != 0) {
         std::fprintf(stderr, "I2_S to FP2PACK4 code map is incorrect\n");
         return false;
+    }
+
+    // The packer and NEMU's decoder must agree on every ternary value.  An
+    // encoding that round-trips through nemu_fp2_decode() to a different
+    // weight silently drops or flips lanes in the matrix unit, which is not
+    // visible in the packed bytes themselves.
+    static const int8_t i2_code_value[4] = { -1, 0, +1, 0 };
+    for (uint8_t code = 0; code < 4; ++code) {
+        const int8_t decoded = nemu_fp2_decode(i2_to_fp2(code));
+        if (decoded != i2_code_value[code]) {
+            std::fprintf(stderr,
+                         "FP2PACK4 round-trip mismatch: I2_S code %u packs to %u, "
+                         "which NEMU decodes as %d instead of %d\n",
+                         code, i2_to_fp2(code), decoded, i2_code_value[code]);
+            return false;
+        }
     }
 
     // Check the GGML byte order and the exact FP2 lane conversion independently

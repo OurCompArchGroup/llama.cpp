@@ -726,13 +726,16 @@ void ggml_ame_mul_mat_i2_s(
 }
 
 // Convert one 64-element I2_S interval to NEMU FP2PACK4's B-row encoding.
-// I2_S codes are {-1, 0, +1, 0}; FP2PACK4 stores four signed 2-bit lanes per
-// byte, where 3=-1, 0=0 and 1=+1.  The native B load is row-major over
-// output channels, which is the opposite operand order from GGML MUL_MAT.
+// I2_S codes are {-1, 0, +1, 0}.  FP2PACK4 packs four ternary lanes per byte
+// using the BitNet encoding 0b11=-1, 0b10=+1 and 0b01/0b00=0, which NEMU
+// decodes in host_read_matrix()'s msew==4 path.  Note +1 is 2, not 1: emitting
+// 1 here makes NEMU read the weight as 0 and silently drops every +1 lane.
+// The native B load is row-major over output channels, which is the opposite
+// operand order from GGML MUL_MAT.
 static inline uint8_t ggml_ame_i2_s_to_fp2pack4_code(const uint8_t * row, int64_t k) {
     const uint8_t packed = row[(size_t) (k / 128) * 32 + (size_t) (k % 32)];
     const uint8_t code = (packed >> (6 - 2 * ((k % 128) / 32))) & 0x3;
-    return code == 0 ? 3 : (code == 2 ? 1 : 0);
+    return code == 0 ? 3 : (code == 2 ? 2 : 0);
 }
 
 static inline void ggml_ame_pack_i2_s_fp2pack4_row64(

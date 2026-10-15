@@ -413,13 +413,16 @@ public:
             return false;
         }
 
+        // The AME kernels currently execute the complete operation and do not
+        // partition work by ggml's worker thread index.  Run them once until
+        // per-thread workspaces/output handling is implemented.
+        if (params->ith != 0) {
+            return true;
+        }
+
         static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
 
         if (scalar_mode) {
-            if (params->ith != 0) {
-                return true;
-            }
-
             const ggml_tensor * src0 = op->src[0];
             const ggml_tensor * src1 = op->src[1];
             const int64_t M = src0->ne[1];
