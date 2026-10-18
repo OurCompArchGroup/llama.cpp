@@ -238,8 +238,10 @@ static bool ame_use_whole_k_q8() {
 }
 
 struct ame_packed_q8_info {
-    void * data = nullptr;
+    void * data = nullptr;       // [rows][nb64] 纯 qs 块（每块 64B）
     size_t size = 0;
+    void * scales = nullptr;     // [rows][nb64] fp16 scale，与 data 同下标
+    size_t scales_size = 0;
 };
 
 struct ame_buffer_context {
@@ -338,6 +340,12 @@ static size_t ggml_ame_packed_q8_64_size(const ggml_tensor * tensor) {
     return (size_t) rows * (size_t) nb64 * sizeof(block_q8_ame64);
 }
 
+static size_t ggml_ame_packed_q8_64_scales_size(const ggml_tensor * tensor) {
+    const int64_t nb64 = (tensor->ne[0] + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+    const int64_t rows = ((ggml_nrows(tensor) + AME_TILE_M_MAX - 1) / AME_TILE_M_MAX) * AME_TILE_M_MAX;
+    return (size_t) rows * (size_t) nb64 * sizeof(uint16_t);
+}
+
 static const block_q8_ame64 * ame_get_packed_q8_weight(const ggml_tensor * tensor) {
     if (tensor->buffer == nullptr || tensor->buffer->context == nullptr) {
         return nullptr;
@@ -351,6 +359,19 @@ static const block_q8_ame64 * ame_get_packed_q8_weight(const ggml_tensor * tenso
     return static_cast<const block_q8_ame64 *>(it->second.data);
 }
 
+static const uint16_t * ame_get_packed_q8_scales(const ggml_tensor * tensor) {
+    if (tensor->buffer == nullptr || tensor->buffer->context == nullptr) {
+        return nullptr;
+    }
+
+    ame_buffer_context * ctx = ame_buffer_ctx(tensor->buffer);
+    const auto it = ctx->packed_q8.find(tensor);
+    if (it == ctx->packed_q8.end()) {
+        return nullptr;
+    }
+    return static_cast<const uint16_t *>(it->second.scales);
+}
+
 static void ame_store_packed_q8_weight(
     ggml_backend_buffer_t buffer,
     const ggml_tensor * tensor,
@@ -359,6 +380,7 @@ static void ame_store_packed_q8_weight(
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
     auto & entry = ctx->packed_q8[tensor];
     const size_t packed_size = ggml_ame_packed_q8_64_size(tensor);
+    const size_t scales_size = ggml_ame_packed_q8_64_scales_size(tensor);
 
     if (entry.data == nullptr || entry.size != packed_size) {
         if (entry.data != nullptr) {
@@ -367,14 +389,22 @@ static void ame_store_packed_q8_weight(
         entry.data = ggml_aligned_malloc(packed_size);
         entry.size = packed_size;
     }
+    if (entry.scales == nullptr || entry.scales_size != scales_size) {
+        if (entry.scales != nullptr) {
+            ggml_aligned_free(entry.scales, entry.scales_size);
+        }
+        entry.scales = ggml_aligned_malloc(scales_size);
+        entry.scales_size = scales_size;
+    }
 
-    if (entry.data != nullptr) {
+    if (entry.data != nullptr && entry.scales != nullptr) {
+        uint16_t * dst_d = static_cast<uint16_t *>(entry.scales);
         if (ame_use_whole_k_q8()) {
             ggml_ame_repack_q8_0_to_ame64_whole_k(
-                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+                entry.data, dst_d, data, ggml_nrows(tensor), tensor->ne[0]);
         } else {
             ggml_ame_repack_q8_0_to_ame64(
-                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
+                entry.data, dst_d, data, ggml_nrows(tensor), tensor->ne[0]);
         }
         // 对齐产生的 padding 行清零（repack 只写原始行；每次 refresh 都要补，
         // 因为 padding 区不在 repack 的写入范围内、但可能在上一轮被复用）
@@ -382,8 +412,11 @@ static void ame_store_packed_q8_weight(
         const int64_t padded_rows = ((nrows + AME_TILE_M_MAX - 1) / AME_TILE_M_MAX) * AME_TILE_M_MAX;
         if (padded_rows > nrows) {
             const int64_t nb64 = (tensor->ne[0] + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
+            const size_t pad_blocks = (size_t) (padded_rows - nrows) * (size_t) nb64;
             memset((char *) entry.data + (size_t) nrows * (size_t) nb64 * sizeof(block_q8_ame64), 0,
-                   (size_t) (padded_rows - nrows) * (size_t) nb64 * sizeof(block_q8_ame64));
+                   pad_blocks * sizeof(block_q8_ame64));
+            memset(dst_d + (size_t) nrows * (size_t) nb64, 0,
+                   pad_blocks * sizeof(uint16_t));
         }
     }
 }
@@ -589,13 +622,15 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
         // traits 的 work_size / compute_forward 双 gate 用同一谓词过滤（含 packed 就绪），
         // 走到这里缺失说明 plan/compute 不一致，直接暴露而不是静默回退。
         const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0);
-        if (packed_w == nullptr) {
+        const uint16_t * packed_d = ame_get_packed_q8_scales(src0);
+        if (packed_w == nullptr || packed_d == nullptr) {
             GGML_ABORT("AME Q8_0 mul_mat: packed weight missing at compute time");
         }
         AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel whole_k=%d",
             ame_use_whole_k_q8() ? 1 : 0);
         ggml_ame_mul_mat_q8_0_ame64(
             packed_w,
+            packed_d,
             src1,
             src1->data,
             dst->data,
@@ -643,7 +678,8 @@ public:
             // 单侧为真会让 generic 路径拿到 AME 的 wsize（或反之）而撞 ggml-cpu 断言
             if (op->src[1]->type != GGML_TYPE_F32 ||
                 !ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]) ||
-                ame_get_packed_q8_weight(op->src[0]) == nullptr) {
+                ame_get_packed_q8_weight(op->src[0]) == nullptr ||
+                ame_get_packed_q8_scales(op->src[0]) == nullptr) {
                 return false;
             }
             size = ggml_backend_ame_desired_wsize(op);
@@ -718,7 +754,8 @@ public:
             // 与 work_size 同谓词（见上）；baseline 删除后无 packed 就必须让位给 generic
             if (src1->type != GGML_TYPE_F32 ||
                 !ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0]) ||
-                ame_get_packed_q8_weight(src0) == nullptr) {
+                ame_get_packed_q8_weight(src0) == nullptr ||
+                ame_get_packed_q8_scales(src0) == nullptr) {
                 return false;
             }
         } else if (src0->type == GGML_TYPE_BF16) {
@@ -754,6 +791,9 @@ static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     for (auto & it : ctx->packed_q8) {
         if (it.second.data != nullptr) {
             ggml_aligned_free(it.second.data, it.second.size);
+        }
+        if (it.second.scales != nullptr) {
+            ggml_aligned_free(it.second.scales, it.second.scales_size);
         }
     }
     if (ctx->base != nullptr) {

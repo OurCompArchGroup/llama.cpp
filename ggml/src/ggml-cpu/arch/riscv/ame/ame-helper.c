@@ -52,7 +52,9 @@ void ggml_ame_repack_q4_0(
     }
 }
 
-static inline void ggml_ame_quantize_64_f32_to_q8(const float * x, block_q8_ame64 * y) {
+static inline void ggml_ame_quantize_64_f32_to_q8(
+    const float * x, block_q8_ame64 * y, uint16_t * d_out
+) {
     float amax = 0.0f;
     for (int j = 0; j < AME_Q8_PACK_K; ++j) {
         const float av = fabsf(x[j]);
@@ -63,7 +65,7 @@ static inline void ggml_ame_quantize_64_f32_to_q8(const float * x, block_q8_ame6
 
     const float delta = amax / 127.0f;
     const float inv_delta = delta ? 1.0f / delta : 0.0f;
-    y->d = GGML_FP32_TO_FP16(delta);
+    *d_out = GGML_FP32_TO_FP16(delta);
 
     for (int j = 0; j < AME_Q8_PACK_K; ++j) {
         y->qs[j] = roundf(x[j] * inv_delta);
@@ -72,6 +74,7 @@ static inline void ggml_ame_quantize_64_f32_to_q8(const float * x, block_q8_ame6
 
 void ggml_ame_repack_q8_0_to_ame64(
     void * dst,
+    uint16_t * dst_d,
     const void * src,
     int64_t nrows,
     int64_t k
@@ -104,13 +107,15 @@ void ggml_ame_repack_q8_0_to_ame64(
                 }
             }
 
-            ggml_ame_quantize_64_f32_to_q8(tmp, &dst_row[b64]);
+            ggml_ame_quantize_64_f32_to_q8(
+                tmp, &dst_row[b64], &dst_d[row * nb64 + b64]);
         }
     }
 }
 
 void ggml_ame_repack_q8_0_to_ame64_whole_k(
     void * dst,
+    uint16_t * dst_d,
     const void * src,
     int64_t nrows,
     int64_t k
@@ -144,7 +149,7 @@ void ggml_ame_repack_q8_0_to_ame64_whole_k(
 
         for (int64_t b64 = 0; b64 < nb64; ++b64) {
             block_q8_ame64 * out = &dst_row[b64];
-            out->d = delta_fp16;
+            dst_d[row * nb64 + b64] = delta_fp16;
 
             for (int j = 0; j < AME_Q8_PACK_K; ++j) {
                 const int64_t index = b64 * AME_Q8_PACK_K + j;

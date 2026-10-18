@@ -657,7 +657,7 @@ static void ame_profile_accumulate(const struct ame_profile_counters * local) {
  * without issuing a TLB re-query for each virtual page boundary.
  * This is only correct when the accessed buffers are physically contiguous.
  * 直读路径下 MLA/MLB 直接跨行读 repack 大数组（entry.data / xq），
- * 单条 MLA 覆盖 tile_m*nb64*66 字节：K=4096 时 m64 ≈ 264 KiB、m128 ≈ 528 KiB，
+ * 单条 MLA 覆盖 tile_m*nb64*64 字节：K=4096 时 m64 ≈ 256 KiB、m128 ≈ 512 KiB，
  * 远超一页；非物理连续分配同样会静默读错行。
  */
 static void ame_assert_phys_contiguous(void) {
@@ -670,8 +670,8 @@ static void ame_assert_phys_contiguous(void) {
             "[AME] FATAL: xsai memory pool is not physically contiguous.\n"
             "             CUTE AMU row-address formula: PA_row = PA_base + row*stride\n"
             "             (no per-row TLB re-query, LocalMMU TODO not yet implemented).\n"
-            "             Direct-read kernels span tile_m*nb64*66 bytes per call\n"
-            "             (K=4096: ~264 KiB at m64 / ~528 KiB at m128) across many\n"
+            "             Direct-read kernels span tile_m*nb64*64 bytes per call\n"
+            "             (K=4096: ~256 KiB at m64 / ~512 KiB at m128) across many\n"
             "             virtual pages; wrong physical addresses => silent corruption.\n"
             "             Fix: boot kernel with hugepages=512, or define\n"
             "             RESERVED_PHYS_BASE_ADDR for /dev/mem-backed pool.\n");
@@ -812,10 +812,12 @@ static size_t ame_align_up_size(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-static inline void ggml_ame_quantize_block_f32_to_q8_64(const float * x, int valid, block_q8_ame64 * y) {
+static inline void ggml_ame_quantize_block_f32_to_q8_64(
+    const float * x, int valid, block_q8_ame64 * y, uint16_t * d_out
+) {
 #if defined(__riscv_v)
     if (valid <= 0) {
-        y->d = GGML_FP32_TO_FP16(0.0f);
+        *d_out = GGML_FP32_TO_FP16(0.0f);
         memset(y->qs, 0, AME_Q8_PACK_K);
         return;
     }
@@ -837,7 +839,7 @@ static inline void ggml_ame_quantize_block_f32_to_q8_64(const float * x, int val
 
     const float d = amax / 127.0f;
     const float id = d ? 1.0f / d : 0.0f;
-    y->d = GGML_FP32_TO_FP16(d);
+    *d_out = GGML_FP32_TO_FP16(d);
 
     offset = 0;
     while (offset < valid) {
@@ -871,7 +873,7 @@ static inline void ggml_ame_quantize_block_f32_to_q8_64(const float * x, int val
     const float d = amax / 127.0f;
     const float id = d ? 1.0f / d : 0.0f;
 
-    y->d = GGML_FP32_TO_FP16(d);
+    *d_out = GGML_FP32_TO_FP16(d);
     for (int j = 0; j < AME_Q8_PACK_K; ++j) {
         y->qs[j] = roundf(tmp[j] * id);
     }
@@ -923,7 +925,6 @@ static void ame_quantize_row_f32_to_q8_whole_k(
 
     for (int64_t kb = 0; kb < nb64; ++kb) {
         block_q8_ame64 * block = &blocks[kb];
-        block->d = delta_fp16;
         scales[kb] = stored_delta;
         const int64_t base = kb * AME_Q8_PACK_K;
         const int valid = base + AME_Q8_PACK_K <= k ?
@@ -1136,8 +1137,7 @@ static inline void ame_store_scaled_tile_transposed(
 static inline void ame_finish_whole_k_pipeline_tile(
     float * restrict out,
     const int32_t * restrict c,
-    const block_q8_ame64 * restrict xa,
-    const block_q8_ame64 * restrict xq,
+    const uint16_t * restrict xa_d,
     const float * restrict xq_scales,
     const int64_t mt,
     const int64_t j0,
@@ -1153,15 +1153,13 @@ static inline void ame_finish_whole_k_pipeline_tile(
     uint64_t prof_t0 = prof != NULL ? ame_read_cycle() : 0;
     float x_scales[AME_TILE_M_MAX];
     float y_scales[AME_TILE_N_MAX];
-    // 直读：行 (mt*tile_m + i) 的 scale 取该行 kb=0 块的 d（whole-K 下每行各 kb 的 d 相同）
+    // 直读：行 (mt*tile_m + i) 的 scale 取该行 kb=0 个 scale（whole-K 下每行各 kb 的 d 相同）
     for (int i = 0; i < imax; ++i) {
         x_scales[i] = GGML_FP16_TO_FP32(
-            xa[((size_t) mt * (size_t) tile_m + (size_t) i) * (size_t) nb64].d);
+            xa_d[((size_t) mt * (size_t) tile_m + (size_t) i) * (size_t) nb64]);
     }
     for (int j = 0; j < jmax; ++j) {
-        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
-        y_scales[j] = xq_scales != NULL ?
-            xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
+        y_scales[j] = xq_scales[(j0 + j) * nb64];
     }
     if (transposed_c) {
         ame_store_scaled_tile_transposed(out, c, x_scales, y_scales, M, tile_m, imax, jmax);
@@ -1176,8 +1174,7 @@ static inline void ame_finish_whole_k_pipeline_tile(
 struct ame_whole_k_overlap_context {
     float * out;
     const int32_t * c;
-    const block_q8_ame64 * xa;
-    const block_q8_ame64 * xq;
+    const uint16_t * xa_d;
     const float * xq_scales;
     int64_t mt;
     int64_t j0;
@@ -1197,8 +1194,7 @@ static void ame_finish_whole_k_pipeline_tile_callback(void * opaque) {
     ame_finish_whole_k_pipeline_tile(
         ctx->out,
         ctx->c,
-        ctx->xa,
-        ctx->xq,
+        ctx->xa_d,
         ctx->xq_scales,
         ctx->mt,
         ctx->j0,
@@ -1215,7 +1211,7 @@ static void ame_finish_whole_k_pipeline_tile_callback(void * opaque) {
 struct ame_whole_k_acc_pipeline_context {
     float * out;
     const int32_t * c_slots;
-    const block_q8_ame64 * xa;
+    const uint16_t * xa_d;
     const float * y_scales;
     int64_t nb64;
     int64_t M;
@@ -1236,7 +1232,7 @@ static void ame_finish_whole_k_acc_pipeline_tile(void * opaque, int tile_index) 
     float x_scales_local[AME_TILE_M_MAX];
     for (int i = 0; i < imax; ++i) {
         x_scales_local[i] = GGML_FP16_TO_FP32(
-            ctx->xa[((size_t) i0 + (size_t) i) * (size_t) ctx->nb64].d);
+            ctx->xa_d[((size_t) i0 + (size_t) i) * (size_t) ctx->nb64]);
     }
     const float * restrict x_scales = x_scales_local;
     const int32_t * restrict c = ctx->c_slots + (size_t) slot * ctx->tile_c_elements;
@@ -1352,8 +1348,9 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
             const int64_t base = kb * AME_Q8_PACK_K;
             const int valid = (base + AME_Q8_PACK_K <= K) ? AME_Q8_PACK_K : (K > base ? (int) (K - base) : 0);
             block_q8_ame64 * dst = &g_ame_x_q64_cache.blocks[j * nb64 + kb];
-            ggml_ame_quantize_block_f32_to_q8_64(src1_col + base, valid, dst);
-            g_ame_x_q64_cache.scales[j * nb64 + kb] = GGML_FP16_TO_FP32(dst->d);
+            uint16_t d16 = 0;
+            ggml_ame_quantize_block_f32_to_q8_64(src1_col + base, valid, dst, &d16);
+            g_ame_x_q64_cache.scales[j * nb64 + kb] = GGML_FP16_TO_FP32(d16);
         }
     }
 
@@ -1379,6 +1376,7 @@ static const block_q8_ame64 * ame_prepare_x_q64_cache(
 
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
+    const uint16_t * src0_d,
     const void * src1_key,
     const void * src1,
     void * dst,
@@ -1397,9 +1395,10 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const int64_t N = ne11;
     const int64_t K = ne00;
     const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-    // 直读布局（A 侧 = 权重 repack 数组）：块 = {uint16 d; int8 qs[64]}，块长 ablock。
+    // 直读布局（A 侧 = 权重 repack 数组）：块 = {int8 qs[64]}，块长 ablock（=64）。
     // A 第 m 行第 kb 块的 qs 地址 = (const int8_t *) x + (m*nb64 + kb)*ablock + a_qs_off；
     // 行距 a_row_stride = nb64*ablock（同一 kb 的相邻行），相邻 k 块增量 = ablock。
+    // scale 在独立数组 src0_d 中，下标 = row*nb64 + kb。
     const size_t ablock = sizeof(block_q8_ame64);
     const size_t a_qs_off = offsetof(block_q8_ame64, qs);
     const ptrdiff_t a_row_stride = (ptrdiff_t) ((size_t) nb64 * ablock);
@@ -1584,14 +1583,12 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 float y_scales[AME_TILE_N_MAX];
                 const int output_tiles = (int) ((M + tile_m - 1) / tile_m);
                 for (int j = 0; j < jmax; ++j) {
-                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
-                    y_scales[j] = xq_scales != NULL ?
-                        xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
+                    y_scales[j] = xq_scales[(j0 + j) * nb64];
                 }
                 struct ame_whole_k_acc_pipeline_context pipeline_ctx = {
                     .out = out + j0 * M,
                     .c_slots = tile_c,
-                    .xa = x,
+                    .xa_d = src0_d,
                     .y_scales = y_scales,
                     .nb64 = nb64,
                     .M = M,
@@ -1661,8 +1658,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     overlap_ctx.out = out + j0 * M + pending_i0;
                     overlap_ctx.c = tile_c +
                         (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t));
-                    overlap_ctx.xa = x;
-                    overlap_ctx.xq = xq;
+                    overlap_ctx.xa_d = src0_d;
                     overlap_ctx.xq_scales = xq_scales;
                     overlap_ctx.mt = pending_i0 / tile_m;
                     overlap_ctx.j0 = j0;
@@ -1713,8 +1709,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 ame_finish_whole_k_pipeline_tile(
                     out + j0 * M + pending_i0,
                     tile_c + (size_t) pending_slot * (tile_c_bytes / sizeof(int32_t)),
-                    x,
-                    xq,
+                    src0_d,
                     xq_scales,
                     pending_i0 / tile_m,
                     j0,
@@ -1793,14 +1788,12 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                // 直读：行 (i0+i) 的 scale 取该行 kb=0 块的 d（whole-K 下每行各 kb 的 d 相同）
+                // 直读：行 (i0+i) 的 scale 取该行 kb=0 个 scale（whole-K 下每行各 kb 的 d 相同）
                 for (int i = 0; i < imax; ++i) {
-                    x_scales[i] = GGML_FP16_TO_FP32(x[(i0 + i) * nb64].d);
+                    x_scales[i] = GGML_FP16_TO_FP32(src0_d[(i0 + i) * nb64]);
                 }
                 for (int j = 0; j < jmax; ++j) {
-                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64];
-                    y_scales[j] = xq_scales != NULL ?
-                        xq_scales[(j0 + j) * nb64] : GGML_FP16_TO_FP32(bx->d);
+                    y_scales[j] = xq_scales[(j0 + j) * nb64];
                 }
                 if (use_whole_k_fused_epilogue) {
                     ame_store_scaled_tile(
@@ -1861,13 +1854,12 @@ void ggml_ame_mul_mat_q8_0_ame64(
                     }
 
                     for (int j = 0; j < jmax; ++j) {
-                        const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                        pending_y_scales[slot][j] =
-                            xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
+                        pending_y_scales[slot][j] = xq_scales[(j0 + j) * nb64 + kb];
                     }
-                    // 直读：行 (i0+i) 第 kb 块的 d（fp16→f32）
+                    // 直读：行 (i0+i) 第 kb 个 scale（fp16→f32）
                     for (int i = 0; i < imax; ++i) {
-                        pending_x_scales[slot][i] = GGML_FP16_TO_FP32(x[(i0 + i) * nb64 + kb].d);
+                        pending_x_scales[slot][i] =
+                            GGML_FP16_TO_FP32(src0_d[(i0 + i) * nb64 + kb]);
                     }
 
                     pending_c[slot] = tile_c + (size_t) slot * (tile_c_bytes / sizeof(int32_t));
@@ -1966,8 +1958,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 if (prof) prof_local.cycles_pack_a += ame_read_cycle() - prof_t0;
 
                 for (int j = 0; j < jmax; ++j) {
-                    const block_q8_ame64 * bx = &xq[(j0 + j) * nb64 + kb];
-                    y_scales[j] = xq_scales != NULL ? xq_scales[(j0 + j) * nb64 + kb] : GGML_FP16_TO_FP32(bx->d);
+                    y_scales[j] = xq_scales[(j0 + j) * nb64 + kb];
                 }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
@@ -2009,10 +2000,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 }
 
                 prof_t0 = prof ? ame_read_cycle() : 0;
-                // 直读：行 (i0+i) 第 kb 块的 d（fp16→f32），与旧 tile 缓存逐位等价
+                // 直读：行 (i0+i) 第 kb 个 scale（fp16→f32），与旧 tile 缓存逐位等价
                 for (int i = 0; i < imax; ++i) {
-                    const block_q8_ame64 * bx = &x[(i0 + i) * nb64 + kb];
-                    x_scales[i] = GGML_FP16_TO_FP32(bx->d);
+                    x_scales[i] = GGML_FP16_TO_FP32(src0_d[(i0 + i) * nb64 + kb]);
                 }
                 ame_accumulate_scaled_tile(
                     acc_f32,

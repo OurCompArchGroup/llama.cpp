@@ -407,10 +407,13 @@ typedef struct {
     int8_t qs[32];      // pre-unpacked 4-bit values to int8 [-8, 7]
 } block_q4_0_ame;
 
+// 直读布局：CUTE 矩阵访存固定 64B 粒度（地址低 6 位被硬件丢弃），
+// 因此块必须是纯 qs —— 块起点就是 64B 对齐点，块长正好 64B。
+// scale（原块内 d）拆到独立的 uint16_t 数组，由 CPU 侧读取，
+// 布局见 ggml_ame_repack_q8_0_to_ame64[_whole_k]。
 typedef struct {
-    uint16_t d;
     int8_t qs[AME_Q8_PACK_K];
-} block_q8_ame64;
+} block_q8_ame64;  // sizeof == 64
 
 #define AME_MCFG_INT8  0x02
 #define AME_MCFG_UINT8 0x03
@@ -723,8 +726,11 @@ void ggml_ame_repack_q4_0(
 );
 
 // Experimental Q8_0 -> AME-native packed K64 repack.
+// dst: [nrows][nb64] 的 64B qs 块（64B 对齐、行距 nb64*64）；
+// dst_d: [nrows][nb64] 的 fp16 scale，与 dst 同下标。
 void ggml_ame_repack_q8_0_to_ame64(
     void * dst,
+    uint16_t * dst_d,
     const void * src,
     int64_t nrows,
     int64_t k
@@ -732,6 +738,7 @@ void ggml_ame_repack_q8_0_to_ame64(
 
 void ggml_ame_repack_q8_0_to_ame64_whole_k(
     void * dst,
+    uint16_t * dst_d,
     const void * src,
     int64_t nrows,
     int64_t k
@@ -753,6 +760,7 @@ void ggml_ame_mul_mat_bf16(
 
 void ggml_ame_mul_mat_q8_0_ame64(
     const void * src0,
+    const uint16_t * src0_d,
     const void * src1_key,
     const void * src1,
     void * dst,
