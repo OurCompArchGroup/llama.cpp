@@ -666,6 +666,30 @@ static int ggml_xsai_op_progress_enabled(void) {
     return cached;
 }
 
+static int ggml_xsai_op_timing_log_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        cached = ggml_xsai_profile_env_on("GGML_XSAI_OP_TIMING_LOG") ? 1 : 0;
+    }
+    return cached;
+}
+
+static void ggml_xsai_op_timing_log(const struct ggml_tensor * node,
+                                    uint64_t start_cycle,
+                                    uint64_t end_cycle) {
+    char name[GGML_MAX_NAME];
+    ggml_xsai_profile_normalize_name(node->name, name, sizeof(name));
+    fprintf(stderr,
+            "[GGML_XSAI_OP_TIMING] name=%s op=%s start_cycle=%" PRIu64
+            " end_cycle=%" PRIu64 " cycles=%" PRIu64 "\n",
+            name,
+            node->op < GGML_OP_COUNT ? ggml_op_name(node->op) : "UNKNOWN",
+            start_cycle,
+            end_cycle,
+            end_cycle - start_cycle);
+    fflush(stderr);
+}
+
 static void ggml_xsai_op_progress_log(const char * phase, int node_n, const struct ggml_tensor * node) {
     char name[GGML_MAX_NAME];
     ggml_xsai_profile_normalize_name(node->name, name, sizeof(name));
@@ -3600,6 +3624,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const int xsai_profile = state->ith == 0 ? ggml_xsai_op_profile_enabled() : 0;
     const int xsai_detail = state->ith == 0 ? ggml_xsai_op_profile_detail_enabled() : 0;
     const int xsai_progress = state->ith == 0 ? ggml_xsai_op_progress_enabled() : 0;
+    const int xsai_timing_log = ggml_xsai_op_timing_log_enabled();
     const int xsai_timing = xsai_profile || xsai_detail;
     uint64_t xsai_detail_graph = 0;
     if (xsai_profile) {
@@ -3668,9 +3693,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (xsai_progress) {
             ggml_xsai_op_progress_log("begin", node_n, node);
         }
+        if (xsai_timing_log) {
+            ggml_barrier(tp);
+        }
+        const uint64_t xsai_timing_start = xsai_timing_log && state->ith == 0
+            ? ggml_xsai_profile_read_cycle() : 0;
         const uint64_t xsai_profile_t0 = xsai_timing ? ggml_xsai_profile_read_cycle() : 0;
         ggml_compute_forward(&params, node);
         const uint64_t xsai_profile_cycles = xsai_timing ? ggml_xsai_profile_read_cycle() - xsai_profile_t0 : 0;
+        if (xsai_timing_log) {
+            ggml_barrier(tp);
+            if (state->ith == 0) {
+                const uint64_t xsai_timing_end = ggml_xsai_profile_read_cycle();
+                ggml_xsai_op_timing_log(node, xsai_timing_start, xsai_timing_end);
+            }
+        }
         if (xsai_progress) {
             ggml_xsai_op_progress_log("end", node_n, node);
         }
