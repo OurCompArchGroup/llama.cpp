@@ -489,8 +489,10 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                     start = profile_enabled ? read_cycle() : 0;
                     ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
                         ws.q_panels, FA_M * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                        FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                         ws.k_panels, FA_N * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                        dk_tiles, 2, ws.scores);
+                        FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                        dk_tiles, 2, FA_N, ws.scores);
                     if (profile_enabled) {
                         profile.qk_ame += read_cycle() - start;
                         ++profile.qk_tiles;
@@ -560,8 +562,10 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                         start = profile_enabled ? read_cycle() : 0;
                         ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
                             ws.p_panels, FA_M * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                            FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                             ws.v_panels, FA_N * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                            2, 2, ws.pv);
+                            FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                            2, 2, FA_N, ws.pv);
                         if (profile_enabled) {
                             profile.pv_ame += read_cycle() - start;
                             ++profile.pv_tiles;

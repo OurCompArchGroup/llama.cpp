@@ -696,7 +696,10 @@ extern void ggml_ame_gemm_tile_i8_i32_bT(
 
 extern void ggml_ame_gemm_tile_bf16_fp32_bT(
     const ggml_bf16_t * A,
+    ptrdiff_t a_row_stride,
     const ggml_bf16_t * B,
+    ptrdiff_t b_row_stride,
+    int tile_n,
     float * C
 );
 
@@ -2103,9 +2106,9 @@ void ggml_ame_mul_mat_bf16(
     int src1_allocated = 0;
 
     const size_t tile_a_size = AME_TILE_M * AME_TILE_K_BF16 * sizeof(ggml_bf16_t);
-    const size_t tile_b_size = AME_TILE_N * AME_TILE_K_BF16 * sizeof(ggml_bf16_t);
-    const size_t tile_c_size = AME_TILE_M * AME_TILE_N * sizeof(float);
-    const size_t acc_tile_size = AME_TILE_M * AME_TILE_N * sizeof(float);
+    const size_t tile_b_size = AME_TILE_N_BF16 * AME_TILE_K_BF16 * sizeof(ggml_bf16_t);
+    const size_t tile_c_size = AME_TILE_M * AME_TILE_N_BF16 * sizeof(float);
+    const size_t acc_tile_size = AME_TILE_M * AME_TILE_N_BF16 * sizeof(float);
 
     const size_t k_tiles = (size_t) (K_AME / AME_TILE_K_BF16);
     int use_whole_k = ame_whole_k_bf16_enabled() && K_AME == K && k_tiles > 0;
@@ -2115,15 +2118,6 @@ void ggml_ame_mul_mat_bf16(
     }
     const size_t tile_a_alloc_size = use_whole_k ? k_tiles * tile_a_size : tile_a_size;
     const size_t tile_b_alloc_size = use_whole_k ? k_tiles * tile_b_size : tile_b_size;
-
-    ggml_bf16_t * tile_a = (ggml_bf16_t *) ggml_aligned_malloc(tile_a_alloc_size);
-    ggml_bf16_t * tile_b = (ggml_bf16_t *) ggml_aligned_malloc(tile_b_alloc_size);
-    float * tile_c = (float *) ggml_aligned_malloc(tile_c_size);
-    float * acc_tile = use_whole_k ? NULL : (float *) malloc(acc_tile_size);
-
-    if (tile_a == NULL || tile_b == NULL || tile_c == NULL || (!use_whole_k && acc_tile == NULL)) {
-        goto cleanup;
-    }
 
     if (src1_type == GGML_TYPE_F32) {
         const size_t converted_size = (size_t) N * (size_t) K * sizeof(ggml_bf16_t);
@@ -2141,18 +2135,59 @@ void ggml_ame_mul_mat_bf16(
         GGML_ASSERT(src1_type == GGML_TYPE_BF16);
     }
 
+    const int64_t a_row_stride = K * (int64_t) sizeof(ggml_bf16_t);
+    const int64_t b_row_stride = (src1_type == GGML_TYPE_BF16)
+        ? (int64_t) src1_stride
+        : K * (int64_t) sizeof(ggml_bf16_t);
+    const ptrdiff_t tile_row_stride = (ptrdiff_t) AME_TILE_K;
+    const ptrdiff_t k_tile_bytes = (ptrdiff_t) AME_TILE_K_BF16 * (ptrdiff_t) sizeof(ggml_bf16_t);
+    const ggml_bf16_t * b_base = ame_get_bf16_col_ptr(
+        src1, 0, K, src1_stride, src1_type, converted_src1);
+
+    // Direct read: MLA/MLB consume whole 64-byte granules, so every row start
+    // and the row stride must be 64B aligned.  AME weights live in the
+    // 64B-aligned AME buffer; the activation side may be a 32B-aligned host
+    // tensor or have a row stride that is not a multiple of 64B.  Keep the
+    // packed-tile path as fallback for those (rare) cases.
+    const int direct_ok =
+        ((uintptr_t) a % 64u) == 0 &&
+        ((uintptr_t) b_base % 64u) == 0 &&
+        (a_row_stride % 64) == 0 &&
+        (b_row_stride % 64) == 0;
+
+    AME_LOG("bf16 mul_mat: M=%lld N=%lld K=%lld whole_k=%d direct=%d "
+            "a_stride=%lld b_stride=%lld src1_type=%d",
+            (long long) M, (long long) N, (long long) K, use_whole_k, direct_ok,
+            (long long) a_row_stride, (long long) b_row_stride, (int) src1_type);
+
+    ggml_bf16_t * tile_a = NULL;
+    ggml_bf16_t * tile_b = NULL;
+    float * tile_c = (float *) ggml_aligned_malloc(tile_c_size);
+    float * acc_tile = use_whole_k ? NULL : (float *) malloc(acc_tile_size);
+    if (!direct_ok) {
+        tile_a = (ggml_bf16_t *) ggml_aligned_malloc(tile_a_alloc_size);
+        tile_b = (ggml_bf16_t *) ggml_aligned_malloc(tile_b_alloc_size);
+    }
+
+    if (tile_c == NULL || (!use_whole_k && acc_tile == NULL) ||
+        (!direct_ok && (tile_a == NULL || tile_b == NULL))) {
+        goto cleanup;
+    }
+
     if (K_AME > 0) {
         ame_assert_phys_contiguous();
         ggml_ame_sync_begin_op();
     }
 
-    for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N) {
-        const int jmax = (j0 + AME_TILE_N <= N) ? AME_TILE_N : (int) (N - j0);
+    for (int64_t j0 = 0; j0 < N; j0 += AME_TILE_N_BF16) {
+        const int jmax = (j0 + AME_TILE_N_BF16 <= N) ? AME_TILE_N_BF16 : (int) (N - j0);
+        const ggml_bf16_t * b_col0 = ame_get_bf16_col_ptr(
+            src1, j0, K, src1_stride, src1_type, converted_src1);
 
         for (int64_t i0 = 0; i0 < M; i0 += AME_TILE_M) {
             const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (int) (M - i0);
 
-            if (imax != AME_TILE_M || jmax != AME_TILE_N || K_AME == 0) {
+            if (imax != AME_TILE_M || jmax != AME_TILE_N_BF16 || K_AME == 0) {
                 for (int i = 0; i < imax; ++i) {
                     const ggml_bf16_t * row_a = a + (i0 + i) * K;
                     for (int j = 0; j < jmax; ++j) {
@@ -2165,33 +2200,40 @@ void ggml_ame_mul_mat_bf16(
             }
 
             if (use_whole_k) {
-                for (size_t kb = 0; kb < k_tiles; ++kb) {
-                    const int64_t k0 = (int64_t) kb * AME_TILE_K_BF16;
-                    ggml_bf16_t * panel_a = tile_a + kb * AME_TILE_M * AME_TILE_K_BF16;
-                    ggml_bf16_t * panel_b = tile_b + kb * AME_TILE_N * AME_TILE_K_BF16;
+                if (direct_ok) {
+                    ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
+                        a + i0 * K, k_tile_bytes, (ptrdiff_t) a_row_stride,
+                        b_col0, k_tile_bytes, (ptrdiff_t) b_row_stride,
+                        (int) k_tiles, ame_bf16_register_pairs(), AME_TILE_N_BF16, tile_c);
+                } else {
+                    for (size_t kb = 0; kb < k_tiles; ++kb) {
+                        const int64_t k0 = (int64_t) kb * AME_TILE_K_BF16;
+                        ggml_bf16_t * panel_a = tile_a + kb * AME_TILE_M * AME_TILE_K_BF16;
+                        ggml_bf16_t * panel_b = tile_b + kb * AME_TILE_N_BF16 * AME_TILE_K_BF16;
 
-                    for (int i = 0; i < AME_TILE_M; ++i) {
-                        memcpy(panel_a + i * AME_TILE_K_BF16,
-                            a + (i0 + i) * K + k0,
-                            AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
+                        for (int i = 0; i < AME_TILE_M; ++i) {
+                            memcpy(panel_a + i * AME_TILE_K_BF16,
+                                a + (i0 + i) * K + k0,
+                                AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
+                        }
+                        for (int j = 0; j < AME_TILE_N_BF16; ++j) {
+                            const ggml_bf16_t * col_b = ame_get_bf16_col_ptr(
+                                src1, j0 + j, K, src1_stride, src1_type, converted_src1);
+                            memcpy(panel_b + j * AME_TILE_K_BF16,
+                                col_b + k0,
+                                AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
+                        }
                     }
-                    for (int j = 0; j < AME_TILE_N; ++j) {
-                        const ggml_bf16_t * col_b = ame_get_bf16_col_ptr(
-                            src1, j0 + j, K, src1_stride, src1_type, converted_src1);
-                        memcpy(panel_b + j * AME_TILE_K_BF16,
-                            col_b + k0,
-                            AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
-                    }
+
+                    ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
+                        tile_a, (ptrdiff_t) tile_a_size, tile_row_stride,
+                        tile_b, (ptrdiff_t) tile_b_size, tile_row_stride,
+                        (int) k_tiles, ame_bf16_register_pairs(), AME_TILE_N_BF16, tile_c);
                 }
 
-                ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
-                    tile_a, (ptrdiff_t) tile_a_size,
-                    tile_b, (ptrdiff_t) tile_b_size,
-                    (int) k_tiles, ame_bf16_register_pairs(), tile_c);
-
                 for (int i = 0; i < AME_TILE_M; ++i) {
-                    for (int j = 0; j < AME_TILE_N; ++j) {
-                        out[(j0 + j) * M + (i0 + i)] = tile_c[i * AME_TILE_N + j];
+                    for (int j = 0; j < AME_TILE_N_BF16; ++j) {
+                        out[(j0 + j) * M + (i0 + i)] = tile_c[i * AME_TILE_N_BF16 + j];
                     }
                 }
                 continue;
@@ -2200,26 +2242,34 @@ void ggml_ame_mul_mat_bf16(
             memset(acc_tile, 0, acc_tile_size);
 
             for (int64_t k0 = 0; k0 < K_AME; k0 += AME_TILE_K_BF16) {
-                for (int i = 0; i < AME_TILE_M; ++i) {
-                    memcpy(tile_a + i * AME_TILE_K_BF16,
-                        a + (i0 + i) * K + k0,
-                        AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
-                }
-
-                for (int j = 0; j < AME_TILE_N; ++j) {
-                    const ggml_bf16_t * col_b = ame_get_bf16_col_ptr(
-                        src1, j0 + j, K, src1_stride, src1_type, converted_src1);
-                    memcpy(tile_b + j * AME_TILE_K_BF16,
-                        col_b + k0,
-                        AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
-                }
-
                 memset(tile_c, 0, tile_c_size);
-                ggml_ame_gemm_tile_bf16_fp32_bT(tile_a, tile_b, tile_c);
+                if (direct_ok) {
+                    ggml_ame_gemm_tile_bf16_fp32_bT(
+                        a + i0 * K + k0, (ptrdiff_t) a_row_stride,
+                        b_col0 + k0, (ptrdiff_t) b_row_stride,
+                        AME_TILE_N_BF16, tile_c);
+                } else {
+                    for (int i = 0; i < AME_TILE_M; ++i) {
+                        memcpy(tile_a + i * AME_TILE_K_BF16,
+                            a + (i0 + i) * K + k0,
+                            AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
+                    }
+
+                    for (int j = 0; j < AME_TILE_N_BF16; ++j) {
+                        const ggml_bf16_t * col_b = ame_get_bf16_col_ptr(
+                            src1, j0 + j, K, src1_stride, src1_type, converted_src1);
+                        memcpy(tile_b + j * AME_TILE_K_BF16,
+                            col_b + k0,
+                            AME_TILE_K_BF16 * sizeof(ggml_bf16_t));
+                    }
+
+                    ggml_ame_gemm_tile_bf16_fp32_bT(
+                        tile_a, tile_row_stride, tile_b, tile_row_stride, AME_TILE_N_BF16, tile_c);
+                }
 
                 for (int i = 0; i < AME_TILE_M; ++i) {
-                    for (int j = 0; j < AME_TILE_N; ++j) {
-                        acc_tile[i * AME_TILE_N + j] += tile_c[i * AME_TILE_N + j];
+                    for (int j = 0; j < AME_TILE_N_BF16; ++j) {
+                        acc_tile[i * AME_TILE_N_BF16 + j] += tile_c[i * AME_TILE_N_BF16 + j];
                     }
                 }
             }
@@ -2228,17 +2278,17 @@ void ggml_ame_mul_mat_bf16(
                 const int tail = (int) (K - K_AME);
                 for (int i = 0; i < AME_TILE_M; ++i) {
                     const ggml_bf16_t * row_a = a + (i0 + i) * K + K_AME;
-                    for (int j = 0; j < AME_TILE_N; ++j) {
+                    for (int j = 0; j < AME_TILE_N_BF16; ++j) {
                         const ggml_bf16_t * col_b = ame_get_bf16_col_ptr(
                             src1, j0 + j, K, src1_stride, src1_type, converted_src1) + K_AME;
-                        acc_tile[i * AME_TILE_N + j] += ame_vec_dot_bf16_fallback(tail, row_a, col_b);
+                        acc_tile[i * AME_TILE_N_BF16 + j] += ame_vec_dot_bf16_fallback(tail, row_a, col_b);
                     }
                 }
             }
 
             for (int i = 0; i < AME_TILE_M; ++i) {
-                for (int j = 0; j < AME_TILE_N; ++j) {
-                    out[(j0 + j) * M + (i0 + i)] = acc_tile[i * AME_TILE_N + j];
+                for (int j = 0; j < AME_TILE_N_BF16; ++j) {
+                    out[(j0 + j) * M + (i0 + i)] = acc_tile[i * AME_TILE_N_BF16 + j];
                 }
             }
         }

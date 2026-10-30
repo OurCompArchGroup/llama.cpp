@@ -47,6 +47,14 @@ static inline int ame_log_enabled(void) {
 #define AME_TILE_N_MAX 128
 #define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
 
+// BF16 GEMM 的 N tile。
+// 这一版 RTL（CUTE Tensor_MN=128）在每次 MMA 时断言
+// MatrixRegWorkingTensor_N === Tensor_MN，即 MMA 的 N 必须填满整个
+// tensor 宽度；用 64 宽的 N 会直接 assert。硬件没有对应的 M 约束，
+// 所以 M 仍取 AME_TILE_M=64。NEMU 侧两者都支持（tile N 本来就是
+// MSETTILEN 的寄存器操作数），因此统一用 128 有利 RTL/NEMU 对齐。
+#define AME_TILE_N_BF16 128
+
 #define AME_Q8_BLOCK_K 32
 #define AME_Q8_PACK_K 64
 
@@ -684,17 +692,23 @@ void ggml_ame_gemm_tile_i8_i32_bT(
 
 void ggml_ame_gemm_tile_bf16_fp32_bT(
     const ggml_bf16_t * A,
+    ptrdiff_t a_row_stride,
     const ggml_bf16_t * B,
+    ptrdiff_t b_row_stride,
+    int tile_n,
     float * C
 );
 
 void ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
     const ggml_bf16_t * a_tiles,
     ptrdiff_t a_tile_stride,
+    ptrdiff_t a_row_stride,
     const ggml_bf16_t * b_tiles,
     ptrdiff_t b_tile_stride,
+    ptrdiff_t b_row_stride,
     int k_tiles,
     int reg_pairs,
+    int tile_n,
     float * C
 );
 
