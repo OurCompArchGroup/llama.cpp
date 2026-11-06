@@ -1,7 +1,8 @@
 #include "xsai-backend.h"
 
-#include "ame-xsai-observe.h"
-#include "ame-xsai-plan.h"
+#include "xsai-observe.h"
+#include "xsai-plan.h"
+#include "ggml-backend-impl.h"
 #include "ggml-cpu-impl.h"
 
 #include <cstdio>
@@ -49,22 +50,22 @@ static void test_add_reuses_plan() {
     dst.src[0] = &lhs;
     dst.src[1] = &rhs;
 
-    ame_xsai_plan_cache_clear();
-    ame_xsai_plan_cache_reset_counts();
-    ame_xsai_observe_reset();
+    xsai_plan_cache_clear();
+    xsai_plan_cache_reset_counts();
+    xsai_observe_reset();
 
     size_t bytes = 99;
     expect(xsai_backend_work_size(1, &dst, bytes), "add work_size creates a plan");
     expect(bytes == 0, "add workspace is empty");
-    const uint64_t created = ame_xsai_plan_create_count();
-    const uint64_t misses = ame_xsai_plan_key_miss_count();
+    const uint64_t created = xsai_plan_create_count();
+    const uint64_t misses = xsai_plan_key_miss_count();
     expect(created == 1 && misses == 1 && created == misses, "first add plan-create equals key miss");
 
     size_t again = 7;
     expect(xsai_backend_work_size(1, &dst, again), "second add work_size hits");
-    expect(ame_xsai_plan_create_count() == 1, "second work_size does not create");
-    expect(ame_xsai_plan_cache_hit_count() == 1, "second work_size is a cache hit");
-    expect(ame_xsai_plan_key_miss_count() == 1, "hit is not a key miss");
+    expect(xsai_plan_create_count() == 1, "second work_size does not create");
+    expect(xsai_plan_cache_hit_count() == 1, "second work_size is a cache hit");
+    expect(xsai_plan_key_miss_count() == 1, "hit is not a key miss");
 
     ggml_compute_params params = {};
     params.ith = 0;
@@ -73,13 +74,13 @@ static void test_add_reuses_plan() {
     expect(dst_data[0] == 11.f && dst_data[1] == 22.f && dst_data[2] == 33.f && dst_data[3] == 44.f,
            "add compute wrote the sum");
     expect(xsai_backend_compute(&params, &dst), "second add compute reuses the plan");
-    expect(ame_xsai_plan_execute_count() == 2, "two executes share one plan");
-    expect(ame_xsai_plan_create_count() == ame_xsai_plan_key_miss_count(),
+    expect(xsai_plan_execute_count() == 2, "two executes share one plan");
+    expect(xsai_plan_create_count() == xsai_plan_key_miss_count(),
            "plan-create still equals key miss after reuse");
 
-    ame_xsai_observe_export_t observed = {};
-    ame_xsai_observe_export(&observed);
-    expect(observed.plan_create_count == ame_xsai_plan_key_miss_count(),
+    xsai_observe_export_t observed = {};
+    xsai_observe_export(&observed);
+    expect(observed.plan_create_count == xsai_plan_key_miss_count(),
            "observe plan_create matches key miss");
     expect(observed.execute_count == 2 && observed.kernel_count == observed.execute_count,
            "observe execute is the kernel sample");
@@ -173,14 +174,16 @@ static void test_q8_work_and_compute() {
     dst.src[0] = &weight;
     dst.src[1] = &activation;
 
-    const uint64_t before = ame_xsai_plan_create_count();
+    const uint64_t before = xsai_plan_create_count();
     size_t bytes = 0;
     const bool planned = xsai_backend_work_size(1, &dst, bytes);
     expect(planned, "q8 work_size creates a plan");
     if (!planned) {
         return;
     }
-    expect(ame_xsai_plan_create_count() == before + 1, "q8 plan-create counted");
+    expect(xsai_plan_create_count() == before + 1, "q8 plan-create counted");
+    expect(xsai_plan_cached_op(&dst) == XSAI_OP_GEMM,
+           "M = 1 activation uses the vector form");
     ggml_compute_params params = {};
     params.ith = 0;
     params.nth = 1;
@@ -195,17 +198,116 @@ static void test_q8_work_and_compute() {
     }
     expect(xsai_backend_compute(&params, &dst), "q8 compute executes");
     expect(out > 31.f && out < 33.f, "q8 compute is near the reference dot");
-    std::printf("q8 out=%g workspace=%zu prepared_bytes=%llu\n", out, bytes,
-                (unsigned long long) ame_xsai_prepared_bytes());
-    expect(ame_xsai_prepared_bytes() > 0, "q8 prepare owns arena bytes");
+    std::printf("q8 vector out=%g workspace=%zu prepared_bytes=%llu\n", out, bytes,
+                (unsigned long long) xsai_prepared_bytes());
+    expect(xsai_prepared_bytes() > 0, "q8 prepare owns arena bytes");
     std::free(scratch);
+
+    /* M = 2 reuses the same prepared weight through a GEMM plan. */
+    float act2[2 * 32];
+    float out2[2] = {0.f, 0.f};
+    for (int i = 0; i < 2 * 32; ++i) {
+        act2[i] = 1.f;
+    }
+    activation.ne[1] = 2;
+    activation.nb[1] = 32 * sizeof(float);
+    activation.nb[2] = activation.nb[1] * 2;
+    activation.nb[3] = activation.nb[2];
+    activation.data = act2;
+    dst.ne[1] = 2;
+    dst.nb[1] = sizeof(float);
+    dst.nb[2] = sizeof(float) * 2;
+    dst.nb[3] = dst.nb[2];
+    dst.data = out2;
+
+    size_t gemm_bytes = 0;
+    const uint64_t gemm_before = xsai_plan_create_count();
+    expect(xsai_backend_work_size(1, &dst, gemm_bytes), "q8 gemm work_size creates a plan");
+    expect(xsai_plan_create_count() == gemm_before + 1, "gemm plan-create counted");
+    expect(xsai_plan_cached_op(&dst) == XSAI_OP_GEMM,
+           "M > 1 activation routes to GEMM");
+    ggml_compute_params gemm_params = {};
+    gemm_params.ith = 0;
+    gemm_params.nth = 1;
+    void * gemm_scratch = nullptr;
+    if (gemm_bytes) {
+        if (posix_memalign(&gemm_scratch, 64, gemm_bytes) != 0) {
+            gemm_scratch = nullptr;
+        }
+        gemm_params.wdata = gemm_scratch;
+    }
+    gemm_params.wsize = gemm_bytes;
+    expect(xsai_backend_compute(&gemm_params, &dst), "q8 gemm compute executes");
+    expect(out2[0] > 31.f && out2[0] < 33.f && out2[1] > 31.f && out2[1] < 33.f,
+           "q8 gemm writes every row");
+    std::free(gemm_scratch);
+}
+
+static void test_placement_probe() {
+    ggml_backend_buffer_type dummy_buft = {};
+    ggml_backend_buffer dummy = {};
+    dummy.buft = &dummy_buft;
+    dummy.context = nullptr;
+    dummy.size = 0;
+
+    unsigned char q8[34] = {};
+    q8[0] = 0x00;
+    q8[1] = 0x3c; /* fp16 1.0 */
+    ggml_tensor weight;
+    std::memset(&weight, 0, sizeof(weight));
+    weight.type = GGML_TYPE_Q8_0;
+    weight.ne[0] = 32;
+    weight.ne[1] = 1;
+    weight.ne[2] = 1;
+    weight.ne[3] = 1;
+    weight.nb[0] = 34;
+    weight.nb[1] = 34;
+    weight.nb[2] = 34;
+    weight.nb[3] = 34;
+    weight.data = q8;
+    weight.buffer = &dummy;
+
+    float act[32] = {};
+    float out = 0.f;
+    ggml_tensor activation;
+    ggml_tensor dst;
+    fill_f32(&activation, 32, 1, act);
+    fill_f32(&dst, 1, 1, &out);
+    dst.op = GGML_OP_MUL_MAT;
+    dst.src[0] = &weight;
+    dst.src[1] = &activation;
+
+    expect(xsai_backend_placement_supports(&dummy_buft, &dst), "q8 mul_mat placement claims");
+
+    weight.type = GGML_TYPE_F16;
+    expect(!xsai_backend_placement_supports(&dummy_buft, &dst),
+           "non-q8 mul_mat placement declines");
+    weight.type = GGML_TYPE_Q8_0;
+
+    dst.op = GGML_OP_GET_ROWS;
+    expect(xsai_backend_placement_supports(&dummy_buft, &dst),
+           "non mul_mat placement stays permissive");
+    dst.op = GGML_OP_MUL_MAT;
+
+    dummy.size = 34;
+    weight.type = GGML_TYPE_F16;
+    expect(xsai_backend_placement_supports(&dummy_buft, &dst),
+           "real buffer placement stays permissive");
+    dummy.size = 0;
+    weight.type = GGML_TYPE_Q8_0;
+
+    dummy.buft = nullptr;
+    expect(xsai_backend_placement_supports(&dummy_buft, &dst),
+           "foreign buffer is not a placement probe");
+    dummy.buft = &dummy_buft;
 }
 
 int main() {
     test_add_reuses_plan();
     test_fallback_does_not_write();
     test_q8_work_and_compute();
-    ame_xsai_plan_cache_clear();
+    test_placement_probe();
+    xsai_plan_cache_clear();
     if (g_failures) {
         std::printf("xsai-backend-test failures=%d\n", g_failures);
         return 1;
