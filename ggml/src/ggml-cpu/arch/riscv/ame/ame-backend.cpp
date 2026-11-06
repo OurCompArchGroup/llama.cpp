@@ -3,6 +3,10 @@
 
 #include "ame-backend.h"
 #include "ame.h"
+#if defined(GGML_USE_XSAI_BLAS)
+#include "../xsai/xsai-plan.h"
+#include "../xsai/xsai-backend.h"
+#endif
 
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
@@ -79,98 +83,6 @@ static bool ame_backend_can_use_f16_via_bf16(const ggml_tensor * op) {
     return ggml_ame_can_use_bf16(src0->ne[1], src1->ne[1], src0->ne[0]);
 }
 
-// Simple scalar reference implementation for Q8_0 x F32 matmul
-// Now using tiled approach with ggml_ame_gemm_tile_i8_i32_bT SCALAR version
-static void reference_mul_mat_q8_0_f32(
-    const void * src0_data,
-    const void * src1_data,
-    float * dst_data,
-    int64_t M, int64_t N, int64_t K,
-    size_t src1_stride_bytes
-) {
-    const block_q8_0 * x = (const block_q8_0 *)src0_data;
-    const int64_t nb = K / QK8_0;
-    
-    // Quantize src1 to Q8_0
-    block_q8_0 * y = (block_q8_0 *)malloc(N * nb * sizeof(block_q8_0));
-    
-    for (int64_t n = 0; n < N; n++) {
-        const float * src1_col = (const float *)((const char *)src1_data + n * src1_stride_bytes);
-        ggml_ame_quantize_row_f32_to_q8_0(src1_col, y + n * nb, K);
-    }
-    
-    // Heap-allocated via ggml_aligned_malloc so the buffers come from the xsai
-    // pool and are physically contiguous (required by CUTE AMU PA-offset addressing).
-    int8_t  * tile_A = (int8_t  *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-    int8_t  * tile_B = (int8_t  *)ggml_aligned_malloc(AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-    int32_t * tile_C = (int32_t *)ggml_aligned_malloc(AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-    if (!tile_A || !tile_B || !tile_C) {
-        ggml_aligned_free(tile_A, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-        ggml_aligned_free(tile_B, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-        ggml_aligned_free(tile_C, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-        free(y);
-        return;
-    }
-
-    memset(dst_data, 0, M * N * sizeof(float));
-    ggml_ame_sync_begin_op();
-
-    for (int64_t m0 = 0; m0 < M; m0 += AME_TILE_M) {
-        for (int64_t n0 = 0; n0 < N; n0 += AME_TILE_N) {
-            
-            // Loop over blocks (K dimension)
-            for (int64_t b = 0; b < nb; b++) {
-                // Pack A tile: [AME_TILE_M, AME_TILE_K]
-                for (int i = 0; i < AME_TILE_M; i++) {
-                    if (m0 + i < M) {
-                         const block_q8_0 * blk = &x[b + (m0 + i) * nb];
-                         memset(&tile_A[i * AME_TILE_K], 0, AME_TILE_K);
-                         memcpy(&tile_A[i * AME_TILE_K], blk->qs, QK8_0);
-                    } else {
-                         memset(&tile_A[i * AME_TILE_K], 0, AME_TILE_K);
-                    }
-                }
-
-                // Pack B tile: [AME_TILE_N, AME_TILE_K]
-                // Note: y is column-major logic (N x nb), but stored linear.
-                // y[b + n*nb] is block for col 'n'.
-                // We want tile_B to have rows corresponding to 'n' (transposed B).
-                for (int j = 0; j < AME_TILE_N; j++) {
-                    if (n0 + j < N) {
-                         const block_q8_0 * blk = &y[b + (n0 + j) * nb];
-                         memset(&tile_B[j * AME_TILE_K], 0, AME_TILE_K);
-                         memcpy(&tile_B[j * AME_TILE_K], blk->qs, QK8_0);
-                    } else {
-                         memset(&tile_B[j * AME_TILE_K], 0, AME_TILE_K);
-                    }
-                }
-
-                // Compute Tile
-                memset(tile_C, 0, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-                ggml_ame_gemm_tile_i8_i32_bT(tile_A, tile_B, tile_C);
-
-                // Accumulate to destination with scales
-                for (int i = 0; i < AME_TILE_M; i++) {
-                    if (m0 + i >= M) continue;
-                    const float d_a = GGML_FP16_TO_FP32(x[b + (m0 + i) * nb].d);
-                    
-                    for (int j = 0; j < AME_TILE_N; j++) {
-                        if (n0 + j >= N) continue;
-                        const float d_b = GGML_FP16_TO_FP32(y[b + (n0 + j) * nb].d);
-                        
-                        float val = (float)tile_C[i * AME_TILE_N + j];
-                        dst_data[(m0 + i) + (n0 + j) * M] += val * d_a * d_b;
-                    }
-                }
-            }
-        }
-    }
-    
-    ggml_aligned_free(tile_A, AME_TILE_M * AME_TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_B, AME_TILE_N * AME_TILE_K * sizeof(int8_t));
-    ggml_aligned_free(tile_C, AME_TILE_M * AME_TILE_N * sizeof(int32_t));
-    free(y);
-}
 
 static void reference_mul_mat_bf16_f32(
     const void * src0_data,
@@ -228,92 +140,16 @@ static bool ame_parse_env_bool(const char * name) {
     return true;
 }
 
-static bool ame_use_packed_q8() {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_parse_env_bool("GGML_AME_PACKED_Q8") ? 1 : 0;
-    }
-    return cached == 1;
-}
-
-static bool ame_use_whole_k_q8() {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = ame_parse_env_bool("GGML_AME_WHOLE_K_Q8") ? 1 : 0;
-    }
-    return cached == 1;
-}
-
-struct ame_packed_q8_info {
-    void * data = nullptr;
-    size_t size = 0;
-    void * tile_a = nullptr;
-    size_t tile_a_size = 0;
-    float * tile_scales = nullptr;
-    size_t tile_scales_count = 0;
-};
 
 struct ame_buffer_context {
     void * base = nullptr;
     size_t base_size = 0;
     uint64_t generation = 1;
-    std::unordered_map<const ggml_tensor *, ame_packed_q8_info> packed_q8;
     std::vector<ggml_tensor *> tensors;
 };
 
 static inline ame_buffer_context * ame_buffer_ctx(ggml_backend_buffer_t buffer) {
     return static_cast<ame_buffer_context *>(buffer->context);
-}
-
-struct ame_host_tensor_generation {
-    ggml_backend_buffer_t buffer = nullptr;
-    uint64_t generation = 0;
-};
-
-struct ame_host_generation_state {
-    uint64_t next_generation = 1;
-    std::unordered_map<const ggml_tensor *, ame_host_tensor_generation> tensors;
-    std::unordered_map<ggml_backend_buffer_t, uint64_t> buffers;
-};
-
-static ame_host_generation_state & ame_host_generations() {
-    static ame_host_generation_state state;
-    return state;
-}
-
-extern "C" void ggml_ame_host_buffer_on_write(
-    ggml_backend_buffer_t buffer,
-    struct ggml_tensor * tensor,
-    size_t offset,
-    size_t size
-) {
-    GGML_UNUSED(offset);
-    if (buffer == nullptr || size == 0) {
-        return;
-    }
-
-    ame_host_generation_state & state = ame_host_generations();
-    const uint64_t generation = ++state.next_generation;
-    state.buffers[buffer] = generation;
-    if (tensor != nullptr) {
-        state.tensors[tensor] = { buffer, generation };
-    }
-}
-
-extern "C" void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) {
-    if (buffer == nullptr) {
-        return;
-    }
-
-    ame_host_generation_state & state = ame_host_generations();
-    state.buffers.erase(buffer);
-    for (auto it = state.tensors.begin(); it != state.tensors.end(); ) {
-        if (it->second.buffer == buffer) {
-            it = state.tensors.erase(it);
-        } else {
-            ++it;
-        }
-    }
 }
 
 static uint64_t ame_tensor_content_generation(const ggml_tensor * tensor) {
@@ -326,178 +162,13 @@ static uint64_t ame_tensor_content_generation(const ggml_tensor * tensor) {
         return ame_buffer_ctx(tensor->buffer)->generation;
     }
 
-    ame_host_generation_state & state = ame_host_generations();
-    uint64_t generation = 0;
-    const auto bit = state.buffers.find(tensor->buffer);
-    if (bit != state.buffers.end()) {
-        generation = bit->second;
-    }
-
-    const auto tit = state.tensors.find(tensor);
-    if (tit != state.tensors.end() && tit->second.buffer == tensor->buffer) {
-        generation = std::max(generation, tit->second.generation);
-    }
-
-    return generation;
+#if defined(GGML_USE_XSAI_BLAS)
+    return xsai_backend_host_generation(tensor);
+#else
+    return 0;
+#endif
 }
 
-static size_t ggml_ame_packed_q8_64_size(const ggml_tensor * tensor) {
-    const int64_t nb64 = (tensor->ne[0] + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-    return (size_t) ggml_nrows(tensor) * (size_t) nb64 * sizeof(block_q8_ame64);
-}
-
-static const block_q8_ame64 * ame_get_packed_q8_weight(
-    const ggml_tensor * tensor,
-    const int8_t ** tile_a_out,
-    const float ** tile_scales_out
-) {
-    if (tile_a_out != nullptr) {
-        *tile_a_out = nullptr;
-    }
-    if (tile_scales_out != nullptr) {
-        *tile_scales_out = nullptr;
-    }
-    if (!ame_use_packed_q8()) {
-        return nullptr;
-    }
-    if (tensor->buffer == nullptr || tensor->buffer->context == nullptr) {
-        return nullptr;
-    }
-
-    ame_buffer_context * ctx = ame_buffer_ctx(tensor->buffer);
-    const auto it = ctx->packed_q8.find(tensor);
-    if (it == ctx->packed_q8.end()) {
-        return nullptr;
-    }
-    if (tile_a_out != nullptr) {
-        *tile_a_out = static_cast<const int8_t *>(it->second.tile_a);
-    }
-    if (tile_scales_out != nullptr) {
-        *tile_scales_out = it->second.tile_scales;
-    }
-    return static_cast<const block_q8_ame64 *>(it->second.data);
-}
-
-static void ame_build_packed_q8_tile_a_cache(
-    ame_packed_q8_info & entry,
-    const ggml_tensor * tensor
-) {
-    const int64_t K = tensor->ne[0];
-    const int64_t M = tensor->ne[1];
-    const int64_t nb64 = (K + AME_Q8_PACK_K - 1) / AME_Q8_PACK_K;
-    const int64_t m_tiles = (M + AME_TILE_M - 1) / AME_TILE_M;
-    const size_t tile_bytes = AME_TILE_M * AME_TILE_K * sizeof(int8_t);
-    const size_t tile_a_size = (size_t) m_tiles * (size_t) nb64 * tile_bytes;
-    const size_t tile_scales_count = (size_t) m_tiles * (size_t) nb64 * AME_TILE_M;
-
-    if (entry.tile_a == nullptr || entry.tile_a_size != tile_a_size) {
-        if (entry.tile_a != nullptr) {
-            ggml_aligned_free(entry.tile_a, entry.tile_a_size);
-        }
-        entry.tile_a = ggml_aligned_malloc(tile_a_size);
-        entry.tile_a_size = tile_a_size;
-    }
-
-    if (entry.tile_scales == nullptr || entry.tile_scales_count != tile_scales_count) {
-        if (entry.tile_scales != nullptr) {
-            ggml_aligned_free(entry.tile_scales, entry.tile_scales_count * sizeof(float));
-        }
-        entry.tile_scales = static_cast<float *>(ggml_aligned_malloc(tile_scales_count * sizeof(float)));
-        entry.tile_scales_count = tile_scales_count;
-    }
-
-    if (entry.tile_a == nullptr || entry.tile_scales == nullptr || entry.data == nullptr) {
-        return;
-    }
-
-    const block_q8_ame64 * blocks = static_cast<const block_q8_ame64 *>(entry.data);
-    for (int64_t mt = 0; mt < m_tiles; ++mt) {
-        const int64_t i0 = mt * AME_TILE_M;
-        const int imax = (i0 + AME_TILE_M <= M) ? AME_TILE_M : (M - i0);
-
-        for (int64_t kb = 0; kb < nb64; ++kb) {
-            int8_t * dst_tile =
-                static_cast<int8_t *>(entry.tile_a) + ((size_t) mt * (size_t) nb64 + (size_t) kb) * tile_bytes;
-            float * dst_scales =
-                entry.tile_scales + ((size_t) mt * (size_t) nb64 + (size_t) kb) * AME_TILE_M;
-
-            for (int i = 0; i < AME_TILE_M; ++i) {
-                if (i < imax) {
-                    const block_q8_ame64 * b = &blocks[(i0 + i) * nb64 + kb];
-                    memcpy(&dst_tile[i * AME_TILE_K], b->qs, AME_Q8_PACK_K);
-                    dst_scales[i] = GGML_FP16_TO_FP32(b->d);
-                } else {
-                    memset(&dst_tile[i * AME_TILE_K], 0, AME_Q8_PACK_K);
-                    dst_scales[i] = 0.0f;
-                }
-            }
-        }
-    }
-}
-
-static void ame_store_packed_q8_weight(
-    ggml_backend_buffer_t buffer,
-    const ggml_tensor * tensor,
-    const void * data
-) {
-    ame_buffer_context * ctx = ame_buffer_ctx(buffer);
-    auto & entry = ctx->packed_q8[tensor];
-    const size_t packed_size = ggml_ame_packed_q8_64_size(tensor);
-
-    if (entry.data == nullptr || entry.size != packed_size) {
-        if (entry.data != nullptr) {
-            ggml_aligned_free(entry.data, entry.size);
-        }
-        entry.data = ggml_aligned_malloc(packed_size);
-        entry.size = packed_size;
-    }
-
-    if (entry.data != nullptr) {
-        if (ame_use_whole_k_q8()) {
-            ggml_ame_repack_q8_0_to_ame64_whole_k(
-                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
-        } else {
-            ggml_ame_repack_q8_0_to_ame64(
-                entry.data, data, ggml_nrows(tensor), tensor->ne[0]);
-        }
-        ame_build_packed_q8_tile_a_cache(entry, tensor);
-    }
-}
-
-static size_t ame_refresh_packed_q8_weights(ggml_backend_buffer_t buffer) {
-    if (!ame_use_packed_q8()) {
-        return 0;
-    }
-
-    ame_buffer_context * ctx = ame_buffer_ctx(buffer);
-    size_t repacked = 0;
-
-    for (ggml_tensor * tensor : ctx->tensors) {
-        if (tensor == nullptr || tensor->data == nullptr) {
-            continue;
-        }
-        if (tensor->type != GGML_TYPE_Q8_0) {
-            continue;
-        }
-
-        ame_store_packed_q8_weight(buffer, tensor, tensor->data);
-        ++repacked;
-    }
-
-    return repacked;
-}
-
-static size_t ggml_backend_ame_desired_wsize(const ggml_tensor * op) {
-    const int64_t K = op->src[0]->ne[0];
-    const int64_t M = op->src[0]->ne[1];
-    const int64_t N = op->src[1]->ne[1];
-    // Kernel dispatch enables packed-B solely through this flag. Workspace
-    // planning must use the same condition; otherwise larger M shapes fall
-    // back to a per-call allocation even though they still execute packed-B.
-    const bool use_packed_b_panel = ame_backend_env_enabled("GGML_AME_USE_PACKED_B_PANEL");
-    const ggml_ame_i8_kernel * kernel = ggml_ame_select_i8_kernel(M, N, K);
-    return ggml_ame_i8_kernel_workspace_size(kernel, N, K, use_packed_b_panel ? 1 : 0);
-}
 
 static void ame_convert_f16_rows_to_bf16(
     const void * src,
@@ -666,43 +337,13 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     GGML_ASSERT(ne00 == ne10);
 
     if (src0->type == GGML_TYPE_Q8_0) {
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-        const int8_t * packed_w_tile_a = nullptr;
-        const float * packed_w_tile_scales = nullptr;
-        const block_q8_ame64 * packed_w = ame_get_packed_q8_weight(src0, &packed_w_tile_a, &packed_w_tile_scales);
-        if (packed_w != nullptr) {
-            AME_LOG("backend_ame_mul_mat: dispatching to packed Q8_64 kernel whole_k=%d",
-                ame_use_whole_k_q8() ? 1 : 0);
-            ggml_ame_mul_mat_q8_0_ame64(
-                packed_w,
-                src1,
-                src1->data,
-                dst->data,
-                ne00, ne01,
-                ne10, ne11,
-                src1->nb[1],
-                packed_w_tile_a,
-                packed_w_tile_scales,
-                ggml_threadpool_graph_id(params->threadpool),
-                params->threadpool,
-                ame_tensor_content_generation(src1),
-                params->wdata,
-                params->wsize
-            );
-        } else {
-            AME_LOG("backend_ame_mul_mat: dispatching to baseline Q8_0 kernel");
-            ggml_ame_mul_mat_q8_0(
-                src0->data,
-                src1->data,
-                dst->data,
-                ne00, ne01,
-                ne10, ne11,
-                src1->nb[1],
-                params->wdata,
-                params->wsize
-            );
-        }
+        /* Q8 GEMM is executed by xsai_plan_execute. This entry only keeps
+         * the non-Q8 kernels. */
+        GGML_UNUSED(ne00);
+        GGML_UNUSED(ne01);
+        GGML_UNUSED(ne10);
+        GGML_UNUSED(ne11);
+        return;
     } else {
         GGML_ASSERT(src0->type == GGML_TYPE_BF16);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
@@ -733,14 +374,16 @@ public:
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
+#if defined(GGML_USE_XSAI_BLAS)
         if (op->src[0]->type == GGML_TYPE_Q8_0) {
-            if (op->src[1]->type != GGML_TYPE_F32 ||
-                !ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])) {
-                return false;
-            }
-            size = ggml_backend_ame_desired_wsize(op);
-            return true;
+            return xsai_backend_q8_work_size(
+                op, ame_tensor_content_generation(op->src[0]), size);
         }
+#else
+        if (op->src[0]->type == GGML_TYPE_Q8_0) {
+            return false;
+        }
+#endif
 
         if (op->src[0]->type == GGML_TYPE_BF16 &&
             (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_BF16) &&
@@ -764,6 +407,14 @@ public:
 
         static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
 
+#if defined(GGML_USE_XSAI_BLAS)
+        if (op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_Q8_0) {
+            /* Q8 key, plan cache, and before-write fallback live in the xsai backend. */
+            return xsai_backend_q8_compute(
+                params, op, ame_tensor_content_generation(op->src[0]));
+        }
+#endif
+
         if (scalar_mode) {
             if (params->ith != 0) {
                 return true;
@@ -774,16 +425,6 @@ public:
             const int64_t N = src1->ne[1];
             const int64_t K = src0->ne[0];
 
-            if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
-                reference_mul_mat_q8_0_f32(
-                    src0->data,
-                    src1->data,
-                    (float *) op->data,
-                    M, N, K,
-                    src1->nb[1]
-                );
-                return true;
-            }
             if (src0->type == GGML_TYPE_BF16 &&
                 (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16)) {
                 reference_mul_mat_bf16_f32(
@@ -807,10 +448,7 @@ public:
                 return false;
             }
         } else if (src0->type == GGML_TYPE_Q8_0) {
-            if (src1->type != GGML_TYPE_F32 ||
-                !ggml_ame_can_use_q8(src0->ne[1], src1->ne[1], src0->ne[0])) {
-                return false;
-            }
+            return false;
         } else if (src0->type == GGML_TYPE_BF16) {
             if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_BF16) ||
                 !ggml_ame_can_use_bf16(src0->ne[1], src1->ne[1], src0->ne[0])) {
@@ -841,17 +479,11 @@ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struc
 // AME buffer interface
 static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
-    for (auto & it : ctx->packed_q8) {
-        if (it.second.data != nullptr) {
-            ggml_aligned_free(it.second.data, it.second.size);
-        }
-        if (it.second.tile_a != nullptr) {
-            ggml_aligned_free(it.second.tile_a, it.second.tile_a_size);
-        }
-        if (it.second.tile_scales != nullptr) {
-            ggml_aligned_free(it.second.tile_scales, it.second.tile_scales_count * sizeof(float));
-        }
+#if defined(GGML_USE_XSAI_BLAS)
+    for (ggml_tensor * tensor : ctx->tensors) {
+        xsai_weight_release(tensor);
     }
+#endif
     if (ctx->base != nullptr) {
         ggml_aligned_free(ctx->base, ctx->base_size);
     }
@@ -881,6 +513,9 @@ static void ggml_backend_ame_buffer_memset_tensor(
     memset((char *)tensor->data + offset, value, size);
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
+#endif
     }
 }
 
@@ -894,10 +529,11 @@ static void ggml_backend_ame_buffer_set_tensor(
     memcpy((char *) tensor->data + offset, data, size);
     if (size != 0) {
         ame_buffer_ctx(buffer)->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
+#endif
     }
-    if (ame_use_packed_q8() && tensor->type == GGML_TYPE_Q8_0 && offset == 0 && size == ggml_nbytes(tensor)) {
-        ame_store_packed_q8_weight(buffer, tensor, data);
-    }
+    GGML_UNUSED(data);
 }
 
 static void ggml_backend_ame_buffer_get_tensor(
@@ -916,14 +552,14 @@ static void ggml_backend_ame_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     memset(ctx->base, value, buffer->size);
     if (buffer->size != 0) {
         ctx->generation++;
+#if defined(GGML_USE_XSAI_BLAS)
+        for (ggml_tensor * tensor : ctx->tensors) {
+            xsai_backend_q8_refresh(tensor, ame_tensor_content_generation(tensor));
+        }
+#endif
     }
 
-    if (value == 0) {
-        const size_t repacked = ame_refresh_packed_q8_weights(buffer);
-        if (repacked > 0) {
-            AME_LOG("buffer_clear: synthesized %zu packed Q8_64 tensors after zero-fill", repacked);
-        }
-    }
+    GGML_UNUSED(value);
 }
 
 static ggml_backend_buffer_i ggml_backend_ame_buffer_interface = {
@@ -1021,9 +657,10 @@ public:
             return true;
         }
 
-        const bool shape_supported = op->src[0]->type == GGML_TYPE_Q8_0
-            ? ggml_ame_can_use_q8(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0])
-            : ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
+        /* Q8 eligibility is decided by xsai-blas plan_create. Do not
+         * pre-guess tile shape or AME capability here. */
+        const bool shape_supported = op->src[0]->type == GGML_TYPE_Q8_0 ||
+            ggml_ame_can_use_bf16(op->src[0]->ne[1], op->src[1]->ne[1], op->src[0]->ne[0]);
         if (!shape_supported) {
             AME_LOG("supports_op: fallback (shape not AME-friendly)");
             return true;
@@ -1062,28 +699,8 @@ public:
 
 }  // namespace ggml::cpu::riscv_ame
 
-// Runtime AME availability check
-static bool ggml_ame_available() {
-#ifdef GGML_USE_RV_AME
-    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
-    if (ggml_ame_select_i8_kernel(64, 64, 64) == NULL) {
-        AME_LOG("ggml_ame_available: returning false (hw probe valid=%d tlenb=%llu trlenb=%llu alenb=%llu capacity=%s)",
-            cfg->valid,
-            (unsigned long long) cfg->tlenb,
-            (unsigned long long) cfg->trlenb,
-            (unsigned long long) cfg->alenb,
-            ggml_ame_i8_capacity_name(cfg));
-        return false;
-    }
-    AME_LOG("ggml_ame_available: returning true (capacity=%s)", ggml_ame_i8_capacity_name(cfg));
-    return true;
-#else
-    AME_LOG("ggml_ame_available: returning false (GGML_USE_RV_AME not set)");
-    return false;
-#endif
-}
-
-// Public buffer type getter
+// Public buffer type getter. Q8 capability is owned by xsai-blas; this
+// registration no longer probes CSR tile limits or picks an i8 kernel.
 ggml_backend_buffer_type_t ggml_backend_cpu_riscv_ame_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv_ame = {
         /* .iface = */ {
@@ -1097,13 +714,6 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv_ame_buffer_type(void) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ new ggml::cpu::riscv_ame::extra_buffer_type(),
     };
-
-    if (!ggml_ame_available()) {
-        AME_LOG("buffer_type: AME not available, returning nullptr");
-        return nullptr;
-    }
-
-    AME_LOG("buffer_type: returning AME buffer type");
 
     return &ggml_backend_cpu_buffer_type_riscv_ame;
 }

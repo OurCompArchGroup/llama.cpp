@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+extern "C" void xsai_backend_print_report(void) __attribute__((weak));
+
 // ---------------------------------------------------------------------------
 // RISC-V hardware performance counters
 // On non-RISC-V hosts both read as 0 so the binary remains buildable on x86.
@@ -382,6 +384,9 @@ int main(int argc, char ** argv) {
 #ifdef GGML_XSAI_ALLOC
     xsai_alloc_print_stats();
 #endif
+    if (xsai_backend_print_report) {
+        xsai_backend_print_report();
+    }
     // llama_perf_sampler_print(smpl);
     // llama_perf_context_print(ctx);
     fprintf(stderr, "\n");

@@ -474,6 +474,34 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/arch/riscv/ame/ame.h
             )
         endif()
+        # xsai-blas adapter: independent of GGML_RV_AME. When both are enabled,
+        # each layer claims the ops of its own buffers.
+        if (XSAI_BLAS_HOME)
+            if (NOT XSAI_BLAS_LIBRARY)
+                set(XSAI_BLAS_LIBRARY "${XSAI_BLAS_HOME}/build/linux-xsai/xsai-blas-riscv64-xs.a")
+            endif()
+            if (NOT EXISTS "${XSAI_BLAS_HOME}/include/xsai_blas.h")
+                message(FATAL_ERROR "xsai-blas headers not found under ${XSAI_BLAS_HOME}/include")
+            endif()
+            if (NOT EXISTS "${XSAI_BLAS_LIBRARY}")
+                message(FATAL_ERROR "xsai-blas library not found: ${XSAI_BLAS_LIBRARY}")
+            endif()
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_XSAI_BLAS)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE
+                "${XSAI_BLAS_HOME}/include"
+                "${XSAI_BLAS_HOME}/3rdparty/dlpack/include")
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE "${XSAI_BLAS_LIBRARY}")
+            target_sources(${GGML_CPU_NAME} PRIVATE
+                ggml-cpu/arch/riscv/xsai/xsai-plan.cpp
+                ggml-cpu/arch/riscv/xsai/xsai-plan.h
+                ggml-cpu/arch/riscv/xsai/xsai-observe.cpp
+                ggml-cpu/arch/riscv/xsai/xsai-observe.h
+                ggml-cpu/arch/riscv/xsai/xsai-fusion.cpp
+                ggml-cpu/arch/riscv/xsai/xsai-fusion.h
+                ggml-cpu/arch/riscv/xsai/xsai-backend.cpp
+                ggml-cpu/arch/riscv/xsai/xsai-backend.h)
+            message(STATUS "RISC-V xsai-blas backend: ${XSAI_BLAS_LIBRARY}")
+        endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
             set(MARCH_STR "rv64g")
             if (GGML_RV_ZFH)
@@ -571,6 +599,39 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     else()
         message(WARNING "Unknown CPU architecture. Falling back to generic implementations.")
         list(APPEND ARCH_FLAGS -DGGML_CPU_GENERIC)
+    endif()
+
+    # Host reference build of the xsai backend. RISC-V keeps its own block in
+    # the riscv64 branch above, which adds the same sources when XSAI_BLAS_HOME
+    # is set. Default OFF so the existing host-tools configure is unchanged.
+    if (GGML_XSAI_BACKEND AND NOT GGML_SYSTEM_ARCH STREQUAL "riscv64")
+        if (NOT XSAI_BLAS_HOME)
+            message(FATAL_ERROR "GGML_XSAI_BACKEND requires XSAI_BLAS_HOME")
+        endif()
+        if (NOT XSAI_BLAS_LIBRARY)
+            message(FATAL_ERROR "GGML_XSAI_BACKEND requires XSAI_BLAS_LIBRARY")
+        endif()
+        if (NOT EXISTS "${XSAI_BLAS_HOME}/include/xsai_blas.h")
+            message(FATAL_ERROR "xsai-blas headers not found under ${XSAI_BLAS_HOME}/include")
+        endif()
+        if (NOT EXISTS "${XSAI_BLAS_LIBRARY}")
+            message(FATAL_ERROR "xsai-blas library not found: ${XSAI_BLAS_LIBRARY}")
+        endif()
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_XSAI_BLAS)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE
+            "${XSAI_BLAS_HOME}/include"
+            "${XSAI_BLAS_HOME}/3rdparty/dlpack/include")
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE "${XSAI_BLAS_LIBRARY}")
+        target_sources(${GGML_CPU_NAME} PRIVATE
+            ggml-cpu/arch/riscv/xsai/xsai-plan.cpp
+            ggml-cpu/arch/riscv/xsai/xsai-plan.h
+            ggml-cpu/arch/riscv/xsai/xsai-observe.cpp
+            ggml-cpu/arch/riscv/xsai/xsai-observe.h
+            ggml-cpu/arch/riscv/xsai/xsai-fusion.cpp
+            ggml-cpu/arch/riscv/xsai/xsai-fusion.h
+            ggml-cpu/arch/riscv/xsai/xsai-backend.cpp
+            ggml-cpu/arch/riscv/xsai/xsai-backend.h)
+        message(STATUS "xsai ggml backend (host reference/generic): ${XSAI_BLAS_LIBRARY}")
     endif()
 
     if (GGML_CPU_REPACK)

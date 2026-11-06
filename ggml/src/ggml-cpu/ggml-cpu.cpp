@@ -26,6 +26,10 @@
 #    include "arch/riscv/ame/ame-backend.h"
 #endif
 
+#ifdef GGML_USE_XSAI_BLAS
+#    include "arch/riscv/xsai/xsai-backend.h"
+#endif
+
 #ifdef GGML_XSAI_ALLOC
 #    include "xsai_alloc.h"
 #endif
@@ -60,6 +64,12 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
         if (ggml_backend_cpu_riscv64_spacemit_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_riscv64_spacemit_buffer_type());
+        }
+#endif
+
+#ifdef GGML_USE_XSAI_BLAS
+        if (ggml_backend_cpu_xsai_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_xsai_buffer_type());
         }
 #endif
 
@@ -148,6 +158,7 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
 
     struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
 
+    /* cplan keeps the shared scratch buffer. It does not store xsai plans. */
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 

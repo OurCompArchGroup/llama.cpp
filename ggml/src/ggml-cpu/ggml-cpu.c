@@ -17,6 +17,9 @@
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
 #endif
+#if defined(GGML_USE_XSAI_BLAS)
+#include "arch/riscv/xsai/xsai-backend.h"
+#endif
 #include "ggml.h"
 #include "common.h"
 
@@ -3359,6 +3362,14 @@ struct ggml_cplan ggml_graph_plan(
 
     struct ggml_cplan cplan;
     memset(&cplan, 0, sizeof(struct ggml_cplan));
+
+#if defined(GGML_USE_XSAI_BLAS)
+    /* Notify the plan cache that this graph is the live set. Scratch is
+     * still only the max of per-node work_size values below. */
+    xsai_backend_note_graph(cgraph);
+    xsai_plan_cache_retain((const void * const *) cgraph->nodes,
+                           (size_t) cgraph->n_nodes);
+#endif
 
     int max_tasks = 1;
 

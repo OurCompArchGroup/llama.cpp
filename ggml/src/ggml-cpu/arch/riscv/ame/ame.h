@@ -43,12 +43,7 @@ static inline int ame_log_enabled(void) {
 #define AME_TILE_M 64
 #define AME_TILE_K 64
 #define AME_TILE_N 64
-#define AME_TILE_M_MAX 128
-#define AME_TILE_N_MAX 128
 #define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
-
-#define AME_Q8_BLOCK_K 32
-#define AME_Q8_PACK_K 64
 
 typedef struct {
     uint64_t tlenb;
@@ -63,12 +58,6 @@ typedef struct {
     int valid;
     int fixed_tile_supported;
 } ggml_ame_hw_config;
-
-typedef enum {
-    GGML_AME_I8_KERNEL_NONE = 0,
-    GGML_AME_I8_KERNEL_64_64_64,
-    GGML_AME_I8_KERNEL_128_64_128,
-} ggml_ame_i8_kernel_kind;
 
 #ifdef __cplusplus
 extern "C" {
@@ -145,32 +134,11 @@ typedef struct {
     unsigned long sync0_release_target;
 } ggml_ame_sync_state;
 
-typedef void (*ggml_ame_gemm_tile_i8_i32_bT_fn)(
-    const int8_t * A,
-    const int8_t * B,
-    int32_t * C);
-
-typedef unsigned long (*ggml_ame_gemm_tile_i8_i32_bT_submit_fn)(
-    const int8_t * A,
-    const int8_t * B,
-    int32_t * C);
-
 extern ggml_ame_sync_state ggml_ame_sync_state_global;
 
 #ifdef __cplusplus
 }
 #endif
-
-typedef struct {
-    ggml_ame_i8_kernel_kind kind;
-    int tile_m;
-    int tile_k;
-    int tile_n;
-    const char * name;
-    ggml_ame_gemm_tile_i8_i32_bT_fn gemm;
-    ggml_ame_gemm_tile_i8_i32_bT_submit_fn submit;
-    ggml_ame_gemm_tile_i8_i32_bT_submit_fn submit_alt;
-} ggml_ame_i8_kernel;
 
 static inline const char * ggml_ame_i8_capacity_name(const ggml_ame_hw_config * cfg) {
     if (cfg->int8_m_max >= 128 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 128) {
@@ -180,39 +148,6 @@ static inline const char * ggml_ame_i8_capacity_name(const ggml_ame_hw_config * 
         return "m64n64k64.i8i32";
     }
     return "none";
-}
-
-static inline const ggml_ame_i8_kernel * ggml_ame_i8_kernel_for_kind(ggml_ame_i8_kernel_kind kind) {
-    static const ggml_ame_i8_kernel kernel_64_64_64 = {
-        GGML_AME_I8_KERNEL_64_64_64,
-        64,
-        64,
-        64,
-        "m64n64k64.i8i32",
-        ggml_ame_gemm_tile_i8_i32_bT,
-        ggml_ame_gemm_tile_i8_i32_bT_submit,
-        ggml_ame_gemm_tile_i8_i32_bT_submit_alt,
-    };
-    static const ggml_ame_i8_kernel kernel_128_64_128 = {
-        GGML_AME_I8_KERNEL_128_64_128,
-        128,
-        64,
-        128,
-        "m128n128k64.i8i32",
-        ggml_ame_gemm_tile_i8_i32_bT_128_64_128,
-        ggml_ame_gemm_tile_i8_i32_bT_128_64_128_submit,
-        ggml_ame_gemm_tile_i8_i32_bT_128_64_128_submit_alt,
-    };
-
-    switch (kind) {
-        case GGML_AME_I8_KERNEL_64_64_64:
-            return &kernel_64_64_64;
-        case GGML_AME_I8_KERNEL_128_64_128:
-            return &kernel_128_64_128;
-        case GGML_AME_I8_KERNEL_NONE:
-        default:
-            return NULL;
-    }
 }
 
 static inline const ggml_ame_hw_config * ggml_ame_hw_config_get(void) {
@@ -284,53 +219,6 @@ static inline const ggml_ame_hw_config * ggml_ame_hw_config_get(void) {
     return &cfg;
 }
 
-static inline const ggml_ame_i8_kernel * ggml_ame_select_i8_kernel(int64_t M, int64_t N, int64_t K) {
-    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
-    if (!cfg->valid || K % AME_Q8_BLOCK_K != 0) {
-        return NULL;
-    }
-    const char * force_64_value = getenv("GGML_AME_FORCE_I8_KERNEL_64");
-    const int force_64 = force_64_value != NULL &&
-        force_64_value[0] != '\0' &&
-        strcmp(force_64_value, "0") != 0 &&
-        strcmp(force_64_value, "false") != 0 &&
-        strcmp(force_64_value, "off") != 0 &&
-        strcmp(force_64_value, "no") != 0;
-
-    if (!force_64 && M >= 128 && N >= 128 &&
-            cfg->int8_m_max >= 128 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 128) {
-        return ggml_ame_i8_kernel_for_kind(GGML_AME_I8_KERNEL_128_64_128);
-    }
-    if (M >= 64 && N >= 64 &&
-            cfg->int8_m_max >= 64 && cfg->int8_k_max >= 64 && cfg->int32_n_max >= 64) {
-        return ggml_ame_i8_kernel_for_kind(GGML_AME_I8_KERNEL_64_64_64);
-    }
-    return NULL;
-}
-
-static inline size_t ggml_ame_i8_kernel_workspace_size(const ggml_ame_i8_kernel * kernel, int64_t N, int64_t K, int use_packed_b_panel) {
-    (void) N;
-    if (kernel == NULL) {
-        return 0;
-    }
-
-    const int tile_m = kernel->tile_m;
-    const int tile_n = kernel->tile_n;
-    const int tile_k = kernel->tile_k;
-    const int64_t n_k_tiles = (K + tile_k - 1) / tile_k;
-
-    size_t size = 64;
-    size = (size + 63) / 64 * 64;
-    size += (size_t) tile_m * tile_k * sizeof(int8_t);
-    size = (size + 63) / 64 * 64;
-    size += use_packed_b_panel ?
-        (size_t) n_k_tiles * tile_n * tile_k * sizeof(int8_t) :
-        (size_t) tile_n * tile_k * sizeof(int8_t);
-    size = (size + 63) / 64 * 64;
-    size += (size_t) tile_m * tile_n * sizeof(int32_t);
-    return size;
-}
-
 static inline void ggml_ame_sync_begin_op(void) {
     ggml_ame_sync_state_global.sync0_release_target = 0;
 #if defined(__riscv)
@@ -364,21 +252,6 @@ static inline unsigned long ggml_ame_sync_release_acquire_store(void) {
     return acquire_target;
 }
 
-// Helper function to check if AME can be used for given dimensions.
-//
-// The current AME backend only accelerates Q8_0 GEMM. It only reaches the
-// AME core on full MxN tiles; smaller shapes fall back to RVV/scalar helpers
-// and usually lose to the generic CPU path once the extra quantize/pack cost is
-// accounted for.
-static inline int ggml_ame_can_use(int M, int N, int K) {
-    if (M <= 0 || N <= 0 || K <= 0) return 0;
-    return ggml_ame_select_i8_kernel(M, N, K) != NULL;
-}
-
-static inline int ggml_ame_can_use_q8(int M, int N, int K) {
-    return ggml_ame_can_use(M, N, K);
-}
-
 static inline int ggml_ame_can_use_bf16(int M, int N, int K) {
     if (M < AME_TILE_M || N < AME_TILE_N || K < AME_TILE_K_BF16) {
         return 0;
@@ -397,11 +270,6 @@ typedef struct {
     uint16_t d;         // scale factor FP16 (same format as block_q4_0)
     int8_t qs[32];      // pre-unpacked 4-bit values to int8 [-8, 7]
 } block_q4_0_ame;
-
-typedef struct {
-    uint16_t d;
-    int8_t qs[AME_Q8_PACK_K];
-} block_q8_ame64;
 
 #define AME_MCFG_INT8  0x02
 #define AME_MCFG_UINT8 0x03
@@ -682,17 +550,6 @@ void ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
 void ggml_ame_bf16_profile_reset(void);
 void ggml_ame_bf16_profile_snapshot(ggml_ame_bf16_profile * profile);
 
-// Core AME GEMM function for INT8 matrix multiplication
-// C(M×N) += A(M×K) × B(K×N), where B is transposed in memory
-void ggml_ame_gemm_q8_0(
-    const int8_t * A,
-    const int8_t * B,
-    int32_t * C,
-    int M,
-    int K,
-    int N
-);
-
 void ggml_ame_profile_reset(void);
 void ggml_ame_profile_dump_now(void);
 
@@ -706,35 +563,6 @@ void ggml_ame_repack_q4_0(
     int64_t nblocks          // Number of Q4_0 blocks
 );
 
-// Experimental Q8_0 -> AME-native packed K64 repack.
-void ggml_ame_repack_q8_0_to_ame64(
-    void * dst,
-    const void * src,
-    int64_t nrows,
-    int64_t k
-);
-
-void ggml_ame_repack_q8_0_to_ame64_whole_k(
-    void * dst,
-    const void * src,
-    int64_t nrows,
-    int64_t k
-);
-
-// GGML integration wrapper for Q8_0 quantized matrix multiplication
-void ggml_ame_mul_mat_q8_0(
-    const void * src0,
-    const void * src1,
-    void * dst,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne10,
-    int64_t ne11,
-    size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
-    void * work_data,
-    size_t work_size
-);
-
 void ggml_ame_mul_mat_bf16(
     const void * src0,
     const void * src1,
@@ -745,25 +573,6 @@ void ggml_ame_mul_mat_bf16(
     int64_t ne11,
     size_t src1_stride,
     enum ggml_type src1_type,
-    void * work_data,
-    size_t work_size
-);
-
-void ggml_ame_mul_mat_q8_0_ame64(
-    const void * src0,
-    const void * src1_key,
-    const void * src1,
-    void * dst,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne10,
-    int64_t ne11,
-    size_t src1_stride,
-    const int8_t * src0_tile_a,
-    const float * src0_tile_scales,
-    int graph_id,
-    const void * graph_key,
-    uint64_t src1_generation,
     void * work_data,
     size_t work_size
 );

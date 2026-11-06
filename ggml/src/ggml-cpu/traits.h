@@ -20,6 +20,10 @@ namespace ggml::cpu {
 class tensor_traits {
   public:
     virtual ~tensor_traits();
+    /* Scratch only. An accelerator may cache its own plan across calls.
+     * That plan is not stored in ggml wdata. work_size runs the full
+     * prepare only on a plan-cache miss; compute_forward looks the plan
+     * up and binds this call's buffers. */
     virtual bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size)        = 0;
     virtual bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) = 0;
 };
