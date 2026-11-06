@@ -4,7 +4,7 @@
 #include "ame-backend.h"
 #include "ame.h"
 #if defined(GGML_USE_XSAI_BLAS)
-#include "../xsai/ame-xsai-plan.h"
+#include "../xsai/xsai-plan.h"
 #include "../xsai/xsai-backend.h"
 #endif
 
@@ -337,7 +337,7 @@ static void ggml_backend_ame_mul_mat(ggml_compute_params * params, ggml_tensor *
     GGML_ASSERT(ne00 == ne10);
 
     if (src0->type == GGML_TYPE_Q8_0) {
-        /* Q8 GEMM is executed by ame_xsai_plan_execute. This entry only keeps
+        /* Q8 GEMM is executed by xsai_plan_execute. This entry only keeps
          * the non-Q8 kernels. */
         GGML_UNUSED(ne00);
         GGML_UNUSED(ne01);
@@ -481,7 +481,7 @@ static void ggml_backend_ame_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ame_buffer_context * ctx = ame_buffer_ctx(buffer);
 #if defined(GGML_USE_XSAI_BLAS)
     for (ggml_tensor * tensor : ctx->tensors) {
-        ame_xsai_weight_release(tensor);
+        xsai_weight_release(tensor);
     }
 #endif
     if (ctx->base != nullptr) {

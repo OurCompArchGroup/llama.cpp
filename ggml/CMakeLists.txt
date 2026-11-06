@@ -188,7 +188,8 @@ option(GGML_RV_ZIHINTPAUSE   "ggml: enable riscv zihintpause "  ON)
 option(GGML_RV_AME           "ggml: enable riscv ame"        OFF)
 set(XSAI_BLAS_HOME "" CACHE PATH "Path to xsai-blas for the RISC-V AME backend")
 set(XSAI_BLAS_LIBRARY "" CACHE FILEPATH "Path to the xsai-blas static archive")
-option(GGML_XSAI_BACKEND     "ggml: xsai backend on a non-RISC-V host (reference/generic). Off by default; RISC-V uses GGML_RV_AME plus XSAI_BLAS_HOME." OFF)
+option(GGML_XSAI_BACKEND     "ggml: xsai backend on a non-RISC-V host (reference/generic). Off by default; RISC-V uses XSAI_BLAS_HOME." OFF)
+option(GGML_XSAI_BACKEND_TESTS "ggml: build the xsai adapter unit tests (host only, requires GGML_XSAI_BACKEND and XSAI_BLAS_LIBRARY)" OFF)
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"     OFF)
 option(GGML_VXE              "ggml: enable vxe"              ${GGML_NATIVE})
 
@@ -303,6 +304,14 @@ include(GNUInstallDirs)
 #
 # build the library
 #
+
+# The xsai adapter tests are registered in src (their sources live under
+# src/ggml-cpu/arch/riscv/xsai). enable_testing must run in this directory
+# before add_subdirectory(src) so that the CTest file is generated for the
+# src subtree even though the top-level include(CTest) runs later.
+if (GGML_XSAI_BACKEND_TESTS)
+    enable_testing()
+endif()
 
 add_subdirectory(src)
 

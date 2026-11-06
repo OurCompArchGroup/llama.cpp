@@ -1,18 +1,14 @@
 #include "xsai-backend.h"
 
-#include "ame-xsai-fusion.h"
-#include "ame-xsai-observe.h"
-#include "ame-xsai-plan.h"
+#include "xsai-fusion.h"
+#include "xsai-observe.h"
+#include "xsai-plan.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "traits.h"
-
-#if defined(GGML_USE_RV_AME)
-#include "../ame/ame-backend.h"
-#endif
 
 #include <xsai_blas.h>
 
@@ -65,7 +61,7 @@ struct RouteNote {
 /* One row per ggml op the default llama graph can emit, plus the default. */
 const RouteNote k_route_notes[] = {
     { GGML_OP_MUL_MAT, "MUL_MAT",
-      "xsai GEMM_I8_F32 for compact Q8_0 x F32 rank-1; other matmul CPU before write" },
+      "Q8_0 MUL_MAT -> xsai-blas GEMM; other types stay with AME/CPU" },
     { GGML_OP_MUL_MAT_ID, "MUL_MAT_ID", "CPU before write" },
     { GGML_OP_FLASH_ATTN_EXT, "FLASH_ATTN_EXT",
       "CPU before write (xsai flash is I8; the default graph is decomposed attention)" },
@@ -93,20 +89,52 @@ const RouteNote k_route_notes[] = {
 
 std::atomic<uint64_t> g_xsai_count[GGML_OP_COUNT];
 std::atomic<uint64_t> g_cpu_count[GGML_OP_COUNT];
+std::atomic<uint64_t> g_q8_probe_claims{0};
+std::atomic<uint64_t> g_q8_probe_declines{0};
+std::atomic<uint64_t> g_q8_foreign_declines{0};
+
+bool env_disabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr &&
+        (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+         std::strcmp(value, "off") == 0 || std::strcmp(value, "no") == 0);
+}
 
 bool backend_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        const char * value = std::getenv("XSAI_GGML_BACKEND");
-        const bool off = value != nullptr &&
-            (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
-             std::strcmp(value, "off") == 0 || std::strcmp(value, "no") == 0);
-        cached = off ? 0 : 1;
+        cached = env_disabled("XSAI_GGML_BACKEND") ? 0 : 1;
         if (cached) {
-            ame_xsai_observe_set_enabled(1);
+            xsai_observe_set_enabled(1);
         }
     }
     return cached != 0;
+}
+
+/* Q8 weight placement and execution switch. Off keeps Q8_0 MUL_MAT on AME/CPU. */
+bool q8_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = env_disabled("XSAI_GGML_Q8") ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/*
+ * Status policy from the operator ABI: UNSUPPORTED and PREPARATION_REQUIRED
+ * let the framework keep the CPU node. INVALID_ARGUMENT means the adapter
+ * built a malformed call, and any execute-stage failure is a runtime error.
+ * Neither is allowed to fall back and hide the defect.
+ */
+bool fallback_status(xsai_status_t status) {
+    return status == XSAI_STATUS_UNSUPPORTED ||
+        status == XSAI_STATUS_PREPARATION_REQUIRED;
+}
+
+void adapter_error(const char * stage, xsai_status_t status) {
+    std::fprintf(stderr, "xsai-backend: adapter ABI error at %s: status=%d\n",
+                 stage, (int) status);
+    GGML_ABORT("xsai adapter ABI error");
 }
 
 void count_route(enum ggml_op op, bool xsai) {
@@ -188,71 +216,87 @@ void bind_f32_1d(DLTensor * slot, void * data, int64_t * shape, int64_t n) {
     slot->shape = shape;
 }
 
-struct GeneralKey {
-    int32_t xsai_op;
-    int32_t ndim;
-    int64_t shape[4];
-    float attr0;
-    float attr1;
-    uint32_t flags;
-};
-
 bool q8_compact(const ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_Q8_0 || tensor->ne[0] <= 0 ||
-        tensor->ne[1] < 0) {
+        tensor->ne[1] <= 0) {
         return false;
     }
     const int64_t blocks = (tensor->ne[0] + 31) / 32;
-    return tensor->nb[1] == (size_t) blocks * 34u;
+    return tensor->nb[0] == 34 && tensor->nb[1] == (size_t) blocks * 34u;
 }
 
+/*
+ * The adapter maps a ggml MUL_MAT onto a compact logical contract: A [M, K]
+ * from src1 [K, M], B [K, N] from the row-major Q8_0 weight [N, K], and C
+ * [M, N] over dst [N, M]. Anything else stays on the CPU.
+ */
 bool q8_plan_op(const ggml_tensor * op) {
-    return op != nullptr && op->op == GGML_OP_MUL_MAT && op->type == GGML_TYPE_F32 &&
-        op->src[0] != nullptr && op->src[1] != nullptr &&
-        op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1]->type == GGML_TYPE_F32;
-}
-
-bool ame_owns_q8(const ggml_tensor * op) {
-#if defined(GGML_USE_RV_AME)
-    return q8_plan_op(op) && op->src[0]->buffer != nullptr &&
-        op->src[0]->buffer->buft == ggml_backend_cpu_riscv_ame_buffer_type();
-#else
-    GGML_UNUSED(op);
-    return false;
-#endif
-}
-
-ame_xsai_q8_key q8_key(const ggml_tensor * op, uint64_t generation) {
-    ame_xsai_q8_key key = {};
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->type != GGML_TYPE_F32 ||
+        op->src[0] == nullptr || op->src[1] == nullptr) {
+        return false;
+    }
     const ggml_tensor * weight = op->src[0];
     const ggml_tensor * activation = op->src[1];
-    key.k = weight->ne[0];
-    key.n = weight->ne[1];
-    key.m = activation->ne[1];
-    key.act_nb0 = activation->nb[0];
-    key.act_nb1 = activation->nb[1];
-    key.act_nb2 = activation->nb[2];
-    key.act_nb3 = activation->nb[3];
-    key.weight_nb0 = weight->nb[0];
-    key.weight_nb1 = weight->nb[1];
-    key.weight_identity = weight;
+    if (weight->type != GGML_TYPE_Q8_0 || activation->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!q8_compact(weight) || weight->ne[2] != 1 || weight->ne[3] != 1) {
+        return false;
+    }
+    if (!dense_f32(activation) || !dense_f32(op)) {
+        return false;
+    }
+    if (activation->ne[2] != 1 || activation->ne[3] != 1 ||
+        op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+    return activation->ne[0] == weight->ne[0] &&
+        activation->ne[1] >= 1 &&
+        op->ne[0] == weight->ne[1] &&
+        op->ne[1] == activation->ne[1];
+}
+
+/* Q8 GEMM reads the weight on the host and keys its plan cache on the host
+ * generation counter, so only host buffers qualify (the plain CPU buffer and
+ * this adapter's own host buffer). A weight in any other buffer type belongs
+ * to a backend that manages its own memory and invalidation: decline, so a
+ * failed attempt there is not retried here and the host generation stays
+ * meaningful. Raw host memory (buffer == nullptr, as in the unit tests)
+ * counts as host. */
+bool q8_foreign_weight(const ggml_tensor * op) {
+    if (!q8_plan_op(op)) {
+        return false;
+    }
+    const ggml_backend_buffer_t buffer = op->src[0]->buffer;
+    if (buffer == nullptr) {
+        return false;
+    }
+    const struct ggml_backend_buffer_type_i * iface = &buffer->buft->iface;
+    return iface->is_host == nullptr || !iface->is_host(buffer->buft);
+}
+
+/* Builds and seals the plan identity. False means this node stays on the CPU. */
+bool q8_key_build(const ggml_tensor * op, uint64_t generation, xsai_q8_key * key) {
+    if (!q8_plan_op(op)) {
+        return false;
+    }
+    const ggml_tensor * weight = op->src[0];
+    const ggml_tensor * activation = op->src[1];
     xsai_backend_q8_refresh(weight, generation);
-    key.prepared_weight = ame_xsai_weight_plan(weight);
-    key.weight_nb2 = weight->nb[2];
-    key.weight_nb3 = weight->nb[3];
-    key.dst_nb0 = op->nb[0];
-    key.dst_nb1 = op->nb[1];
-    key.dst_nb2 = op->nb[2];
-    key.dst_nb3 = op->nb[3];
-    key.src0_ne2 = weight->ne[2];
-    key.src0_ne3 = weight->ne[3];
-    key.src1_ne2 = activation->ne[2];
-    key.src1_ne3 = activation->ne[3];
-    key.dst_ne2 = op->ne[2];
-    key.dst_ne3 = op->ne[3];
-    key.weight_generation = generation;
-    key.explicit_options = 0;
-    return key;
+    const xsai_weight_plan_t * prepared = xsai_weight_plan(weight);
+    if (prepared == nullptr) {
+        return false;
+    }
+    *key = xsai_q8_key{};
+    key->op = XSAI_OP_GEMM;
+    key->m = activation->ne[1];
+    key->k = weight->ne[0];
+    key->n = weight->ne[1];
+    key->blocks = (key->k + 31) / 32;
+    key->weight_generation = generation;
+    key->weight_identity = weight;
+    key->prepared_weight = prepared;
+    return xsai_q8_key_seal(key);
 }
 
 xsai_op_type_t element_op(enum ggml_op op) {
@@ -343,7 +387,7 @@ bool softmax_eligible(const ggml_tensor * op, float * scale_out, int64_t * rows_
 }
 
 struct BuiltCall {
-    GeneralKey key;
+    uint64_t key = 0; /* template call fingerprint */
     bool ok = false;
     xsai_op_call_t call = {};
     DLTensor inputs[3] = {};
@@ -358,23 +402,20 @@ bool build_element_call(const ggml_tensor * op, bool with_data, BuiltCall * buil
     if (!element_eligible(op, &n)) {
         return false;
     }
-    std::memset(&built->key, 0, sizeof(built->key));
-    built->key.xsai_op = element_op(op->op);
-    built->key.ndim = 1;
-    built->key.shape[0] = n;
     bind_f32_1d(&built->inputs[0], with_data ? op->src[0]->data : nullptr, &built->shapes[0], n);
     bind_f32_1d(&built->inputs[1], with_data ? op->src[1]->data : nullptr, &built->shapes[1], n);
     bind_f32_1d(&built->output, with_data ? op->data : nullptr, &built->shapes[2], n);
     built->call = {};
     built->call.struct_size = sizeof(built->call);
     built->call.abi_version = XSAI_BLAS_ABI_VERSION;
-    built->call.op = built->key.xsai_op;
+    built->call.op = element_op(op->op);
     built->call.input_count = 2;
     built->call.inputs = built->inputs;
     built->call.output_count = 1;
     built->call.outputs = &built->output;
-    built->ok = true;
-    return true;
+    built->key = xsai_op_call_fingerprint(&built->call);
+    built->ok = built->key != 0;
+    return built->ok;
 }
 
 bool build_unary_call(const ggml_tensor * op, bool with_data, BuiltCall * built) {
@@ -383,11 +424,6 @@ bool build_unary_call(const ggml_tensor * op, bool with_data, BuiltCall * built)
     if (!unary_eligible(op, &xsai_op, &n)) {
         return false;
     }
-    std::memset(&built->key, 0, sizeof(built->key));
-    built->key.xsai_op = xsai_op;
-    built->key.ndim = 1;
-    built->key.shape[0] = n;
-    built->key.flags = (uint32_t) ((const int32_t *) op->op_params)[0];
     bind_f32_1d(&built->inputs[0], with_data ? op->src[0]->data : nullptr, &built->shapes[0], n);
     bind_f32_1d(&built->output, with_data ? op->data : nullptr, &built->shapes[1], n);
     built->call = {};
@@ -398,8 +434,9 @@ bool build_unary_call(const ggml_tensor * op, bool with_data, BuiltCall * built)
     built->call.inputs = built->inputs;
     built->call.output_count = 1;
     built->call.outputs = &built->output;
-    built->ok = true;
-    return true;
+    built->key = xsai_op_call_fingerprint(&built->call);
+    built->ok = built->key != 0;
+    return built->ok;
 }
 
 bool build_softmax_call(const ggml_tensor * op, bool with_data, BuiltCall * built) {
@@ -409,12 +446,6 @@ bool build_softmax_call(const ggml_tensor * op, bool with_data, BuiltCall * buil
     if (!softmax_eligible(op, &scale, &rows, &cols)) {
         return false;
     }
-    std::memset(&built->key, 0, sizeof(built->key));
-    built->key.xsai_op = XSAI_OP_SOFTMAX;
-    built->key.ndim = 2;
-    built->key.shape[0] = rows;
-    built->key.shape[1] = cols;
-    built->key.attr0 = scale;
     built->shapes[0] = rows;
     built->shapes[1] = cols;
     built->inputs[0] = {};
@@ -430,6 +461,7 @@ bool build_softmax_call(const ggml_tensor * op, bool with_data, BuiltCall * buil
     built->shapes[3] = cols;
     built->softmax = {};
     built->softmax.struct_size = sizeof(built->softmax);
+    built->softmax.abi_version = XSAI_BLAS_ABI_VERSION;
     built->softmax.axis = 1;
     built->softmax.scale = scale;
     built->call = {};
@@ -440,17 +472,18 @@ bool build_softmax_call(const ggml_tensor * op, bool with_data, BuiltCall * buil
     built->call.inputs = built->inputs;
     built->call.output_count = 1;
     built->call.outputs = &built->output;
-    built->call.op_attrs = &built->softmax;
-    built->ok = true;
-    return true;
+    built->call.op_params = &built->softmax;
+    built->key = xsai_op_call_fingerprint(&built->call);
+    built->ok = built->key != 0;
+    return built->ok;
 }
 
 bool build_fused_call(const ggml_tensor * op, bool with_data, BuiltCall * built) {
     if (op->op != GGML_OP_RMS_NORM) {
         return false;
     }
-    const xsai_add_rms_fusion_decision_t decision = ame_xsai_match_add_rms_norm(
-        g_graph, op, 1, built->inputs, &built->output, &built->fused, &built->call);
+    const xsai_add_rms_fusion_decision_t decision = xsai_match_add_rms_norm(
+        g_graph, op, built->inputs, &built->output, &built->fused, &built->call);
     if (decision != XSAI_FUSION_ACCEPT) {
         return false;
     }
@@ -460,15 +493,9 @@ bool build_fused_call(const ggml_tensor * op, bool with_data, BuiltCall * built)
         }
         built->output.data = nullptr;
     }
-    std::memset(&built->key, 0, sizeof(built->key));
-    built->key.xsai_op = XSAI_OP_FUSED_ADD_RMS_NORM;
-    built->key.ndim = built->output.ndim;
-    for (int i = 0; i < 4 && i < built->output.ndim; ++i) {
-        built->key.shape[i] = built->output.shape[i];
-    }
-    built->key.attr0 = built->fused.eps;
-    built->ok = true;
-    return true;
+    built->key = xsai_op_call_fingerprint(&built->call);
+    built->ok = built->key != 0;
+    return built->ok;
 }
 
 bool build_general(const ggml_tensor * op, bool with_data, BuiltCall * built) {
@@ -489,11 +516,15 @@ bool build_general(const ggml_tensor * op, bool with_data, BuiltCall * built) {
     }
 }
 
-xsai_op_plan_t * general_plan(const ggml_tensor * op, const BuiltCall * built, bool create) {
-    if (create) {
-        return ame_xsai_general_cache_get_or_create(op, &built->key, sizeof(built->key), &built->call);
+xsai_op_plan_t * general_plan(const ggml_tensor * op, const BuiltCall * built,
+                              bool create, xsai_status_t * status_out) {
+    if (status_out != nullptr) {
+        *status_out = XSAI_STATUS_SUCCESS;
     }
-    return ame_xsai_general_cache_lookup(op, &built->key, sizeof(built->key));
+    if (create) {
+        return xsai_general_cache_get_or_create(op, built->key, &built->call, status_out);
+    }
+    return xsai_general_cache_lookup(op, built->key);
 }
 
 }  // namespace
@@ -523,23 +554,21 @@ extern "C" void xsai_backend_q8_refresh(const struct ggml_tensor * tensor, uint6
     if (!q8_compact(tensor) || tensor->data == nullptr) {
         return;
     }
-    if (ame_xsai_weight_plan(tensor) != nullptr &&
-        ame_xsai_weight_generation(tensor) == generation) {
+    if (xsai_weight_plan(tensor) != nullptr &&
+        xsai_weight_generation(tensor) == generation) {
         return;
     }
-    ame_xsai_weight_refresh_q8(tensor, tensor->data, tensor->ne[1], tensor->ne[0], generation);
+    xsai_weight_refresh_q8(tensor, tensor->data, tensor->ne[1], tensor->ne[0], generation);
 }
 
 extern "C" void xsai_backend_q8_release(const struct ggml_tensor * tensor) {
-    ame_xsai_weight_release(tensor);
+    xsai_weight_release(tensor);
 }
 
-extern "C" void ggml_ame_host_buffer_on_write(
-    ggml_backend_buffer_t buffer,
-    struct ggml_tensor * tensor,
-    size_t offset,
-    size_t size) {
-    GGML_UNUSED(offset);
+/* Shared by the default CPU buffer hook and the XSAI buffer's own writes: a
+   write to a host-resident weight bumps its generation and refreshes any
+   prepared weight plan bound to it. */
+static void note_host_write(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t size) {
     if (buffer == nullptr || size == 0) {
         return;
     }
@@ -552,7 +581,28 @@ extern "C" void ggml_ame_host_buffer_on_write(
     }
 }
 
-extern "C" void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) {
+static void forget_buffer(ggml_backend_buffer_t buffer) {
+    HostGenerationState & state = host_state();
+    state.buffers.erase(buffer);
+    for (auto it = state.tensors.begin(); it != state.tensors.end(); ) {
+        if (it->second.buffer == buffer) {
+            it = state.tensors.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+extern "C" void ggml_xsai_host_buffer_on_write(
+    ggml_backend_buffer_t buffer,
+    struct ggml_tensor * tensor,
+    size_t offset,
+    size_t size) {
+    GGML_UNUSED(offset);
+    note_host_write(buffer, tensor, size);
+}
+
+extern "C" void ggml_xsai_host_buffer_on_free(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr) {
         return;
     }
@@ -572,15 +622,22 @@ bool xsai_backend_q8_work_size(const struct ggml_tensor * op, uint64_t weight_ge
     if (!backend_enabled() || !q8_plan_op(op)) {
         return false;
     }
-    const ame_xsai_q8_key key = q8_key(op, weight_generation);
-    xsai_op_plan_t * plan = ame_xsai_q8_cache_get_or_create(op, &key);
+    xsai_q8_key key;
+    if (!q8_key_build(op, weight_generation, &key)) {
+        return false;
+    }
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    xsai_op_plan_t * plan = xsai_q8_cache_get_or_create(op, &key, &status);
     if (plan == nullptr) {
+        if (!fallback_status(status)) {
+            adapter_error("q8 plan_create", status);
+        }
         return false;
     }
     xsai_op_requirements_t requirements = {};
     requirements.struct_size = sizeof(requirements);
     requirements.abi_version = XSAI_BLAS_ABI_VERSION;
-    if (ame_xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
+    if (xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
         return false;
     }
     /* ggml's compute buffer is not guaranteed to be 64-byte aligned. */
@@ -591,12 +648,12 @@ bool xsai_backend_q8_work_size(const struct ggml_tensor * op, uint64_t weight_ge
     return true;
 }
 
-bool align_workspace(const xsai_op_plan_t * plan, void * wdata, size_t wsize,
-                     void ** aligned_out, size_t * size_out) {
+static bool align_workspace(const xsai_op_plan_t * plan, void * wdata, size_t wsize,
+                            void ** aligned_out, size_t * size_out) {
     xsai_op_requirements_t requirements = {};
     requirements.struct_size = sizeof(requirements);
     requirements.abi_version = XSAI_BLAS_ABI_VERSION;
-    if (ame_xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
+    if (xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
         return false;
     }
     if (requirements.workspace_size == 0) {
@@ -621,8 +678,14 @@ bool xsai_backend_q8_compute(struct ggml_compute_params * params, struct ggml_te
     if (!backend_enabled() || !q8_plan_op(op)) {
         return false;
     }
-    const ame_xsai_q8_key key = q8_key(op, weight_generation);
-    xsai_op_plan_t * plan = ame_xsai_q8_cache_lookup(op, &key);
+    xsai_q8_key key;
+    if (!q8_key_build(op, weight_generation, &key)) {
+        if (params->ith == 0) {
+            count_route(op->op, false);
+        }
+        return false;
+    }
+    xsai_op_plan_t * plan = xsai_q8_cache_lookup(op, &key);
     if (plan == nullptr) {
         if (params->ith == 0) {
             count_route(op->op, false);
@@ -638,18 +701,15 @@ bool xsai_backend_q8_compute(struct ggml_compute_params * params, struct ggml_te
         count_route(op->op, false);
         return false;
     }
-    const ame_xsai_q8_bind bind = {
+    const xsai_q8_bind bind = {
         op->src[1]->data,
-        op->src[0]->data,
         op->data,
         workspace,
         workspace_size,
     };
-    const xsai_status_t status = ame_xsai_q8_cache_execute(plan, &key, &bind);
-    /* GEMM reports these before it stores output. */
+    const xsai_status_t status = xsai_q8_cache_execute(plan, &key, &bind);
     if (status != XSAI_STATUS_SUCCESS) {
-        count_route(op->op, false);
-        return false;
+        adapter_error("q8 execute", status);
     }
     count_route(op->op, true);
     return true;
@@ -660,7 +720,7 @@ bool xsai_backend_work_size(int n_threads, const struct ggml_tensor * op, size_t
         return false;
     }
     if (op->op == GGML_OP_MUL_MAT) {
-        if (ame_owns_q8(op)) {
+        if (q8_foreign_weight(op)) {
             return false;
         }
         const uint64_t generation = op->src[0] != nullptr ? xsai_backend_host_generation(op->src[0]) : 0;
@@ -670,14 +730,18 @@ bool xsai_backend_work_size(int n_threads, const struct ggml_tensor * op, size_t
     if (!build_general(op, false, &built)) {
         return false;
     }
-    xsai_op_plan_t * plan = general_plan(op, &built, true);
+    xsai_status_t status = XSAI_STATUS_SUCCESS;
+    xsai_op_plan_t * plan = general_plan(op, &built, true, &status);
     if (plan == nullptr) {
+        if (!fallback_status(status)) {
+            adapter_error("plan_create", status);
+        }
         return false;
     }
     xsai_op_requirements_t requirements = {};
     requirements.struct_size = sizeof(requirements);
     requirements.abi_version = XSAI_BLAS_ABI_VERSION;
-    if (ame_xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
+    if (xsai_plan_read_requirements(plan, &requirements) != XSAI_STATUS_SUCCESS) {
         return false;
     }
     size = requirements.workspace_size;
@@ -698,7 +762,7 @@ bool xsai_backend_compute(struct ggml_compute_params * params, struct ggml_tenso
         return false;
     }
     if (op->op == GGML_OP_MUL_MAT) {
-        if (ame_owns_q8(op)) {
+        if (q8_foreign_weight(op)) {
             return false;
         }
         if (!q8_plan_op(op)) {
@@ -717,7 +781,7 @@ bool xsai_backend_compute(struct ggml_compute_params * params, struct ggml_tenso
         }
         return false;
     }
-    xsai_op_plan_t * plan = general_plan(op, &built, false);
+    xsai_op_plan_t * plan = general_plan(op, &built, false, nullptr);
     if (plan == nullptr) {
         if (params->ith == 0) {
             count_route(op->op, false);
@@ -735,10 +799,9 @@ bool xsai_backend_compute(struct ggml_compute_params * params, struct ggml_tenso
     }
     built.call.workspace = workspace;
     built.call.workspace_size = workspace_size;
-    const xsai_status_t status = ame_xsai_general_cache_execute(plan, &built.call);
+    const xsai_status_t status = xsai_general_cache_execute(plan, &built.call);
     if (status != XSAI_STATUS_SUCCESS) {
-        count_route(op->op, false);
-        return false;
+        adapter_error("execute", status);
     }
     count_route(op->op, true);
     return true;
@@ -770,16 +833,24 @@ extern "C" void xsai_backend_print_report(void) {
         std::fprintf(stderr, "  op=%d %-16s xsai=%" PRIu64 " cpu_fallback=%" PRIu64 "\n",
                      op, name, xsai, cpu);
     }
-    ame_xsai_observe_export_t observed = {};
-    ame_xsai_observe_export(&observed);
+    std::fprintf(stderr,
+                 "xsai-backend q8 probe_claims=%" PRIu64 " probe_declines=%" PRIu64
+                 " foreign_declines=%" PRIu64 "\n",
+                 (uint64_t) g_q8_probe_claims.load(std::memory_order_relaxed),
+                 (uint64_t) g_q8_probe_declines.load(std::memory_order_relaxed),
+                 (uint64_t) g_q8_foreign_declines.load(std::memory_order_relaxed));
+    xsai_observe_export_t observed = {};
+    xsai_observe_export(&observed);
     std::fprintf(stderr,
                  "xsai-backend plan_create=%" PRIu64 " key_miss=%" PRIu64
-                 " cache_hit=%" PRIu64 " execute=%" PRIu64 " prepared_bytes=%" PRIu64 "\n",
-                 (uint64_t) ame_xsai_plan_create_count(),
-                 (uint64_t) ame_xsai_plan_key_miss_count(),
-                 (uint64_t) ame_xsai_plan_cache_hit_count(),
-                 (uint64_t) ame_xsai_plan_execute_count(),
-                 (uint64_t) ame_xsai_prepared_bytes());
+                 " cache_hit=%" PRIu64 " execute=%" PRIu64
+                 " prepared_bytes=%" PRIu64 " prepared_peak_bytes=%" PRIu64 "\n",
+                 (uint64_t) xsai_plan_create_count(),
+                 (uint64_t) xsai_plan_key_miss_count(),
+                 (uint64_t) xsai_plan_cache_hit_count(),
+                 (uint64_t) xsai_plan_execute_count(),
+                 (uint64_t) xsai_prepared_bytes(),
+                 (uint64_t) xsai_prepared_peak_bytes());
     std::fprintf(stderr,
                  "xsai-backend observe prepare_count=%" PRIu64 " prepare_ns=%" PRIu64
                  " plan_create_count=%" PRIu64 " plan_create_ns=%" PRIu64
@@ -810,6 +881,7 @@ void buffer_free(ggml_backend_buffer_t buffer) {
     for (ggml_tensor * tensor : ctx->tensors) {
         xsai_backend_q8_release(tensor);
     }
+    forget_buffer(buffer);
     if (ctx->base != nullptr) {
         ggml_aligned_free(ctx->base, ctx->base_size);
     }
@@ -828,10 +900,9 @@ enum ggml_status buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_te
 void buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                        const void * data, size_t offset, size_t size) {
     std::memcpy((char *) tensor->data + offset, data, size);
-    if (size != 0) {
-        xsai_backend_q8_refresh(tensor, xsai_backend_host_generation(tensor));
-    }
-    GGML_UNUSED(buffer);
+    /* ggml only calls the weak host-buffer hooks for the default CPU buffer,
+       so this buffer type must note its own writes. */
+    note_host_write(buffer, tensor, size);
 }
 
 void buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
@@ -843,15 +914,13 @@ void buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * 
 void buffer_memset(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                    uint8_t value, size_t offset, size_t size) {
     std::memset((char *) tensor->data + offset, value, size);
-    if (size != 0) {
-        xsai_backend_q8_refresh(tensor, xsai_backend_host_generation(tensor));
-    }
-    GGML_UNUSED(buffer);
+    note_host_write(buffer, tensor, size);
 }
 
 void buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     xsai_buffer_context * ctx = xsai_buffer_ctx(buffer);
     std::memset(ctx->base, value, buffer->size);
+    note_host_write(buffer, nullptr, buffer->size);
     GGML_UNUSED(value);
 }
 
@@ -900,6 +969,36 @@ bool buffer_type_is_host(ggml_backend_buffer_type_t buft) {
 
 }  // namespace
 
+/*
+ * Weight placement probe. weight_buft_supported() creates a zero-size dummy
+ * buffer of the candidate type and attaches it to the weight before asking the
+ * device. Only such a dummy (size 0, no context) counts as a placement query;
+ * real buffers keep the permissive runtime answer so scheduling never blocks
+ * the CPU fallback. Only src0 is inspected: MUL_MAT/GET_ROWS weights live
+ * there, while a bias on src1 must not turn an ADD into a Q8 probe. The dummy
+ * has an empty iface, so q8_foreign_weight() must not be called on it.
+ */
+bool xsai_backend_placement_supports(ggml_backend_buffer_type_t self, const ggml_tensor * op) {
+    if (op == nullptr) {
+        return true;
+    }
+    const ggml_tensor * src0 = op->src[0];
+    if (src0 == nullptr || src0->buffer == nullptr || src0->buffer->buft != self ||
+        src0->buffer->size != 0 || src0->buffer->context != nullptr) {
+        return true;
+    }
+    if (op->op != GGML_OP_MUL_MAT) {
+        return true;
+    }
+    const bool supported = backend_enabled() && q8_enabled() && q8_plan_op(op);
+    if (supported) {
+        g_q8_probe_claims.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_q8_probe_declines.fetch_add(1, std::memory_order_relaxed);
+    }
+    return supported;
+}
+
 namespace ggml::cpu::xsai {
 
 class tensor_traits : public ggml::cpu::tensor_traits {
@@ -919,13 +1018,21 @@ static tensor_traits * traits() {
 
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
 public:
-    bool supports_op(ggml_backend_dev_t, const struct ggml_tensor *) override {
-        /* Storage stays ordinary host bytes. Scheduling must not block CPU fallback. */
-        return true;
+    bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        return xsai_backend_placement_supports(ggml_backend_cpu_xsai_buffer_type(), op);
     }
-    ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor *) override {
+    ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (!backend_enabled()) {
             return nullptr;
+        }
+        if (op->op == GGML_OP_MUL_MAT) {
+            if (!q8_enabled() || !q8_plan_op(op)) {
+                return nullptr;
+            }
+            if (q8_foreign_weight(op)) {
+                g_q8_foreign_declines.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
+            }
         }
         return traits();
     }
@@ -938,6 +1045,11 @@ static void xsai_report_at_exit() {
 }
 
 ggml_backend_buffer_type_t ggml_backend_cpu_xsai_buffer_type(void) {
+    /* Buffer allocation happens at model load, before the first graph plan.
+       Resolve the runtime switches here so observation and weight placement
+       cover load-time decisions. */
+    (void) backend_enabled();
+    (void) q8_enabled();
     static bool report_armed = false;
     if (!report_armed) {
         std::atexit(xsai_report_at_exit);

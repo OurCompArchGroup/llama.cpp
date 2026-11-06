@@ -3367,8 +3367,8 @@ struct ggml_cplan ggml_graph_plan(
     /* Notify the plan cache that this graph is the live set. Scratch is
      * still only the max of per-node work_size values below. */
     xsai_backend_note_graph(cgraph);
-    ame_xsai_plan_cache_retain((const void * const *) cgraph->nodes,
-                               (size_t) cgraph->n_nodes);
+    xsai_plan_cache_retain((const void * const *) cgraph->nodes,
+                           (size_t) cgraph->n_nodes);
 #endif
 
     int max_tasks = 1;

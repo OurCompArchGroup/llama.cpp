@@ -29,8 +29,12 @@
 
 #if defined(__GNUC__)
 extern "C" {
+/* AME backend: invalidates its packed-Q8 cache on host writes. */
 void ggml_ame_host_buffer_on_write(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset, size_t size) __attribute__((weak));
 void ggml_ame_host_buffer_on_free(ggml_backend_buffer_t buffer) __attribute__((weak));
+/* xsai-blas adapter: tracks weight content generations for its plan cache. */
+void ggml_xsai_host_buffer_on_write(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, size_t offset, size_t size) __attribute__((weak));
+void ggml_xsai_host_buffer_on_free(ggml_backend_buffer_t buffer) __attribute__((weak));
 }
 #endif
 
@@ -2135,6 +2139,9 @@ static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (ggml_ame_host_buffer_on_free) {
         ggml_ame_host_buffer_on_free(buffer);
     }
+    if (ggml_xsai_host_buffer_on_free) {
+        ggml_xsai_host_buffer_on_free(buffer);
+    }
 #endif
     ggml_aligned_free(buffer->context, buffer->size);
 }
@@ -2146,6 +2153,9 @@ static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, 
 #if defined(__GNUC__)
     if (ggml_ame_host_buffer_on_write && size != 0) {
         ggml_ame_host_buffer_on_write(buffer, tensor, offset, size);
+    }
+    if (ggml_xsai_host_buffer_on_write && size != 0) {
+        ggml_xsai_host_buffer_on_write(buffer, tensor, offset, size);
     }
 #else
     GGML_UNUSED(buffer);
@@ -2159,6 +2169,9 @@ static void ggml_backend_cpu_buffer_set_tensor(ggml_backend_buffer_t buffer, str
 #if defined(__GNUC__)
     if (ggml_ame_host_buffer_on_write && size != 0) {
         ggml_ame_host_buffer_on_write(buffer, tensor, offset, size);
+    }
+    if (ggml_xsai_host_buffer_on_write && size != 0) {
+        ggml_xsai_host_buffer_on_write(buffer, tensor, offset, size);
     }
 #else
     GGML_UNUSED(buffer);
@@ -2189,6 +2202,9 @@ static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
 #if defined(__GNUC__)
     if (ggml_ame_host_buffer_on_write && buffer->size != 0) {
         ggml_ame_host_buffer_on_write(buffer, nullptr, 0, buffer->size);
+    }
+    if (ggml_xsai_host_buffer_on_write && buffer->size != 0) {
+        ggml_xsai_host_buffer_on_write(buffer, nullptr, 0, buffer->size);
     }
 #endif
 }

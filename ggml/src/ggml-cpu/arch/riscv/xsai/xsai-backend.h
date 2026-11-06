@@ -18,7 +18,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_xsai_buffer_type(void);
 void xsai_backend_note_graph(const struct ggml_cgraph * graph);
 
 /* Drop cached plans whose nodes are not in this graph. */
-void ame_xsai_plan_cache_retain(const void * const * ops, size_t count);
+void xsai_plan_cache_retain(const void * const * ops, size_t count);
 
 /* One-shot route, plan, and observe summary. Safe to call more than once. */
 void xsai_backend_print_report(void);
@@ -32,6 +32,8 @@ uint64_t xsai_backend_host_generation(const struct ggml_tensor * tensor);
 #endif
 
 #ifdef __cplusplus
+/* Weight placement probe used by the extra buffer type's supports_op(). */
+bool xsai_backend_placement_supports(ggml_backend_buffer_type_t self, const struct ggml_tensor * op);
 bool xsai_backend_q8_work_size(const struct ggml_tensor * op, uint64_t weight_generation, size_t & size);
 bool xsai_backend_q8_compute(struct ggml_compute_params * params, struct ggml_tensor * op, uint64_t weight_generation);
 bool xsai_backend_work_size(int n_threads, const struct ggml_tensor * op, size_t & size);

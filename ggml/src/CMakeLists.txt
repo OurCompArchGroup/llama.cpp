@@ -445,6 +445,63 @@ elseif (GGML_CPU)
     ggml_add_cpu_backend_variant_impl("")
 endif()
 
+# Standalone unit tests for the xsai-blas adapter layer
+# (ggml/src/ggml-cpu/arch/riscv/xsai). Host only: the tests compile just the
+# adapter translation units (no ggml-base, no AME) and link the host xsai-blas
+# archive. -ffunction-sections/--gc-sections drop the unreferenced registration
+# code so that only the symbols the tests exercise need definitions; see
+# xsai/xsai-test-stubs.cpp for the one stub that is required.
+if (GGML_XSAI_BACKEND AND GGML_XSAI_BACKEND_TESTS AND NOT GGML_SYSTEM_ARCH STREQUAL "riscv64" AND CMAKE_SYSTEM_NAME MATCHES "Linux")
+    if (NOT XSAI_BLAS_HOME OR NOT XSAI_BLAS_LIBRARY)
+        message(FATAL_ERROR "GGML_XSAI_BACKEND_TESTS requires XSAI_BLAS_HOME and XSAI_BLAS_LIBRARY")
+    endif()
+    if (NOT EXISTS "${XSAI_BLAS_HOME}/include/xsai_blas.h")
+        message(FATAL_ERROR "xsai-blas headers not found under ${XSAI_BLAS_HOME}/include")
+    endif()
+    if (NOT EXISTS "${XSAI_BLAS_LIBRARY}")
+        message(FATAL_ERROR "xsai-blas library not found: ${XSAI_BLAS_LIBRARY}")
+    endif()
+
+    set(GGML_XSAI_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/arch/riscv/xsai")
+
+    function(ggml_add_xsai_test name)
+        add_executable(${name} "${GGML_XSAI_TEST_DIR}/${name}.cpp"
+                               "${GGML_XSAI_TEST_DIR}/xsai-test-stubs.cpp"
+                               ${ARGN})
+        target_include_directories(${name} PRIVATE
+            "${GGML_XSAI_TEST_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+            "${XSAI_BLAS_HOME}/include"
+            "${XSAI_BLAS_HOME}/3rdparty/dlpack/include")
+        target_compile_definitions(${name} PRIVATE GGML_USE_XSAI_BLAS)
+        target_compile_options(${name} PRIVATE -ffunction-sections -fdata-sections)
+        target_link_options(${name} PRIVATE -Wl,--gc-sections)
+        target_link_libraries(${name} PRIVATE "${XSAI_BLAS_LIBRARY}")
+        # Registered unconditionally: add_test is inert unless testing is
+        # enabled in an ancestor directory (BUILD_TESTING/include(CTest) are
+        # only set up after add_subdirectory(ggml) has already run).
+        add_test(NAME ${name} COMMAND ${name})
+    endfunction()
+
+    ggml_add_xsai_test(xsai-plan-test
+        "${GGML_XSAI_TEST_DIR}/xsai-plan.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-observe.cpp")
+    ggml_add_xsai_test(xsai-observe-test
+        "${GGML_XSAI_TEST_DIR}/xsai-observe.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-plan.cpp")
+    ggml_add_xsai_test(xsai-fusion-test
+        "${GGML_XSAI_TEST_DIR}/xsai-fusion.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-plan.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-observe.cpp")
+    ggml_add_xsai_test(xsai-backend-test
+        "${GGML_XSAI_TEST_DIR}/xsai-backend.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-plan.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-observe.cpp"
+        "${GGML_XSAI_TEST_DIR}/xsai-fusion.cpp")
+endif()
+
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)

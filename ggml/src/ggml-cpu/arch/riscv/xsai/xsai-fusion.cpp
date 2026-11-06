@@ -1,11 +1,24 @@
-#include "ame-xsai-fusion.h"
+#include "xsai-fusion.h"
 
 #include "ggml-impl.h"
 
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 namespace {
+
+/* Fusion facts are adapter policy now; the ABI publishes no facts struct. */
+struct xsai_add_rms_fusion_facts_t {
+    uint32_t struct_size;
+    int32_t pattern_is_add_then_rms_norm;
+    int32_t intermediate_consumer_count;
+    int32_t dtype_shape_layout_match;
+    int32_t alias_safe;
+    int32_t eps_rounding_match;
+    int32_t fused_implementation_available;
+};
 
 int64_t nelements(const ggml_tensor * tensor) {
     int64_t n = 1;
@@ -131,19 +144,69 @@ void bind_tensor(DLTensor * slot, const ggml_tensor * tensor) {
     slot->byte_offset = 0;
 }
 
+xsai_add_rms_fusion_decision_t decide(const xsai_add_rms_fusion_facts_t & facts) {
+    if (!facts.pattern_is_add_then_rms_norm) {
+        return XSAI_FUSION_NOT_PATTERN;
+    }
+    if (facts.intermediate_consumer_count != 1) {
+        return XSAI_FUSION_EXTRA_CONSUMER;
+    }
+    if (!facts.dtype_shape_layout_match) {
+        return XSAI_FUSION_DTYPE_SHAPE_LAYOUT;
+    }
+    if (!facts.alias_safe) {
+        return XSAI_FUSION_ALIAS;
+    }
+    if (!facts.eps_rounding_match) {
+        return XSAI_FUSION_EPS_ROUNDING;
+    }
+    if (!facts.fused_implementation_available) {
+        return XSAI_FUSION_NO_IMPLEMENTATION;
+    }
+    return XSAI_FUSION_ACCEPT;
+}
+
+/*
+ * The library owns the decision on whether the op has a usable kernel. The
+ * answer depends only on the call metadata, so one successful probe per
+ * fingerprint is enough; data pointers and workspace are not part of it.
+ */
+std::mutex g_probe_mu;
+std::unordered_set<uint64_t> g_probe_ok;
+
+bool implementation_available(const xsai_op_call_t * call) {
+    const uint64_t key = xsai_op_call_fingerprint(call);
+    if (key == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_probe_mu);
+        if (g_probe_ok.find(key) != g_probe_ok.end()) {
+            return true;
+        }
+    }
+    xsai_op_plan_t * plan = nullptr;
+    const xsai_status_t status = xsai_op_plan_create(call, &plan);
+    xsai_op_plan_destroy(plan);
+    if (status != XSAI_STATUS_SUCCESS) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_probe_mu);
+    g_probe_ok.insert(key);
+    return true;
+}
+
 }  // namespace
 
-xsai_add_rms_fusion_decision_t ame_xsai_match_add_rms_norm(
+xsai_add_rms_fusion_decision_t xsai_match_add_rms_norm(
     const ggml_cgraph * graph,
     const ggml_tensor * rms_norm,
-    int fused_implementation_available,
     DLTensor inputs[3],
     DLTensor * output,
     xsai_fused_add_rms_norm_params_t * params,
     xsai_op_call_t * call) {
     xsai_add_rms_fusion_facts_t facts = {};
     facts.struct_size = sizeof(facts);
-    facts.fused_implementation_available = fused_implementation_available ? 1 : 0;
 
     const ggml_tensor * intermediate =
         rms_norm != nullptr && rms_norm->op == GGML_OP_RMS_NORM ? rms_norm->src[0] : nullptr;
@@ -154,7 +217,7 @@ xsai_add_rms_fusion_decision_t ame_xsai_match_add_rms_norm(
         weight != nullptr;
     facts.pattern_is_add_then_rms_norm = pattern ? 1 : 0;
     if (!pattern) {
-        return xsai_add_rms_fusion_decide(&facts);
+        return decide(facts);
     }
 
     const ggml_tensor * lhs = intermediate->src[0];
@@ -174,27 +237,42 @@ xsai_add_rms_fusion_decision_t ame_xsai_match_add_rms_norm(
     facts.eps_rounding_match = std::isfinite(eps) && eps >= 0.0f ? 1 : 0;
     facts.alias_safe = alias_safe(rms_norm, lhs, rhs, weight) ? 1 : 0;
 
-    const xsai_add_rms_fusion_decision_t decision = xsai_add_rms_fusion_decide(&facts);
+    /* Probe on locals so a rejected match leaves the caller slots untouched. */
+    DLTensor probe_inputs[3];
+    DLTensor probe_output;
+    bind_tensor(&probe_inputs[0], lhs);
+    bind_tensor(&probe_inputs[1], rhs);
+    bind_tensor(&probe_inputs[2], weight);
+    bind_tensor(&probe_output, rms_norm);
+    xsai_fused_add_rms_norm_params_t probe_params = {};
+    probe_params.struct_size = sizeof(probe_params);
+    probe_params.abi_version = XSAI_BLAS_ABI_VERSION;
+    probe_params.eps = eps;
+    xsai_op_call_t probe_call = {};
+    probe_call.struct_size = sizeof(probe_call);
+    probe_call.abi_version = XSAI_BLAS_ABI_VERSION;
+    probe_call.op = XSAI_OP_FUSED_ADD_RMS_NORM;
+    probe_call.inputs = probe_inputs;
+    probe_call.input_count = 3;
+    probe_call.outputs = &probe_output;
+    probe_call.output_count = 1;
+    probe_call.op_params = &probe_params;
+    facts.fused_implementation_available = implementation_available(&probe_call) ? 1 : 0;
+
+    const xsai_add_rms_fusion_decision_t decision = decide(facts);
     if (decision != XSAI_FUSION_ACCEPT || inputs == nullptr || output == nullptr ||
         params == nullptr || call == nullptr) {
         return decision;
     }
 
-    bind_tensor(&inputs[0], lhs);
-    bind_tensor(&inputs[1], rhs);
-    bind_tensor(&inputs[2], weight);
-    bind_tensor(output, rms_norm);
-    *params = {};
-    params->struct_size = sizeof(*params);
-    params->eps = eps;
-    *call = {};
-    call->struct_size = sizeof(*call);
-    call->abi_version = XSAI_BLAS_ABI_VERSION;
-    call->op = XSAI_OP_FUSED_ADD_RMS_NORM;
+    inputs[0] = probe_inputs[0];
+    inputs[1] = probe_inputs[1];
+    inputs[2] = probe_inputs[2];
+    *output = probe_output;
+    *params = probe_params;
+    *call = probe_call;
     call->inputs = inputs;
-    call->input_count = 3;
     call->outputs = output;
-    call->output_count = 1;
-    call->op_attrs = params;
+    call->op_params = params;
     return XSAI_FUSION_ACCEPT;
 }

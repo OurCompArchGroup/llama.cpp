@@ -1,4 +1,4 @@
-#include "ame-xsai-fusion.h"
+#include "xsai-fusion.h"
 
 #include "ggml-impl.h"
 
@@ -88,8 +88,8 @@ int main() {
     std::memset(&call, 0, sizeof(call));
     call.op = (xsai_op_type_t) 99;
 
-    xsai_add_rms_fusion_decision_t decision = ame_xsai_match_add_rms_norm(
-        &fx.graph, &fx.rms, 1, inputs, &output, &params, &call);
+    xsai_add_rms_fusion_decision_t decision = xsai_match_add_rms_norm(
+        &fx.graph, &fx.rms, inputs, &output, &params, &call);
     expect(decision == XSAI_FUSION_ACCEPT, "all five conditions accept");
     expect(call.op == XSAI_OP_FUSED_ADD_RMS_NORM, "accepted call is the fused op");
     expect(call.input_count == 3, "fused call has lhs rhs and weight");
@@ -115,14 +115,14 @@ int main() {
     fx.nodes[2] = &fx.extra;
     fx.graph.n_nodes = 3;
     call.op = (xsai_op_type_t) 99;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_EXTRA_CONSUMER, "extra consumer does not fuse");
     expect(call.op == (xsai_op_type_t) 99, "rejected match leaves the call untouched");
 
     make_fixture(&fx);
     fx.add.flags = GGML_TENSOR_FLAG_OUTPUT;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_EXTRA_CONSUMER, "graph output is an extra consumer");
 
@@ -134,51 +134,45 @@ int main() {
     fx.weight.ne[0] = 8;
     fx.weight.nb[1] = sizeof(float) * 8;
     fx.lhs.nb[1] = sizeof(float) * 8;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_DTYPE_SHAPE_LAYOUT, "strided layout does not fuse");
 
     make_fixture(&fx);
     fx.weight.type = GGML_TYPE_F16;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_DTYPE_SHAPE_LAYOUT, "dtype mismatch does not fuse");
 
     make_fixture(&fx);
     fx.rms.data = fx.weight.data;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_ALIAS, "alias onto the weight does not fuse");
 
     make_fixture(&fx);
     float bad_eps = -1.0f;
     std::memcpy(fx.rms.op_params, &bad_eps, sizeof(bad_eps));
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_EPS_ROUNDING, "negative eps does not fuse");
 
     make_fixture(&fx);
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 0, inputs, &output,
-                                           &params, &call);
-    expect(decision == XSAI_FUSION_NO_IMPLEMENTATION,
-           "missing fused implementation does not fuse");
-
-    make_fixture(&fx);
     fx.add.op = GGML_OP_MUL;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_NOT_PATTERN, "mul then rms_norm is not the pattern");
 
     make_fixture(&fx);
     fx.rms.data = fx.lhs.data;
-    decision = ame_xsai_match_add_rms_norm(&fx.graph, &fx.rms, 1, inputs, &output,
+    decision = xsai_match_add_rms_norm(&fx.graph, &fx.rms, inputs, &output,
                                            &params, &call);
     expect(decision == XSAI_FUSION_ACCEPT, "exact alias onto an add input is safe");
 
     if (g_failures != 0) {
-        std::printf("ame-xsai-fusion-test failures=%d\n", g_failures);
+        std::printf("xsai-fusion-test failures=%d\n", g_failures);
         return 1;
     }
-    std::printf("ame-xsai-fusion-test pass\n");
+    std::printf("xsai-fusion-test pass\n");
     return 0;
 }

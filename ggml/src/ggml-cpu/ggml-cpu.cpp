@@ -67,15 +67,15 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
         }
 #endif
 
-#ifdef GGML_USE_RV_AME
-        if (ggml_backend_cpu_riscv_ame_buffer_type()) {
-            bufts.push_back(ggml_backend_cpu_riscv_ame_buffer_type());
-        }
-#endif
-
 #ifdef GGML_USE_XSAI_BLAS
         if (ggml_backend_cpu_xsai_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_xsai_buffer_type());
+        }
+#endif
+
+#ifdef GGML_USE_RV_AME
+        if (ggml_backend_cpu_riscv_ame_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_riscv_ame_buffer_type());
         }
 #endif
 

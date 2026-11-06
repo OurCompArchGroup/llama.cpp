@@ -1,4 +1,4 @@
-#include "ame-xsai-observe.h"
+#include "xsai-observe.h"
 
 #include <atomic>
 #include <mutex>
@@ -21,15 +21,15 @@ uint64_t monotonic_ns(void) {
 
 }  // namespace
 
-void ame_xsai_observe_set_enabled(int enabled) {
+void xsai_observe_set_enabled(int enabled) {
     g_enabled.store(enabled ? 1 : 0, std::memory_order_release);
 }
 
-int ame_xsai_observe_enabled(void) {
+int xsai_observe_enabled(void) {
     return g_enabled.load(std::memory_order_acquire);
 }
 
-void ame_xsai_observe_reset(void) {
+void xsai_observe_reset(void) {
     std::lock_guard<std::mutex> lock(g_mu);
     for (int i = 0; i < 4; ++i) {
         g_count[i] = 0;
@@ -37,29 +37,29 @@ void ame_xsai_observe_reset(void) {
     }
 }
 
-void ame_xsai_observe_export(ame_xsai_observe_export_t * out) {
+void xsai_observe_export(xsai_observe_export_t * out) {
     if (out == nullptr) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_mu);
-    out->prepare_count = g_count[AME_XSAI_OBS_PREPARE];
-    out->prepare_ns = g_ns[AME_XSAI_OBS_PREPARE];
-    out->plan_create_count = g_count[AME_XSAI_OBS_PLAN_CREATE];
-    out->plan_create_ns = g_ns[AME_XSAI_OBS_PLAN_CREATE];
-    out->workspace_count = g_count[AME_XSAI_OBS_WORKSPACE];
-    out->workspace_ns = g_ns[AME_XSAI_OBS_WORKSPACE];
-    out->execute_count = g_count[AME_XSAI_OBS_EXECUTE];
-    out->execute_ns = g_ns[AME_XSAI_OBS_EXECUTE];
-    out->kernel_count = g_count[AME_XSAI_OBS_EXECUTE];
-    out->kernel_ns = g_ns[AME_XSAI_OBS_EXECUTE];
+    out->prepare_count = g_count[XSAI_OBS_PREPARE];
+    out->prepare_ns = g_ns[XSAI_OBS_PREPARE];
+    out->plan_create_count = g_count[XSAI_OBS_PLAN_CREATE];
+    out->plan_create_ns = g_ns[XSAI_OBS_PLAN_CREATE];
+    out->workspace_count = g_count[XSAI_OBS_WORKSPACE];
+    out->workspace_ns = g_ns[XSAI_OBS_WORKSPACE];
+    out->execute_count = g_count[XSAI_OBS_EXECUTE];
+    out->execute_ns = g_ns[XSAI_OBS_EXECUTE];
+    out->kernel_count = g_count[XSAI_OBS_EXECUTE];
+    out->kernel_ns = g_ns[XSAI_OBS_EXECUTE];
 }
 
-void ame_xsai_observe_span_begin(int phase, uint64_t * token) {
+void xsai_observe_span_begin(int phase, uint64_t * token) {
     if (token == nullptr) {
         return;
     }
     *token = UINT64_MAX;
-    if (phase < AME_XSAI_OBS_PREPARE || phase > AME_XSAI_OBS_EXECUTE) {
+    if (phase < XSAI_OBS_PREPARE || phase > XSAI_OBS_EXECUTE) {
         return;
     }
     if (!g_enabled.load(std::memory_order_acquire)) {
@@ -68,11 +68,11 @@ void ame_xsai_observe_span_begin(int phase, uint64_t * token) {
     *token = monotonic_ns();
 }
 
-void ame_xsai_observe_span_end(int phase, uint64_t token) {
+void xsai_observe_span_end(int phase, uint64_t token) {
     if (token == UINT64_MAX) {
         return;
     }
-    if (phase < AME_XSAI_OBS_PREPARE || phase > AME_XSAI_OBS_EXECUTE) {
+    if (phase < XSAI_OBS_PREPARE || phase > XSAI_OBS_EXECUTE) {
         return;
     }
     const uint64_t end = monotonic_ns();
