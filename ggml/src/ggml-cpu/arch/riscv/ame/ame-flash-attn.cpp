@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -23,7 +24,6 @@
 namespace {
 
 constexpr int FA_M = AME_TILE_M;
-constexpr int FA_N = AME_TILE_N;
 constexpr int FA_K = AME_TILE_K_BF16;
 constexpr size_t FA_ALIGN = 64;
 
@@ -85,8 +85,26 @@ static bool implementation_enabled() {
     return enabled;
 }
 
-static bool shape_supported(const ggml_tensor * dst) {
-    if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
+// FA 的 N tile 必须恰好等于硬件的 tensor 宽度：RTL 的 CDataController 在每次
+// MMA 时断言 MatrixRegWorkingTensor_N === Tensor_MN（"not Full!"），N 小于
+// 物理宽度会导致紧凑地址布局错位。Tensor_MN = tlenb / trlenb 由 CSR 探测
+// 得到：minimal (CUTE_2Tops) 为 64，default (CUTE_8Tops_128SCP) 为 128。
+// 因此 FA_N 不是编译期常量，而是按运行时硬件配置选择。
+static int fa_tile_n() {
+    const ggml_ame_hw_config * cfg = ggml_ame_hw_config_get();
+    if (cfg == nullptr || !cfg->valid || cfg->rows == 0 || cfg->rows > (uint64_t) INT_MAX) {
+        return 0;
+    }
+    const int fa_n = (int) cfg->rows;
+    // K/P/V panel 均按 FA_K 列打包，N 必须是 FA_K 的整数倍。
+    if (fa_n % FA_K != 0) {
+        return 0;
+    }
+    return fa_n;
+}
+
+static bool shape_supported(const ggml_tensor * dst, int fa_n) {
+    if (fa_n <= 0 || dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
         return false;
     }
 
@@ -98,9 +116,9 @@ static bool shape_supported(const ggml_tensor * dst) {
         (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) &&
         k->type == v->type &&
         q->ne[0] == k->ne[0] &&
-        q->ne[1] >= FA_M && k->ne[1] >= FA_N &&
+        q->ne[1] >= FA_M && k->ne[1] >= fa_n &&
         k->ne[0] > 0 && k->ne[0] % FA_K == 0 &&
-        v->ne[0] > 0 && v->ne[0] % FA_N == 0 &&
+        v->ne[0] > 0 && v->ne[0] % fa_n == 0 &&
         q->ne[2] % k->ne[2] == 0 && q->ne[3] % k->ne[3] == 0 &&
         q->ne[2] % v->ne[2] == 0 && q->ne[3] % v->ne[3] == 0 &&
         q->nb[0] == sizeof(float) &&
@@ -110,24 +128,25 @@ static bool shape_supported(const ggml_tensor * dst) {
         dst->nb[0] == sizeof(float) && dst->nb[1] == (size_t) v->ne[0] * sizeof(float);
 }
 
-static size_t workspace_size_for_dims(int64_t dk, int64_t dv) {
+static size_t workspace_size_for_dims(int64_t dk, int64_t dv, int fa_n) {
     const size_t dk_tiles = (size_t) dk / FA_K;
+    const size_t n_panels = (size_t) fa_n / FA_K;
     size_t size = FA_ALIGN;
     const auto add = [&size](size_t bytes) {
         size = align_up(size);
         size += bytes;
     };
 
-    add(dk_tiles * FA_M * FA_K * sizeof(ggml_bf16_t)); // Q panels
-    add(dk_tiles * FA_N * FA_K * sizeof(ggml_bf16_t)); // K panels
-    add(2 * FA_M * FA_K * sizeof(ggml_bf16_t));        // P panels
-    add(2 * FA_N * FA_K * sizeof(ggml_bf16_t));        // V panels
-    add(FA_N * (size_t) dv * sizeof(ggml_bf16_t));     // row-major V tile
-    add(FA_M * FA_N * sizeof(float));                  // QK scores
-    add(FA_M * FA_N * sizeof(float));                  // PV result
-    add(FA_M * (size_t) dv * sizeof(float));           // output accumulator
-    add(FA_M * sizeof(float));                         // online max
-    add(FA_M * sizeof(float));                         // online sum
+    add(dk_tiles * FA_M * FA_K * sizeof(ggml_bf16_t));          // Q panels
+    add(dk_tiles * (size_t) fa_n * FA_K * sizeof(ggml_bf16_t)); // K panels
+    add(n_panels * FA_M * FA_K * sizeof(ggml_bf16_t));          // P panels
+    add(n_panels * (size_t) fa_n * FA_K * sizeof(ggml_bf16_t)); // V panels
+    add((size_t) fa_n * (size_t) dv * sizeof(ggml_bf16_t));     // row-major V tile
+    add((size_t) FA_M * (size_t) fa_n * sizeof(float));         // QK scores
+    add((size_t) FA_M * (size_t) fa_n * sizeof(float));         // PV result
+    add(FA_M * (size_t) dv * sizeof(float));                    // output accumulator
+    add(FA_M * sizeof(float));                                  // online max
+    add(FA_M * sizeof(float));                                  // online sum
     return align_up(size);
 }
 
@@ -140,17 +159,18 @@ static T * carve(char *& cursor, size_t count) {
     return result;
 }
 
-static ame_fa_workspace make_workspace(void * data, int64_t dk, int64_t dv) {
+static ame_fa_workspace make_workspace(void * data, int64_t dk, int64_t dv, int fa_n) {
     char * cursor = static_cast<char *>(data);
     const size_t dk_tiles = (size_t) dk / FA_K;
+    const size_t n_panels = (size_t) fa_n / FA_K;
     ame_fa_workspace ws;
     ws.q_panels = carve<ggml_bf16_t>(cursor, dk_tiles * FA_M * FA_K);
-    ws.k_panels = carve<ggml_bf16_t>(cursor, dk_tiles * FA_N * FA_K);
-    ws.p_panels = carve<ggml_bf16_t>(cursor, 2 * FA_M * FA_K);
-    ws.v_panels = carve<ggml_bf16_t>(cursor, 2 * FA_N * FA_K);
-    ws.v_rows   = carve<ggml_bf16_t>(cursor, FA_N * (size_t) dv);
-    ws.scores   = carve<float>(cursor, FA_M * FA_N);
-    ws.pv       = carve<float>(cursor, FA_M * FA_N);
+    ws.k_panels = carve<ggml_bf16_t>(cursor, dk_tiles * (size_t) fa_n * FA_K);
+    ws.p_panels = carve<ggml_bf16_t>(cursor, n_panels * FA_M * FA_K);
+    ws.v_panels = carve<ggml_bf16_t>(cursor, n_panels * (size_t) fa_n * FA_K);
+    ws.v_rows   = carve<ggml_bf16_t>(cursor, (size_t) fa_n * (size_t) dv);
+    ws.scores   = carve<float>(cursor, (size_t) FA_M * (size_t) fa_n);
+    ws.pv       = carve<float>(cursor, (size_t) FA_M * (size_t) fa_n);
     ws.out      = carve<float>(cursor, FA_M * (size_t) dv);
     ws.row_max  = carve<float>(cursor, FA_M);
     ws.row_sum  = carve<float>(cursor, FA_M);
@@ -262,9 +282,9 @@ static void scale_row(float * row, int64_t n, float scale) {
 #endif
 }
 
-static float softmax_row(float * row, int valid, float max_value) {
+static float softmax_row(float * row, int valid, int fa_n, float max_value) {
     const float sum = (float) ggml_vec_soft_max_f32(valid, row, row, max_value);
-    for (int i = valid; i < FA_N; ++i) {
+    for (int i = valid; i < fa_n; ++i) {
         row[i] = 0.0f;
     }
     return sum;
@@ -302,16 +322,17 @@ static void pack_k_panels(
         int64_t ik2,
         int64_t ik3,
         int rows,
+        int fa_n,
         ame_fa_workspace & ws) {
     const int dk_tiles = (int) k->ne[0] / FA_K;
     for (int kb = 0; kb < dk_tiles; ++kb) {
-        ggml_bf16_t * panel = ws.k_panels + (size_t) kb * FA_N * FA_K;
+        ggml_bf16_t * panel = ws.k_panels + (size_t) kb * fa_n * FA_K;
         for (int tk = 0; tk < rows; ++tk) {
             const void * row = static_cast<const char *>(k->data) +
                 (ic + tk) * k->nb[1] + ik2 * k->nb[2] + ik3 * k->nb[3];
             row_to_bf16(row_segment(row, k->type, kb * FA_K), k->type, panel + tk * FA_K, FA_K);
         }
-        memset(panel + rows * FA_K, 0, (FA_N - rows) * FA_K * sizeof(ggml_bf16_t));
+        memset(panel + rows * FA_K, 0, (fa_n - rows) * FA_K * sizeof(ggml_bf16_t));
     }
 }
 
@@ -321,6 +342,7 @@ static void pack_v_rows(
         int64_t iv2,
         int64_t iv3,
         int rows,
+        int fa_n,
         ame_fa_workspace & ws) {
     const int64_t dv = v->ne[0];
     for (int tk = 0; tk < rows; ++tk) {
@@ -329,25 +351,27 @@ static void pack_v_rows(
         row_to_bf16(row, v->type, ws.v_rows + (size_t) tk * dv, dv);
     }
     memset(ws.v_rows + (size_t) rows * dv, 0,
-        (FA_N - rows) * (size_t) dv * sizeof(ggml_bf16_t));
+        (size_t) (fa_n - rows) * (size_t) dv * sizeof(ggml_bf16_t));
 }
 
-static void pack_probability_panels(const float * scores, int rows, ggml_bf16_t * panels) {
-    for (int half = 0; half < 2; ++half) {
-        ggml_bf16_t * panel = panels + half * FA_M * FA_K;
+static void pack_probability_panels(const float * scores, int rows, int fa_n, ggml_bf16_t * panels) {
+    const int n_panels = fa_n / FA_K;
+    for (int panel_idx = 0; panel_idx < n_panels; ++panel_idx) {
+        ggml_bf16_t * panel = panels + (size_t) panel_idx * FA_M * FA_K;
         for (int tq = 0; tq < rows; ++tq) {
-            f32_to_bf16(scores + tq * FA_N + half * FA_K, panel + tq * FA_K, FA_K);
+            f32_to_bf16(scores + (size_t) tq * fa_n + panel_idx * FA_K, panel + tq * FA_K, FA_K);
         }
         memset(panel + rows * FA_K, 0, (FA_M - rows) * FA_K * sizeof(ggml_bf16_t));
     }
 }
 
-static void pack_v_panels(const ggml_bf16_t * rows, int64_t dv, int64_t dv0, ggml_bf16_t * panels) {
-    for (int half = 0; half < 2; ++half) {
-        ggml_bf16_t * panel = panels + half * FA_N * FA_K;
-        for (int n = 0; n < FA_N; ++n) {
+static void pack_v_panels(const ggml_bf16_t * rows, int64_t dv, int64_t dv0, int fa_n, ggml_bf16_t * panels) {
+    const int n_panels = fa_n / FA_K;
+    for (int panel_idx = 0; panel_idx < n_panels; ++panel_idx) {
+        ggml_bf16_t * panel = panels + (size_t) panel_idx * fa_n * FA_K;
+        for (int n = 0; n < fa_n; ++n) {
             for (int k = 0; k < FA_K; ++k) {
-                panel[n * FA_K + k] = rows[(half * FA_K + k) * dv + dv0 + n];
+                panel[n * FA_K + k] = rows[(panel_idx * FA_K + k) * dv + dv0 + n];
             }
         }
     }
@@ -380,17 +404,19 @@ static void print_profile(
 } // namespace
 
 extern "C" size_t ggml_ame_flash_attn_ext_work_size(const ggml_tensor * dst) {
-    if (!shape_supported(dst)) {
+    const int fa_n = fa_tile_n();
+    if (fa_n == 0 || !shape_supported(dst, fa_n)) {
         return 0;
     }
-    return workspace_size_for_dims(dst->src[1]->ne[0], dst->src[2]->ne[0]);
+    return workspace_size_for_dims(dst->src[1]->ne[0], dst->src[2]->ne[0], fa_n);
 }
 
 extern "C" int ggml_ame_flash_attn_ext_compute(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    if (!implementation_enabled() || params->nth != 1 || params->ith != 0 || !shape_supported(dst) ||
-        !ggml_ame_can_use_bf16(FA_M, FA_N, FA_K)) {
+    const int fa_n = fa_tile_n();
+    if (!implementation_enabled() || params->nth != 1 || params->ith != 0 || fa_n == 0 ||
+        !shape_supported(dst, fa_n) || !ggml_ame_can_use_bf16(FA_M, fa_n, FA_K)) {
         return 0;
     }
 
@@ -402,9 +428,23 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
 
     const int64_t dk = k->ne[0];
     const int64_t dv = v->ne[0];
-    const size_t required = workspace_size_for_dims(dk, dv);
+    const size_t required = workspace_size_for_dims(dk, dv, fa_n);
     GGML_ASSERT(params->wdata != nullptr && params->wsize >= required);
-    ame_fa_workspace ws = make_workspace(params->wdata, dk, dv);
+    ame_fa_workspace ws = make_workspace(params->wdata, dk, dv, fa_n);
+
+    // 预脏化两个 MSC 目标（QK 的 scores、PV 的 pv）。
+    // Svade 语义下 AME 的 MSC 写一个 CPU 从未写过的页时，DTLB 会因 PTE D=0
+    // 报 store page fault；旧版 EMU 的 MLS 异常地址通路缺失（LSQWrapper 的
+    // exceptionAddr 只从 store/load queue 取值，不含 mlsQueue），stval 会是
+    // store queue 的陈旧地址，guest 内核按无 VMA 处理直接 SIGSEGV。
+    // 这里用 CPU 先写一遍，把 PTE 的 A/D 置上，首个 MSC 便不再触发该异常；
+    // 与 ame-matmul.c 里 tile_c 的预清零同源。两个 buffer 随后都会被 AME
+    // 整块覆盖，这里的零值不影响结果。
+    {
+        const size_t msc_target_bytes = (size_t) FA_M * (size_t) fa_n * sizeof(float);
+        memset(ws.scores, 0, msc_target_bytes);
+        memset(ws.pv,     0, msc_target_bytes);
+    }
 
     float scale = 1.0f;
     float max_bias = 0.0f;
@@ -432,10 +472,28 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
 
     static bool logged = false;
     if (!logged) {
-        AME_LOG("FlashAttention backend active: q=f32 kv=%s DK=%lld DV=%lld Q=%lld KV=%lld",
+        AME_LOG("FlashAttention backend active: q=f32 kv=%s DK=%lld DV=%lld Q=%lld KV=%lld FA_N=%d",
             ggml_type_name(k->type), (long long) dk, (long long) dv,
-            (long long) q->ne[1], (long long) k->ne[1]);
+            (long long) q->ne[1], (long long) k->ne[1], fa_n);
         logged = true;
+    }
+
+    // 每个 AME op 入口重置 sync0 令牌计数，与 Q8 / BF16 mul_mat 路径一致。
+    // 这也让 NEMU/EMU checkpoint 恢复时硬件 mtokr（不是 checkpoint 状态，
+    // 恢复后为 0）与软件 target 计数从同一起点开始，避免恢复后死等令牌。
+    ggml_ame_sync_begin_op();
+
+    // 调试用：在 FA op 入口（令牌已重置、尚未发任何 AME kernel）触发 NEMU
+    // manual one-shot checkpoint；仅设置 GGML_AME_FA_CPT_TRAP 时生效。
+    if (getenv("GGML_AME_FA_CPT_TRAP") != NULL) {
+#if defined(__riscv)
+        asm volatile(
+            "li a0, 0x105\n\t"
+            ".insn r 0x6B, 0, 0, x0, x0, x0\n\t"
+            :
+            :
+            : "a0", "memory");
+#endif
     }
 
     for (int64_t iq3 = 0; iq3 < q->ne[3]; ++iq3) {
@@ -460,8 +518,8 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                     ws.row_sum[tq] = 0.0f;
                 }
 
-                for (int64_t ic = 0; ic < k->ne[1]; ic += FA_N) {
-                    const int kv_rows = (int) std::min<int64_t>(FA_N, k->ne[1] - ic);
+                for (int64_t ic = 0; ic < k->ne[1]; ic += fa_n) {
+                    const int kv_rows = (int) std::min<int64_t>(fa_n, k->ne[1] - ic);
 
                     bool all_masked = mask != nullptr;
                     if (mask != nullptr) {
@@ -483,16 +541,16 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                     }
 
                     start = profile_enabled ? read_cycle() : 0;
-                    pack_k_panels(k, ic, ik2, ik3, kv_rows, ws);
+                    pack_k_panels(k, ic, ik2, ik3, kv_rows, fa_n, ws);
                     if (profile_enabled) profile.pack_k += read_cycle() - start;
 
                     start = profile_enabled ? read_cycle() : 0;
                     ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
                         ws.q_panels, FA_M * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                         FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                        ws.k_panels, FA_N * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                        ws.k_panels, fa_n * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                         FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                        dk_tiles, 2, FA_N, ws.scores);
+                        dk_tiles, 2, fa_n, ws.scores);
                     if (profile_enabled) {
                         profile.qk_ame += read_cycle() - start;
                         ++profile.qk_tiles;
@@ -501,7 +559,7 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                     start = profile_enabled ? read_cycle() : 0;
                     bool any_row = false;
                     for (int tq = 0; tq < q_rows; ++tq) {
-                        float * score_row = ws.scores + tq * FA_N;
+                        float * score_row = ws.scores + (size_t) tq * fa_n;
                         const ggml_fp16_t * mask_row = mask ? reinterpret_cast<const ggml_fp16_t *>(
                             static_cast<const char *>(mask->data) +
                             (iq1 + tq) * mask->nb[1] + (iq2 % mask->ne[2]) * mask->nb[2] +
@@ -517,13 +575,13 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                             }
                             score_row[tk] = value;
                         }
-                        for (int tk = kv_rows; tk < FA_N; ++tk) {
+                        for (int tk = kv_rows; tk < fa_n; ++tk) {
                             score_row[tk] = -INFINITY;
                         }
 
                         const float tile_max = row_max(score_row, kv_rows);
                         if (tile_max == -INFINITY) {
-                            memset(score_row, 0, FA_N * sizeof(float));
+                            memset(score_row, 0, (size_t) fa_n * sizeof(float));
                             continue;
                         }
 
@@ -536,10 +594,10 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                             ws.row_sum[tq] *= old_scale;
                         }
                         ws.row_max[tq] = new_max;
-                        ws.row_sum[tq] += softmax_row(score_row, kv_rows, new_max);
+                        ws.row_sum[tq] += softmax_row(score_row, kv_rows, fa_n, new_max);
                     }
                     for (int tq = q_rows; tq < FA_M; ++tq) {
-                        memset(ws.scores + tq * FA_N, 0, FA_N * sizeof(float));
+                        memset(ws.scores + (size_t) tq * fa_n, 0, (size_t) fa_n * sizeof(float));
                     }
                     if (profile_enabled) profile.softmax += read_cycle() - start;
                     if (!any_row) {
@@ -547,25 +605,25 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                     }
 
                     start = profile_enabled ? read_cycle() : 0;
-                    pack_v_rows(v, ic, iv2, iv3, kv_rows, ws);
+                    pack_v_rows(v, ic, iv2, iv3, kv_rows, fa_n, ws);
                     if (profile_enabled) profile.pack_v += read_cycle() - start;
 
                     start = profile_enabled ? read_cycle() : 0;
-                    pack_probability_panels(ws.scores, q_rows, ws.p_panels);
+                    pack_probability_panels(ws.scores, q_rows, fa_n, ws.p_panels);
                     if (profile_enabled) profile.pack_pv += read_cycle() - start;
 
-                    for (int64_t dv0 = 0; dv0 < dv; dv0 += FA_N) {
+                    for (int64_t dv0 = 0; dv0 < dv; dv0 += fa_n) {
                         start = profile_enabled ? read_cycle() : 0;
-                        pack_v_panels(ws.v_rows, dv, dv0, ws.v_panels);
+                        pack_v_panels(ws.v_rows, dv, dv0, fa_n, ws.v_panels);
                         if (profile_enabled) profile.pack_pv += read_cycle() - start;
 
                         start = profile_enabled ? read_cycle() : 0;
                         ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
                             ws.p_panels, FA_M * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                             FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                            ws.v_panels, FA_N * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
+                            ws.v_panels, fa_n * FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
                             FA_K * (ptrdiff_t) sizeof(ggml_bf16_t),
-                            2, 2, FA_N, ws.pv);
+                            fa_n / FA_K, 2, fa_n, ws.pv);
                         if (profile_enabled) {
                             profile.pv_ame += read_cycle() - start;
                             ++profile.pv_tiles;
@@ -574,8 +632,8 @@ extern "C" int ggml_ame_flash_attn_ext_compute(
                         start = profile_enabled ? read_cycle() : 0;
                         for (int tq = 0; tq < q_rows; ++tq) {
                             float * out_row = ws.out + tq * dv + dv0;
-                            const float * pv_row = ws.pv + tq * FA_N;
-                            for (int n = 0; n < FA_N; ++n) {
+                            const float * pv_row = ws.pv + (size_t) tq * fa_n;
+                            for (int n = 0; n < fa_n; ++n) {
                                 out_row[n] += pv_row[n];
                             }
                         }

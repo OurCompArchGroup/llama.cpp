@@ -47,12 +47,14 @@ static inline int ame_log_enabled(void) {
 #define AME_TILE_N_MAX 128
 #define AME_TILE_K_BF16 (AME_TILE_K / (int) sizeof(ggml_bf16_t))
 
-// BF16 GEMM 的 N tile。
-// 这一版 RTL（CUTE Tensor_MN=128）在每次 MMA 时断言
-// MatrixRegWorkingTensor_N === Tensor_MN，即 MMA 的 N 必须填满整个
-// tensor 宽度；用 64 宽的 N 会直接 assert。硬件没有对应的 M 约束，
-// 所以 M 仍取 AME_TILE_M=64。NEMU 侧两者都支持（tile N 本来就是
-// MSETTILEN 的寄存器操作数），因此统一用 128 有利 RTL/NEMU 对齐。
+// BF16 GEMM 的 N tile（对齐 default RTL 的 Tensor_MN=128）。
+// RTL 在每次 MMA 时断言 MatrixRegWorkingTensor_N === Tensor_MN，即 MMA 的
+// N 必须填满整个 tensor 宽度；用 64 宽的 N 会直接 assert。硬件没有对应的
+// M 约束，所以 M 仍取 AME_TILE_M=64。NEMU 侧两者都支持（tile N 本来就是
+// MSETTILEN 的寄存器操作数）。
+// 注意：上面的 128 只适用于 default 配置；minimal 配置的 Tensor_MN 是 64。
+// FlashAttention 的 N 不读这个宏，而是由 fa_tile_n() 按运行时 Tensor_MN
+// （CSR tlenb/trlenb）决定，见 ame-flash-attn.cpp。
 #define AME_TILE_N_BF16 128
 
 #define AME_Q8_BLOCK_K 32

@@ -9,9 +9,10 @@
 // wrapper falls back to packed tiles otherwise).
 //
 // tile_n 是运行时 tile 宽度（MSETTILEN/MSC 都是寄存器操作数）：
-// - GEMM 走 AME_TILE_N_BF16(=128)：这一版 RTL 的 tensor 宽度固定 128，
+// - GEMM 走 AME_TILE_N_BF16(=128)：default RTL 的 tensor 宽度固定 128，
 //   MMA 的 N 必须等于 Tensor_MN，否则 CDataController 断言失败；
-// - FlashAttention 仍用 64（其 KV/PV 分块逻辑按 FA_N 组织）。
+// - FlashAttention 的 tile_n 由 fa_tile_n() 按运行时 Tensor_MN 决定
+//   （minimal 配置 64 / default 配置 128），见 ame-flash-attn.cpp。
 void ggml_ame_gemm_tile_bf16_fp32_bT(
     const ggml_bf16_t * A,
     ptrdiff_t a_row_stride,
