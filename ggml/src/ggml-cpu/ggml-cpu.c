@@ -4316,6 +4316,10 @@ int ggml_cpu_has_sme(void) {
 }
 
 void ggml_cpu_init(void) {
+#if defined(__riscv) && defined(GGML_AME_STARTUP_FCSR_PROBE)
+    uint32_t cpu_enter_fcsr;
+    __asm__ volatile("frcsr %0" : "=r"(cpu_enter_fcsr) : : "memory");
+#endif
     // needed to initialize ggml_time
     {
         struct ggml_init_params params = { 0, NULL, false };
@@ -4331,17 +4335,50 @@ void ggml_cpu_init(void) {
         // initialize GELU, Quick GELU, SILU and EXP F32 tables
         {
             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
+#if defined(__riscv) && defined(GGML_AME_STARTUP_FCSR_PROBE)
+            uint32_t lut_enter_fcsr;
+            uint32_t first_nv_fp16 = 0x10000u;
+            uint32_t first_nv_fcsr = 0u;
+            __asm__ volatile("frcsr %0" : "=r"(lut_enter_fcsr) : : "memory");
+#endif
 
             for (int i = 0; i < (1 << 16); ++i) {
                 union {
                     uint16_t u16;
                     ggml_fp16_t fp16;
                 } u = {i};
+#if defined(__riscv) && defined(__riscv_zfhmin) && defined(GGML_RV_MXFP4_PACKED) && defined(GGML_AME_FP16_LUT_INTEGER_NONFINITE) && GGML_AME_FP16_LUT_INTEGER_NONFINITE
+                if ((u.u16 & 0x7c00u) == 0x7c00u) {
+                    const uint32_t sign = (uint32_t) (u.u16 & 0x8000u) << 16;
+                    const uint32_t magnitude = (u.u16 & 0x03ffu) == 0 ? 0x7f800000u : 0x7fc00000u;
+                    const ggml_fp16_t gelu = u.u16 == 0x7c00u ? 0x7c00u : 0x7e00u;
+                    ggml_table_f32_f16[i] = fp32_from_bits(sign | magnitude);
+                    ggml_table_gelu_f16[i] = gelu;
+                    ggml_table_gelu_quick_f16[i] = gelu;
+                    continue;
+                }
+#endif
                 float f = GGML_COMPUTE_FP16_TO_FP32(u.fp16);
                 ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
                 ggml_table_gelu_quick_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
+#if defined(__riscv) && defined(GGML_AME_STARTUP_FCSR_PROBE)
+                if (!(lut_enter_fcsr & 16u) && first_nv_fp16 == 0x10000u) {
+                    uint32_t step_fcsr;
+                    __asm__ volatile("frcsr %0" : "=r"(step_fcsr) : : "memory");
+                    if (step_fcsr & 16u) {
+                        first_nv_fp16 = u.u16;
+                        first_nv_fcsr = step_fcsr;
+                    }
+                }
+#endif
             }
+#if defined(__riscv) && defined(GGML_AME_STARTUP_FCSR_PROBE)
+            uint32_t lut_exit_fcsr;
+            __asm__ volatile("frcsr %0" : "=r"(lut_exit_fcsr) : : "memory");
+            fprintf(stderr, "GGML_CPU_FIRST_LUT_FCSR entry=0x%x lut_before=0x%x lut_after=0x%x first_nv_fp16=0x%x nv_fcsr=0x%x\n",
+                    cpu_enter_fcsr, lut_enter_fcsr, lut_exit_fcsr, first_nv_fp16, first_nv_fcsr);
+#endif
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
 

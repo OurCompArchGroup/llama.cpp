@@ -1,6 +1,7 @@
 #include "vec.h"
 
 #include <cassert>
+#include <cmath>
 
 // precomputed gelu table for f16 (128 KB)
 ggml_fp16_t ggml_table_gelu_f16[1 << 16];
@@ -600,9 +601,22 @@ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float 
     }
 #elif defined(__riscv_v_intrinsic)
     vfloat64m1_t vsum = __riscv_vfmv_v_f_f64m1(0, 1);
+#if defined(GGML_AME_RVV_SOFTMAX_MASKED_EXP) && GGML_AME_RVV_SOFTMAX_MASKED_EXP
+    const bool finite_max = std::isfinite(max);
+#endif
     for (int avl; i < n; i += avl) {
         avl = __riscv_vsetvl_e32m2(n - i);
-        vfloat32m2_t val = ggml_v_expf_m2(__riscv_vfsub_vf_f32m2(__riscv_vle32_v_f32m2(&x[i], avl), max, avl), avl);
+        const vfloat32m2_t logits = __riscv_vle32_v_f32m2(&x[i], avl);
+        vfloat32m2_t centered = __riscv_vfsub_vf_f32m2(logits, max, avl);
+#if defined(GGML_AME_RVV_SOFTMAX_MASKED_EXP) && GGML_AME_RVV_SOFTMAX_MASKED_EXP
+        if (finite_max) {
+            const vuint32m2_t bits = __riscv_vreinterpret_v_f32m2_u32m2(logits);
+            const vbool16_t masked = __riscv_vmseq_vx_u32m2_b16(bits, 0xff800000u, avl);
+            const float masked_exp_underflow_argument = -0x1p8f;
+            centered = __riscv_vfmerge_vfm_f32m2(centered, masked_exp_underflow_argument, masked, avl);
+        }
+#endif
+        vfloat32m2_t val = ggml_v_expf_m2(centered, avl);
         __riscv_vse32_v_f32m2(&y[i], val, avl);
         vsum = __riscv_vfwredusum_vs_f32m2_f64m1(val, vsum, avl);
     }
