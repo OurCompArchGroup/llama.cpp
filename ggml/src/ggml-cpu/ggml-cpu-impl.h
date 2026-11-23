@@ -15,6 +15,8 @@
 extern "C" {
 #endif
 
+struct ggml_ame_mx_activation_reuse;
+
 struct ggml_compute_params {
     // ith = thread index, nth = number of threads
     int ith, nth;
@@ -24,6 +26,7 @@ struct ggml_compute_params {
     void * wdata;
 
     struct ggml_threadpool * threadpool;
+    struct ggml_ame_mx_activation_reuse * ame_mx_reuse;
 };
 
 

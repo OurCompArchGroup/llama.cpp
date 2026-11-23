@@ -23,11 +23,9 @@
 struct ame_mx_profile_counters {
     uint64_t calls, ops, k32_tiles, output_tiles, weight_cache_hits;
     uint64_t mmacc_instructions;
-    uint64_t msct_output_tiles;
     uint64_t cycles_total, cycles_weights, cycles_prepare, cycles_ame, cycles_store;
     uint64_t rms_calls, rms_pipeline_calls, rms_preflight_cycles, rms_panels, rms_callbacks;
-    uint64_t rms_chunk_calls, rms_chunk_visits, rms_chunks, rms_drain_chunks;
-    uint64_t rms_callback_cycles, rms_drain_cycles;
+    uint64_t qkv_producers, qkv_producer_cycles, qkv_native, qkv_pack_skips;
 };
 
 static int ame_mx_profile_index(int format, int tile_k) {
@@ -209,7 +207,7 @@ static int ame_whole_k_acc_pipeline_enabled(void) {
     return cached;
 }
 
-int ggml_ame_transposed_c_epilogue_enabled(void) {
+static int ame_transposed_c_epilogue_enabled(void) {
     static GGML_AME_THREAD_LOCAL int cached = -1;
     if (cached == -1) {
         cached = ame_env_enabled("GGML_AME_TRANSPOSED_C_EPILOGUE") ? 1 : 0;
@@ -458,7 +456,7 @@ static void ame_ckpt_notify_stop(int64_t M, int64_t N, int64_t K) {
             "occurrence=%lld pipeline=%d acc_pipeline=%d transposed_c=%d roi_cycles=%llu\n",
             (long long) M, (long long) N, (long long) K, (long long) occurrence,
             ame_whole_k_output_pipeline_enabled(), ame_whole_k_acc_pipeline_enabled(),
-            ggml_ame_transposed_c_epilogue_enabled(),
+            ame_transposed_c_epilogue_enabled(),
             (unsigned long long) roi_cycles);
     fflush(stderr);
     ggml_ame_nemu_signal(0x102);
@@ -548,15 +546,15 @@ static void ame_profile_dump(void) {
     pthread_mutex_lock(&g_ame_profile_mutex);
     for (int i = 0; i < 4; ++i) {
         const struct ame_mx_profile_counters * mx = &g_ame_profile.mx[i];
-        if (mx->calls == 0) {
+        if (mx->calls == 0 && mx->qkv_producers == 0) {
             continue;
         }
         const char * names[] = {"mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_k64"};
         fprintf(stderr,
             "[AME_PROFILE] %s calls=%llu useful_ops=%llu k32_tiles=%llu output_tiles=%llu "
             "weight_cache_hits=%llu cycles_total=%llu weight_prepare=%llu activation_quant_pack=%llu "
-            "ame_tile_call=%llu store=%llu mmacc_instructions=%llu msct_output_tiles=%llu "
-            "ops_per_cycle=%.6f cycle_scope=T1_elapsed\n",
+            "ame_tile_call=%llu store=%llu mmacc_instructions=%llu ops_per_cycle=%.6f "
+            "qkv_producers=%llu qkv_producer_cycles=%llu qkv_native=%llu qkv_pack_skips=%llu cycle_scope=T1_elapsed\n",
             names[i],
             (unsigned long long) mx->calls,
             (unsigned long long) mx->ops,
@@ -569,22 +567,20 @@ static void ame_profile_dump(void) {
             (unsigned long long) mx->cycles_ame,
             (unsigned long long) mx->cycles_store,
             (unsigned long long) mx->mmacc_instructions,
-            (unsigned long long) mx->msct_output_tiles,
-            mx->cycles_total ? (double) mx->ops / (double) mx->cycles_total : 0.0);
+            mx->cycles_total ? (double) mx->ops / (double) mx->cycles_total : 0.0,
+            (unsigned long long) mx->qkv_producers,
+            (unsigned long long) mx->qkv_producer_cycles,
+            (unsigned long long) mx->qkv_native,
+            (unsigned long long) mx->qkv_pack_skips);
         fflush(stderr);
         if (mx->rms_calls != 0) fprintf(stderr,
             "[AME_PROFILE] rms_mxfp4 calls=%llu pipeline_calls=%llu norm_gamma_preflight=%llu "
             "prepared_panels=%llu overlap_callbacks=%llu elided_nodes=%llu "
             "source_logical_passes_upper_bound=3 first_admitted_panel_passes=2 "
-            "other_panels_passes=3 wrapper_time_excludes_nested_prepare=yes "
-            "chunk_pipeline_calls=%llu chunk_callback_visits=%llu prepared_chunks=%llu drain_chunks=%llu "
-            "callback_prepare_cycles=%llu drain_prepare_cycles=%llu prepare_subsets_not_additive=yes\n",
+            "other_panels_passes=3 wrapper_time_excludes_nested_prepare=yes\n",
             (unsigned long long) mx->rms_calls, (unsigned long long) mx->rms_pipeline_calls,
             (unsigned long long) mx->rms_preflight_cycles, (unsigned long long) mx->rms_panels,
-            (unsigned long long) mx->rms_callbacks, (unsigned long long) (mx->rms_calls * 2),
-            (unsigned long long) mx->rms_chunk_calls, (unsigned long long) mx->rms_chunk_visits,
-            (unsigned long long) mx->rms_chunks, (unsigned long long) mx->rms_drain_chunks,
-            (unsigned long long) mx->rms_callback_cycles, (unsigned long long) mx->rms_drain_cycles);
+            (unsigned long long) mx->rms_callbacks, (unsigned long long) (mx->rms_calls * 2));
     }
     const uint64_t calls = g_ame_profile.baseline_calls + g_ame_profile.packed_calls;
     if (calls == 0) {
@@ -683,6 +679,14 @@ void ggml_ame_mx_profile_finish(uint64_t elapsed_cycles, int format, int tile_k)
     pthread_mutex_unlock(&g_ame_profile_mutex);
 }
 
+void ggml_ame_mx_profile_qkv_producer(uint64_t elapsed_cycles, int tile_k) {
+    pthread_mutex_lock(&g_ame_profile_mutex);
+    struct ame_mx_profile_counters * mx = &g_ame_profile.mx[ame_mx_profile_index(AME_MCFG_MXFP4, tile_k)];
+    mx->qkv_producers++;
+    mx->qkv_producer_cycles += elapsed_cycles;
+    pthread_mutex_unlock(&g_ame_profile_mutex);
+}
+
 static int g_ame_profile_enabled;
 static pthread_once_t g_ame_profile_once = PTHREAD_ONCE_INIT;
 
@@ -734,7 +738,6 @@ static void ame_profile_accumulate(const struct ame_profile_counters * local) {
         dst->output_tiles += src->output_tiles;
         dst->weight_cache_hits += src->weight_cache_hits;
         dst->mmacc_instructions += src->mmacc_instructions;
-        dst->msct_output_tiles += src->msct_output_tiles;
         dst->cycles_total += src->cycles_total;
         dst->cycles_weights += src->cycles_weights;
         dst->cycles_prepare += src->cycles_prepare;
@@ -745,12 +748,8 @@ static void ame_profile_accumulate(const struct ame_profile_counters * local) {
         dst->rms_preflight_cycles += src->rms_preflight_cycles;
         dst->rms_panels += src->rms_panels;
         dst->rms_callbacks += src->rms_callbacks;
-        dst->rms_chunk_calls += src->rms_chunk_calls;
-        dst->rms_chunk_visits += src->rms_chunk_visits;
-        dst->rms_chunks += src->rms_chunks;
-        dst->rms_drain_chunks += src->rms_drain_chunks;
-        dst->rms_callback_cycles += src->rms_callback_cycles;
-        dst->rms_drain_cycles += src->rms_drain_cycles;
+        dst->qkv_native += src->qkv_native;
+        dst->qkv_pack_skips += src->qkv_pack_skips;
     }
     pthread_mutex_unlock(&g_ame_profile_mutex);
 }
@@ -1217,8 +1216,7 @@ static inline void ame_store_acc_tile(
     const int64_t M,
     const int tile_n,
     const int imax,
-    const int jmax,
-    const bool acc_transposed
+    const int jmax
 ) {
 #if defined(__riscv_v)
     const ptrdiff_t acc_stride = (ptrdiff_t) tile_n * (ptrdiff_t) sizeof(float);
@@ -1226,9 +1224,7 @@ static inline void ame_store_acc_tile(
         int i = 0;
         while (i < imax) {
             const size_t vl = __riscv_vsetvl_e32m8((size_t) (imax - i));
-            const vfloat32m8_t v = acc_transposed ?
-                __riscv_vle32_v_f32m8(acc + j * tile_n + i, vl) :
-                __riscv_vlse32_v_f32m8(acc + i * tile_n + j, acc_stride, vl);
+            const vfloat32m8_t v = __riscv_vlse32_v_f32m8(acc + i * tile_n + j, acc_stride, vl);
             __riscv_vse32_v_f32m8(out + (int64_t) j * M + i, v, vl);
             i += (int) vl;
         }
@@ -1236,8 +1232,7 @@ static inline void ame_store_acc_tile(
 #else
     for (int j = 0; j < jmax; ++j) {
         for (int i = 0; i < imax; ++i) {
-            out[(int64_t) j * M + i] =
-                acc[acc_transposed ? j * tile_n + i : i * tile_n + j];
+            out[(int64_t) j * M + i] = acc[i * tile_n + j];
         }
     }
 #endif
@@ -1305,8 +1300,6 @@ struct ame_rms_panel_producer {
     int tile_k, tile_mn, profile;
     int64_t next_row;
     struct ggml_ame_rmsnorm_input * rms;
-    int64_t rows, next_k;
-    bool chunk_complete, chunk_draining;
 };
 
 static void ame_rms_prepare_panel(void * opaque) {
@@ -1327,54 +1320,12 @@ static void ame_rms_prepare_panel(void * opaque) {
     p->rms->prepared_panels++;
 }
 
-// One complete packed Ktile across the next panel's rows. Reuse full-row
-// factors: calling the producer without them would normalize each slab anew.
-static void ame_rms_prepare_panel_chunk(void * opaque) {
-    struct ame_rms_panel_producer * p = opaque;
-    GGML_ASSERT(p->rms != NULL && p->rms->row_scales != NULL);
-    if (!p->chunk_draining) p->rms->chunk_callback_visits++;
-    if (p->chunk_complete) return;
-    GGML_ASSERT(p->next_row >= 0 && p->next_row % p->tile_mn == 0 &&
-        p->next_row <= p->rows - p->tile_mn);
-    GGML_ASSERT(p->next_k >= 0 && p->next_k % p->tile_k == 0 &&
-        p->next_k <= p->K - p->tile_k);
-    const size_t nb = (size_t) p->K / AME_MXFP4_K;
-    const size_t groups = (size_t) p->tile_k / AME_MXFP4_K;
-    const size_t slot = (size_t) (p->next_row / p->tile_mn) & 1;
-    const size_t block_offset = slot * (size_t) p->tile_mn * nb +
-        (size_t) (p->next_k / p->tile_k) * (size_t) p->tile_mn * groups;
-    const float * x = (const float *) ((const char *) p->src +
-        (size_t) p->next_row * p->stride) + p->next_k;
-    const uint64_t start = p->profile ? ame_read_cycle() : 0;
-    // Whole-input admission precedes native issue. A later failure cannot
-    // fall back after partial output, just as in the original whole panel.
-    GGML_ASSERT(ggml_ame_rmsnorm_pack_mxfp4(
-        p->b + block_offset * 16, p->sb + block_offset, x,
-        p->rms->gamma + p->next_k, p->tile_mn, p->tile_k, p->stride,
-        p->rms->eps, p->tile_k, p->tile_mn, p->rms->row_scales + p->next_row));
-    const uint64_t elapsed = p->profile ? ame_read_cycle() - start : 0;
-    p->rms->prepare_cycles += elapsed;
-    p->rms->prepared_chunks++;
-    if (p->chunk_draining) {
-        p->rms->drain_chunks++;
-        p->rms->drain_prepare_cycles += elapsed;
-    } else {
-        p->rms->overlap_callbacks++;
-        p->rms->callback_prepare_cycles += elapsed;
-    }
-    p->next_k += p->tile_k;
-    if (p->next_k == p->K) {
-        p->chunk_complete = true;
-        p->rms->prepared_panels++;
-    }
-}
-
 void ggml_ame_mul_mat_mx(
     const uint8_t * a, const uint8_t * sa, const void * src1, float * dst,
     int64_t M, int64_t N, int64_t K, size_t src1_stride,
     void * work_data, int ith, int nth,
     uint64_t weight_prepare_cycles, int weight_cache_hit, int format, int tile_k, int tile_mn,
-    struct ggml_ame_rmsnorm_input * rms
+    struct ggml_ame_rmsnorm_input * rms, struct ggml_ame_mx_activation_reuse * reuse
 ) {
     GGML_ASSERT(ggml_ame_mx_shape_supported(M, N, K, tile_mn));
     GGML_ASSERT(ggml_ame_mx_tile_k_supported(format, tile_k) && K % tile_k == 0);
@@ -1382,10 +1333,6 @@ void ggml_ame_mul_mat_mx(
     GGML_ASSERT(nth == 1);
     ame_assert_phys_contiguous();
     const int profile = ame_profile_enabled();
-    // Same canonical selector/cache as the native store. Keep other formats
-    // and 64-row tiles on their original layout until separately qualified.
-    const bool transpose_c = format == AME_MCFG_MXFP4 && tile_mn == AME_TILE_M_MAX &&
-        ggml_ame_transposed_c_epilogue_enabled();
     struct ame_profile_counters local = {0};
     struct ame_mx_profile_counters * mx = &local.mx[ame_mx_profile_index(format, tile_k)];
     const uint64_t prepare_start = profile ? ame_read_cycle() : 0;
@@ -1403,17 +1350,39 @@ void ggml_ame_mul_mat_mx(
     uint8_t * sb = b + (size_t) buffered_rows * (size_t) nb * block_bytes;
     float * c = (float *) (sb + (size_t) buffered_rows * (size_t) nb);
     struct ame_rms_panel_producer producer = {
-        b, sb, src1, src1_stride, K, tile_k, tile_mn, profile, 0, rms,
-        N, 0, true, false
+        b, sb, src1, src1_stride, K, tile_k, tile_mn, profile, 0, rms
     };
+    bool pack_stable = false;
     if (rms == NULL) {
-        ggml_ame_mx_prepare_activation(b, sb, src1, N, K, src1_stride, format, tile_k, tile_mn);
+#if defined(__riscv_flen)
+        if (reuse != NULL && reuse->qkv_norm != NULL) {
+            reuse->hit = pack_stable = true;
+        } else if (reuse != NULL) {
+            const int pack_errno = errno;
+            unsigned entry_fcsr;
+            __asm__ volatile ("frcsr %0" : "=r" (entry_fcsr) : : "memory");
+            const bool reusable_fp = (entry_fcsr & 0x11) == 1 && (entry_fcsr >> 5) <= 4;
+            reuse->hit = reusable_fp && reuse->incoming &&
+                reuse->fcsr == entry_fcsr && reuse->saved_errno == pack_errno;
+            if (reuse->hit) {
+                pack_stable = true;
+            } else {
+                reuse->interposers = 0;
+                ggml_ame_mx_prepare_activation(b, sb, src1, N, K, src1_stride, format, tile_k, tile_mn);
+                unsigned exit_fcsr;
+                __asm__ volatile ("frcsr %0" : "=r" (exit_fcsr) : : "memory");
+                pack_stable = reusable_fp && exit_fcsr == entry_fcsr && errno == pack_errno;
+            }
+            reuse->fcsr = entry_fcsr;
+            reuse->saved_errno = pack_errno;
+        } else
+#endif
+        {
+            ggml_ame_mx_prepare_activation(b, sb, src1, N, K, src1_stride, format, tile_k, tile_mn);
+        }
     } else {
         GGML_ASSERT(format == AME_MCFG_MXFP4 && rms->row_scales == work_data);
-        GGML_ASSERT(rms->pipeline >= 0 && rms->pipeline <= 2);
         rms->overlap_callbacks = 0;
-        rms->chunk_callback_visits = rms->prepared_chunks = rms->drain_chunks = 0;
-        rms->callback_prepare_cycles = rms->drain_prepare_cycles = 0;
         if (rms->first_panel_prepared) {
             GGML_ASSERT(rms->prepared_panels == 1);
         } else {
@@ -1427,7 +1396,6 @@ void ggml_ame_mul_mat_mx(
     }
     const int64_t m_tiles = (m_end - m_begin + tile_mn - 1) / tile_mn;
     const int64_t n_tiles = N / tile_mn;
-    const bool chunk_pipeline = rms != NULL && rms->pipeline == 2;
     // The ordinary path retains its original M-outer ordering. Fused panels
     // are token-outer: quantize once, reuse for every output-channel tile,
     // then retire the slot. No per-output-channel requantization.
@@ -1436,25 +1404,13 @@ void ggml_ame_mul_mat_mx(
             producer.next_row = outer * tile_mn;
             ame_rms_prepare_panel(&producer);
         }
-        if (chunk_pipeline) {
-            // The previous outer's final MSC has been acquired before its
-            // slot can become this outer's next-panel destination.
-            GGML_ASSERT(producer.chunk_complete &&
-                rms->prepared_panels == (uint64_t) outer + 1);
-            if (outer + 1 < n_tiles) {
-                producer.next_row = (outer + 1) * tile_mn;
-                producer.next_k = 0;
-                producer.chunk_complete = false;
-            }
-        }
         for (int64_t inner = 0; inner < (rms == NULL ? n_tiles : m_tiles); ++inner) {
             const int64_t m0 = m_begin + (rms == NULL ? outer : inner) * tile_mn;
             const int64_t n0 = (rms == NULL ? inner : outer) * tile_mn;
             const size_t a_panel = (size_t) (m0 / tile_mn * panels_per_tile);
             const size_t b_panel = (size_t) (rms == NULL ? n0 / tile_mn : (outer & 1)) * panels_per_tile;
-            const int prepare_next = rms != NULL && rms->pipeline == 1 &&
+            const int prepare_next = rms != NULL && rms->pipeline &&
                 inner + 1 == m_tiles && outer + 1 < n_tiles;
-            const bool prepare_chunk = chunk_pipeline && !producer.chunk_complete;
             if (prepare_next) producer.next_row = (outer + 1) * tile_mn;
             const uint64_t prepare_before = rms == NULL ? 0 : rms->prepare_cycles;
             const uint64_t tile_start = profile ? ame_read_cycle() : 0;
@@ -1464,9 +1420,7 @@ void ggml_ame_mul_mat_mx(
                 b + b_panel * tile_bytes,
                 sb + b_panel * (size_t) tile_mn * (size_t) groups,
                 panels_per_tile, c, format, tile_k, tile_mn,
-                prepare_chunk ? ame_rms_prepare_panel_chunk : prepare_next ? ame_rms_prepare_panel : NULL,
-                prepare_chunk || prepare_next ? &producer : NULL,
-                prepare_chunk ? GGML_AME_OVERLAP_EACH_K : GGML_AME_OVERLAP_LAST_K);
+                prepare_next ? ame_rms_prepare_panel : NULL, prepare_next ? &producer : NULL);
             if (prepare_next) rms->overlap_callbacks++;
             if (profile) {
                 // Exclusive CPU wrapper time, not internal array busy time.
@@ -1478,18 +1432,10 @@ void ggml_ame_mul_mat_mx(
             // scale epilogue here; only reuse the canonical GGML store layout.
             const uint64_t store_start = profile ? ame_read_cycle() : 0;
             const int imax = (int) (m_end - m0 < tile_mn ? m_end - m0 : tile_mn);
-            ame_store_acc_tile(dst + n0 * M + m0, c, M, tile_mn, imax, tile_mn, transpose_c);
+            ame_store_acc_tile(dst + n0 * M + m0, c, M, tile_mn, imax, tile_mn);
             if (profile) {
                 mx->cycles_store += ame_read_cycle() - store_start;
             }
-        }
-        if (chunk_pipeline && !producer.chunk_complete) {
-            // Every kernel above has returned AFTER MSC/acquire. No RVV
-            // memory work is allowed in a pending matrix-store interval.
-            producer.chunk_draining = true;
-            while (!producer.chunk_complete) ame_rms_prepare_panel_chunk(&producer);
-            producer.chunk_draining = false;
-            asm volatile("fence rw, rw" ::: "memory");
         }
     }
     if (rms != NULL) {
@@ -1497,16 +1443,10 @@ void ggml_ame_mul_mat_mx(
         if (profile) {
             mx->cycles_prepare = rms->preflight_cycles + rms->prepare_cycles;
             mx->rms_calls = 1;
-            mx->rms_pipeline_calls = rms->pipeline == 1;
+            mx->rms_pipeline_calls = rms->pipeline != 0;
             mx->rms_preflight_cycles = rms->preflight_cycles;
             mx->rms_panels = rms->prepared_panels;
             mx->rms_callbacks = rms->overlap_callbacks;
-            mx->rms_chunk_calls = chunk_pipeline;
-            mx->rms_chunk_visits = rms->chunk_callback_visits;
-            mx->rms_chunks = rms->prepared_chunks;
-            mx->rms_drain_chunks = rms->drain_chunks;
-            mx->rms_callback_cycles = rms->callback_prepare_cycles;
-            mx->rms_drain_cycles = rms->drain_prepare_cycles;
         }
     }
     if (profile) {
@@ -1515,10 +1455,18 @@ void ggml_ame_mul_mat_mx(
         mx->output_tiles = (uint64_t) (ggml_ame_mx_padded_rows(M, tile_mn) / tile_mn) * (uint64_t) (N / tile_mn);
         mx->k32_tiles = mx->output_tiles * (uint64_t) nb;
         mx->mmacc_instructions = mx->output_tiles * (uint64_t) panels_per_tile;
-        mx->msct_output_tiles = transpose_c ? mx->output_tiles : 0;
         mx->weight_cache_hits = weight_cache_hit != 0;
         mx->cycles_weights = weight_prepare_cycles;
+        if (reuse != NULL && reuse->qkv_norm != NULL) {
+            mx->qkv_native = 1;
+            mx->qkv_pack_skips = reuse->qkv_dispatched != 0;
+        }
         ame_profile_accumulate(&local);
+    }
+    if (reuse != NULL) {
+        reuse->interposer_work = c;
+        reuse->interposer_bytes = (size_t) tile_mn * tile_mn * sizeof(*c);
+        reuse->published = pack_stable;
     }
 }
 
@@ -2062,7 +2010,7 @@ static void ame_mul_mat_q8_0_impl(
                 M,
                 tile_n,
                 imax,
-                jmax, false);
+                jmax);
             if (prof) {
                 prof_local.cycles_store += ame_read_cycle() - prof_t0;
                 prof_local.output_tile_calls++;
@@ -2337,7 +2285,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
         ame_whole_k_acc_pipeline_enabled() &&
         !ame_ckpt_rebase_every_tile_enabled();
     const int use_transposed_c_epilogue =
-        use_whole_k_output_pipeline && ggml_ame_transposed_c_epilogue_enabled();
+        use_whole_k_output_pipeline && ame_transposed_c_epilogue_enabled();
     const uint64_t sparse_total_tiles =
         (uint64_t) ((m_end - m_begin + tile_m - 1) / tile_m) *
         (uint64_t) ((N + tile_n - 1) / tile_n) *
@@ -2974,7 +2922,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                         M,
                         tile_n,
                         imax,
-                        jmax, false);
+                        jmax);
                 }
                 if (prof) {
                     if (!use_whole_k_fused_epilogue) {
@@ -3132,7 +3080,7 @@ void ggml_ame_mul_mat_q8_0_ame64(
                 M,
                 tile_n,
                 imax,
-                jmax, false);
+                jmax);
             if (prof) {
                 prof_local.cycles_store += ame_read_cycle() - prof_t0;
                 prof_local.output_tile_calls++;
