@@ -289,6 +289,19 @@ static bool llama_bench_abort_cb(void * user_data) {
 
 static bool llama_bench_layer01_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     const char * name = ggml_get_name(t);
+    if (std::getenv("LLAMA_BENCH_QKV_PREFIX_OUT") != nullptr) {
+        const auto * weight = t->op == GGML_OP_MUL_MAT ? t->src[0] : nullptr;
+        const bool stop = weight && std::strcmp(weight->name, "blk.0.attn_k.weight") == 0;
+        if (ask) {
+            if (t->op == GGML_OP_MUL_MAT_ID || (weight && !stop &&
+                std::strcmp(weight->name, "blk.0.attn_q.weight") != 0 &&
+                std::strcmp(weight->name, "blk.0.attn_v.weight") != 0)) std::_Exit(82);
+            return stop;
+        }
+        std::fprintf(stderr, "QKV_PREFIX_DONE third_projection=%d\n", stop);
+        std::_Exit(stop ? 0 : 83);
+    }
+
     const int layer = parse_layer_id(name);
     const int l_out_layer = parse_l_out_layer_id(name);
     auto * data = static_cast<layer_debug_data *>(user_data);
@@ -2942,7 +2955,7 @@ int main(int argc, char ** argv) {
         const bool layer_estimate_requested_for_shape = prompt_estimate_requested_for_shape ||
                                                        decode_layer_estimate_requested_for_shape;
         const bool layer_callback_requested = layer_estimate_requested_for_shape || decode_token_layer_sample_enabled;
-        if (layer_callback_requested || print_layer01_debug || inst.profile_layers) {
+        if (layer_callback_requested || print_layer01_debug || inst.profile_layers || std::getenv("LLAMA_BENCH_QKV_PREFIX_OUT")) {
             cparams.cb_eval = llama_bench_layer01_cb;
             cparams.cb_eval_user_data = &layer_dbg;
         }

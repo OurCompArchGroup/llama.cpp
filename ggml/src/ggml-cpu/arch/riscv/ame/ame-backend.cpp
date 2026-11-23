@@ -1358,10 +1358,40 @@ static bool ame_compute_mx_forward(
             shared->qkv_norm = nullptr;
             shared->published = false;
         }
+        if (const char * out = getenv("LLAMA_BENCH_QKV_PREFIX_OUT")) {
+            const char * kind = strcmp(weight->name, "blk.0.attn_q.weight") == 0 ? "q" :
+                strcmp(weight->name, "blk.0.attn_v.weight") == 0 ? "v" :
+                strcmp(weight->name, "blk.0.attn_k.weight") == 0 ? "k" : nullptr;
+            if (kind != nullptr) {
+                const unsigned fcsr = ame_read_fcsr();
+                const int saved_errno = errno;
+                const size_t pack_bytes = (size_t) activation->ne[1] * (packed->K / 32) * 17;
+                auto dump = [&](const char * suffix, const void * data, size_t size) {
+                    const std::string path = std::string(out) + "." + kind + "." + suffix;
+                    FILE * file = fopen(path.c_str(), "wbx");
+                    if (file == nullptr || fwrite(data, 1, size, file) != size || fclose(file) != 0) _Exit(81);
+                };
+                if (fused) _Exit(84);
+                dump("output", op->data, ggml_nbytes(op));
+                dump("pack", work, pack_bytes);
+                fprintf(stderr, "QKV_NATIVE role=%s K=%lld tile_k=%d shared=%d fcsr=%02x errno=%d out=%zu pack=%zu\n",
+                    kind, (long long) packed->K, tile_k, shared != nullptr, fcsr, saved_errno,
+                    ggml_nbytes(op), pack_bytes);
+                ame_restore_fcsr(fcsr);
+                errno = saved_errno;
+            }
+        }
     }
     if (profile) {
         const uint64_t elapsed = ame_backend_read_cycle() - op_start;
         ggml_ame_mx_profile_finish(elapsed, format, tile_k);
+        if (getenv("LLAMA_BENCH_QKV_PREFIX_OUT") && strcmp(weight->name, "blk.0.attn_k.weight") == 0) {
+            const unsigned fcsr = ame_read_fcsr();
+            const int saved_errno = errno;
+            ggml_ame_profile_dump_now();
+            ame_restore_fcsr(fcsr);
+            errno = saved_errno;
+        }
     }
     if (fused) {
         g_rms_fused_calls++;
