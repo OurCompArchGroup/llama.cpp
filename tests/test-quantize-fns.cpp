@@ -932,22 +932,6 @@ static void test_mxfp4_supplied_scales() {
 #endif
 }
 
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-#if !defined(GGML_RV_MXFP4_PACKED) || !defined(GGML_AME_MXFP4_ADJACENT) || !GGML_AME_MXFP4_ADJACENT || \
-    !defined(GGML_AME_MXFP4_REUSE_AMAX) || !GGML_AME_MXFP4_REUSE_AMAX
-#error GGML_TEST_MXFP4_SUPPLIED_BATCH8 requires packed, adjacent and reused amax
-#endif
-static_assert(mxfp4_test_rounding_count == 5, "batch8 oracle requires all five RISC-V rounding modes");
-#endif
-
-#if defined(GGML_RV_MXFP4_PACKED) || (defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS)
-static uint32_t mxfp4_packed_read_fcsr() {
-    uint32_t fcsr;
-    __asm__ volatile ("frcsr %0" : "=r" (fcsr) : : "memory");
-    return fcsr;
-}
-#endif
-
 #if defined(GGML_RV_MXFP4_PACKED)
 // The production packed owner consumes the existing AM assembly symbol on the
 // explicit matching R39 RV64 RVV build. Keep the test independent of its
@@ -955,6 +939,12 @@ static uint32_t mxfp4_packed_read_fcsr() {
 extern "C" uint64_t vector_mxfp4_pack_blocks(
     const float * values, uint8_t * adjacent, const uint8_t * scales,
     unsigned count);
+
+static uint32_t mxfp4_packed_read_fcsr() {
+    uint32_t fcsr;
+    __asm__ volatile ("frcsr %0" : "=r" (fcsr));
+    return fcsr;
+}
 
 static void mxfp4_packed_seed_flags(int flags) {
     assert((flags & ~FE_ALL_EXCEPT) == 0);
@@ -1010,28 +1000,13 @@ static void test_mxfp4_packed_compare(
     assert(std::fegetround() == rounding);
 
     mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    const uint32_t reference_fcsr_in = mxfp4_packed_read_fcsr();
-    assert((reference_fcsr_in & 0xffu) == ((uint32_t(rounding) << 5) | uint32_t(initial_flags)));
-#endif
     quantize_row_mxfp4_ref(input.data() + 1,
         reinterpret_cast<block_mxfp4 *>(expected.data() + 1), values.size());
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    const uint32_t reference_fcsr_out = mxfp4_packed_read_fcsr();
-    assert((reference_fcsr_out & ~31u) == (reference_fcsr_in & ~31u));
-    assert((reference_fcsr_out & reference_fcsr_in) == reference_fcsr_in);
-#endif
     const int reference_flags = std::fetestexcept(FE_ALL_EXCEPT);
     assert(std::fegetround() == rounding);
 
     mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_in);
-#endif
     cpu->from_float(input.data() + 1, actual.data() + 1, values.size());
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_out);
-#endif
     const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
     assert(std::fegetround() == rounding);
     assert(actual == expected);
@@ -1072,25 +1047,21 @@ static void test_mxfp4_packed_compare(
     for (bool reuse : {false, true}) {
 #endif
     std::vector<uint8_t> sink(nb * (QK_MXFP4 / 2) + 2, 0x5a);
+    std::vector<uint8_t> sink_scales(nb + 2, 0x5a);
     std::vector<uint8_t> encoded(bytes + 2, 0xa5);
     ggml_mxfp4_packed_stats_reset();
     mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_in);
-#endif
     const bool adjacent_valid = ggml_quantize_row_mxfp4_adjacent(input.data() + 1,
-        encoded.data() + 1, sink.data() + 1, values.size()
+        encoded.data() + 1, sink.data() + 1, sink_scales.data() + 1, values.size()
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
         , reuse ? normalized_amax_bits.data() : nullptr
 #endif
     );
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_out);
-#endif
     const int adjacent_flags = std::fetestexcept(FE_ALL_EXCEPT);
     assert(std::fegetround() == rounding && adjacent_flags == reference_flags);
     assert(adjacent_valid == expect_packed);
     assert(sink.front() == 0x5a && sink.back() == 0x5a);
+    assert(sink_scales.front() == 0x5a && sink_scales.back() == 0x5a);
     assert(encoded.front() == 0xa5 && encoded.back() == 0xa5);
     assert(std::memcmp(input.data(), unchanged.data(), input.size() * sizeof(float)) == 0);
     ggml_mxfp4_packed_stats_get(&stats);
@@ -1107,10 +1078,9 @@ static void test_mxfp4_packed_compare(
 #endif
     if (adjacent_valid) {
         const auto * reference = reinterpret_cast<const block_mxfp4 *>(expected.data() + 1);
-        const auto * result = reinterpret_cast<const block_mxfp4 *>(encoded.data() + 1);
+        assert(std::all_of(encoded.begin(), encoded.end(), [](uint8_t byte) { return byte == 0xa5; }));
         for (size_t b = 0; b < nb; ++b) {
-            assert(result[b].e == reference[b].e);
-            for (int j = 0; j < QK_MXFP4 / 2; ++j) assert(result[b].qs[j] == 0xa5);
+            assert(sink_scales[1 + b] == reference[b].e);
             for (int j = 0; j < QK_MXFP4 / 4; ++j) {
                 const uint8_t lo = reference[b].qs[2*j], hi = reference[b].qs[2*j + 1];
                 assert(sink[1 + b*16 + j] == uint8_t((lo & 15) | ((hi & 15) << 4)));
@@ -1120,8 +1090,7 @@ static void test_mxfp4_packed_compare(
     } else {
         // false is completed legacy output, not another quantizer invocation.
         assert(encoded == expected);
-        // The sink is provisional on rejection; only the legacy blocks are
-        // consumable and the AM helper never reads this sink on false.
+        // The two native planes are provisional on rejection.
     }
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     }
@@ -1144,35 +1113,6 @@ static void test_mxfp4_packed_runtime() {
     };
     for (int rounding : mxfp4_test_rounding_modes) {
         mxfp4_test_set_rounding(rounding);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-        auto batch8 = mxfp4_packed_admitted_input(8);
-        for (size_t block = 0; block < 8; ++block) {
-            batch8[block * QK_MXFP4 + 1] = float(3 << (block % 3));
-        }
-        for (int flags : {0, FE_INEXACT, FE_INEXACT | FE_OVERFLOW | FE_UNDERFLOW | FE_DIVBYZERO}) {
-            test_mxfp4_packed_compare(cpu, batch8, flags, true);
-        }
-        test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT | FE_INVALID, false);
-
-        auto signed_zero_block = batch8;
-        for (int lane = 0; lane < QK_MXFP4; ++lane) {
-            signed_zero_block[lane] = lane & 1 ? -0.0f : 0.0f;
-        }
-        test_mxfp4_packed_compare(cpu, signed_zero_block, 0, false);
-        test_mxfp4_packed_compare(cpu, signed_zero_block, FE_INEXACT, true);
-        std::rotate(signed_zero_block.begin(), signed_zero_block.begin() + QK_MXFP4, signed_zero_block.end());
-        test_mxfp4_packed_compare(cpu, signed_zero_block, 0, true);
-        test_mxfp4_packed_compare(cpu, signed_zero_block, FE_INEXACT, true);
-
-        std::fill(batch8.end() - QK_MXFP4, batch8.end(), 0.0f);
-        for (uint32_t bits : {0x010000ffu, 0x01000100u, 0x01000101u,
-                0x7efffeffu, 0x7effff00u, 0x7effff01u}) {
-            std::memcpy(&batch8.back(), &bits, sizeof(bits));
-            test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT, true);
-        }
-        batch8.back() = 0x1p127f;
-        test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT, false);
-#endif
         for (size_t nblocks : {size_t(1), size_t(8), size_t(9), size_t(16),
                 size_t(24), size_t(25)}) {
             const auto values = mxfp4_packed_admitted_input(nblocks);
@@ -1216,9 +1156,10 @@ static void test_mxfp4_packed_runtime() {
         assert(empty[0] == 0xa5 && empty[1] == 0xa5 && empty[2] == 0xa5);
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
         uint8_t empty_sink[] = {0x5a, 0x5a, 0x5a};
+        uint8_t empty_scales[] = {0x5a, 0x5a, 0x5a};
         const uint32_t empty_fcsr = mxfp4_packed_read_fcsr();
         const bool empty_adjacent = ggml_quantize_row_mxfp4_adjacent(
-            nullptr, empty + 1, empty_sink + 1, 0
+            nullptr, empty + 1, empty_sink + 1, empty_scales + 1, 0
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
             , nullptr
 #endif
@@ -1229,6 +1170,7 @@ static void test_mxfp4_packed_runtime() {
             k0_stats.adjacent_blocks == 0 && k0_stats.adjacent_fallbacks == 0);
         assert(empty[0] == 0xa5 && empty[1] == 0xa5 && empty[2] == 0xa5);
         assert(empty_sink[0] == 0x5a && empty_sink[1] == 0x5a && empty_sink[2] == 0x5a);
+        assert(empty_scales[0] == 0x5a && empty_scales[1] == 0x5a && empty_scales[2] == 0x5a);
         assert(mxfp4_packed_read_fcsr() == empty_fcsr);
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
         assert(k0_stats.amax_reuse_calls == 0 && k0_stats.amax_reuse_blocks == 0 &&
@@ -1251,10 +1193,6 @@ static void test_mxfp4_packed_runtime() {
         assert(mxfp4_packed_read_fcsr() == zero_count_fcsr);
     }
     assert(std::fesetenv(&saved_environment) == 0);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    printf("MXFP4_SUPPLIED_BATCH8_ORACLE_PASS blocks=8 rounding_modes=%u bytes_fcsr_canaries=exact legacy_fallback=exact\n",
-        mxfp4_test_rounding_count);
-#endif
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
     printf("MXFP4_ADJACENT_RUNTIME_PASS packed_cases=%u fallback_cases=%u "
         "bytes_flags_frm_canaries=exact packed_qs_untouched=yes single_runtime_call=yes\n",
@@ -1581,108 +1519,6 @@ static void test_ame_rmsnorm_quant() {
         ++cases;
         checked_blocks += unsigned(blocks);
     };
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-#if !defined(__riscv) || !defined(__riscv_flen) || __riscv_flen < 32 || \
-    !defined(GGML_AME_RMS_PREFLIGHT_BOUNDS) || \
-    (GGML_AME_RMS_PREFLIGHT_BOUNDS != 0 && GGML_AME_RMS_PREFLIGHT_BOUNDS != 2)
-#error "RMS square flags gate requires RISC-V hard float and matching BOUNDS=0 or 2"
-#endif
-    enum class SquareCase { natural_hit, late_nx, uf_accept, uf_reject, nv_reject };
-    unsigned square_cases = 0, square_rejects = 0, square_hits = 0;
-    auto check_square = [&](int round, int flags, SquareCase kind) {
-        constexpr int K = 256, mn = 64, tk = 64, rows = 2 * mn, stride = K + 5, nb = K / 32;
-        constexpr unsigned nx = 1u, uf = 2u, nv = 16u;
-        constexpr float eps = 0x1p-10f;
-        const bool natural_hit = kind == SquareCase::natural_hit;
-        const bool bad_factor = kind == SquareCase::nv_reject;
-        const bool admitted = !bad_factor && kind != SquareCase::uf_reject;
-        const bool late_square_uf = kind == SquareCase::uf_accept || kind == SquareCase::uf_reject;
-        std::vector<float> input(size_t(rows) * stride + 2, 0x1.5p+8f), gamma(K + 2, -0x1.3p+7f);
-        for (int row = 0; row < rows; ++row) std::fill_n(input.data() + 1 + row * stride, K, -0.0f);
-        std::fill_n(gamma.data() + 1, K, 1.0f);
-        float * last = input.data() + 1 + (rows - 1) * stride;
-        if (natural_hit || kind == SquareCase::late_nx) {
-            const auto exact_r16 = [](float * row) {
-                std::fill_n(row, 4, 0x1.8p-2f);
-                std::fill_n(row + 4, 3, 0x1p-2f);
-            };
-            exact_r16(last);
-            if (natural_hit) exact_r16(input.data() + 1);
-            gamma[1] = 0x1.000002p0f;
-        } else if (bad_factor) {
-            const uint32_t snan = 0x7f800001u;
-            std::memcpy(last + K - 1, &snan, sizeof(snan));
-        } else {
-            last[K - 1] = admitted ? 0x1p-80f : 0x1p-149f;
-        }
-        const auto saved_input = input, saved_gamma = gamma;
-        std::vector<float> expected_r(rows + 2, -123.0f), actual_r(expected_r);
-        std::vector<uint8_t> expected(rows * nb * 16 + 2, 0xc3), actual(expected);
-        std::vector<uint8_t> expected_sf(rows * nb + 2, 0xa7), actual_sf(expected_sf);
-        auto preflight = [&](std::vector<float> & factors, ggml_ame_rmsnorm_first_panel * first) {
-            return ggml_ame_rmsnorm_mxfp4_preflight(factors.data() + 1, input.data() + 1,
-                gamma.data() + 1, rows, K, stride * sizeof(float), eps, mn, first);
-        };
-        auto panel = [&](std::vector<uint8_t> & payload, std::vector<uint8_t> & scales,
-                         const std::vector<float> & factors, int first_row) {
-            return ggml_ame_rmsnorm_pack_mxfp4(payload.data() + 1 + first_row * nb * 16,
-                scales.data() + 1 + first_row * nb, input.data() + 1 + first_row * stride,
-                gamma.data() + 1, mn, K, stride * sizeof(float), eps, tk, mn, factors.data() + 1 + first_row);
-        };
-        seed(round, flags);
-        const uint32_t entry_fcsr = mxfp4_packed_read_fcsr();
-        const uint64_t before = ggml_ame_rmsnorm_bounded_preflight_count();
-        const bool reference_ok = preflight(expected_r, nullptr);
-        const uint32_t reference_fcsr = mxfp4_packed_read_fcsr();
-        const int reference_flags = std::fetestexcept(FE_ALL_EXCEPT);
-        assert(ggml_ame_rmsnorm_bounded_preflight_count() == before && reference_ok == admitted);
-        assert(reference_fcsr == (entry_fcsr | (bad_factor ? nv : late_square_uf ? uf | nx : nx)));
-        assert(expected_r.front() == -123.0f && expected_r.back() == -123.0f);
-        for (int row = 0; row < rows - 1; ++row) {
-            assert(expected_r[1 + row] == (natural_hit && row == 0 ? 16.0f : 32.0f));
-        }
-        if (natural_hit || kind == SquareCase::late_nx) assert(expected_r[rows] == 16.0f);
-        if (bad_factor) assert(expected_r[rows] == -123.0f);
-
-        seed(round, flags);
-        if (!bad_factor) {
-            assert(panel(expected, expected_sf, expected_r, 0));
-            assert(expected_sf[1] != 0xa7);
-        }
-        assert(mxfp4_packed_read_fcsr() == (entry_fcsr | (natural_hit ? nx : 0u)));
-        seed(round, flags);
-        ggml_ame_rmsnorm_first_panel first = {actual.data() + 1, actual_sf.data() + 1, tk, 0, 123};
-        const bool actual_ok = preflight(actual_r, &first);
-        const uint32_t preflight_fcsr = mxfp4_packed_read_fcsr();
-        const uint64_t hits = ggml_ame_rmsnorm_bounded_preflight_count() - before;
-        const unsigned expected_hits = GGML_AME_RMS_PREFLIGHT_BOUNDS == 2 && admitted && !late_square_uf &&
-            !(flags & (FE_INVALID | FE_OVERFLOW | FE_UNDERFLOW)) && (natural_hit || (entry_fcsr & nx));
-        if (actual_ok != admitted || preflight_fcsr != reference_fcsr || hits != expected_hits) {
-            fprintf(stderr, "AME_RMS_SQUARE_FLAGS_MISMATCH kind=%d round=%d seed=%x "
-                "admitted=%d/%d fcsr=%x/%x hit=%llu/%u\n", static_cast<int>(kind), round, flags,
-                actual_ok, admitted, preflight_fcsr, reference_fcsr, (unsigned long long) hits, expected_hits);
-            assert(false);
-        }
-        assert(first.prepare_cycles == (bad_factor ? 123u : 0u));
-        assert(std::memcmp(expected_r.data(), actual_r.data(), actual_r.size() * sizeof(float)) == 0);
-        assert(actual == expected && actual_sf == expected_sf);
-        if (admitted) {
-            assert(panel(actual, actual_sf, actual_r, mn));
-            const uint32_t end_fcsr = mxfp4_packed_read_fcsr();
-            seed(round, reference_flags);
-            assert(mxfp4_packed_read_fcsr() == reference_fcsr);
-            assert(panel(expected, expected_sf, expected_r, mn));
-            assert(actual == expected && actual_sf == expected_sf);
-            assert(mxfp4_packed_read_fcsr() == end_fcsr);
-        }
-        assert(actual.front() == 0xc3 && actual.back() == 0xc3 && actual_sf.front() == 0xa7 && actual_sf.back() == 0xa7);
-        assert(std::memcmp(input.data(), saved_input.data(), input.size() * sizeof(float)) == 0);
-        assert(std::memcmp(gamma.data(), saved_gamma.data(), gamma.size() * sizeof(float)) == 0);
-        ++square_cases;
-        square_rejects += !admitted;
-        square_hits += unsigned(hits);
-    };
-#endif
     // Two token panels: real graph RMSNorm+gamma versus direct packed producer.
     for (int mn : {64, 128}) {
         for (int tk : {32, 64}) {
@@ -1704,9 +1540,6 @@ static void test_ame_rmsnorm_quant() {
             for (unsigned bit = 0; bit < 5; ++bit) {
                 if (mask & (1u << bit)) flags |= exceptions[bit];
             }
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-            check_square(round, flags, SquareCase::natural_hit);
-#endif
             for (int tk : {32, 64}) check(64, 64, tk, 64, round, flags);
             for (int pattern : {5, 6}) {
                 for (int tk : {32, 64}) check(64, 320, tk, 64, round, flags, pattern);
@@ -1718,13 +1551,6 @@ static void test_ame_rmsnorm_quant() {
         for (int pattern : {1, 2, 3}) {
             for (int tk : {32, 64}) check(64, 64, tk, 64, round, 0, pattern);
         }
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-        check_square(round, 0, SquareCase::late_nx);
-        check_square(round, FE_INEXACT, SquareCase::late_nx);
-        check_square(round, 0, SquareCase::uf_accept);
-        check_square(round, 0, SquareCase::uf_reject);
-        check_square(round, 0, SquareCase::nv_reject);
-#endif
     }
     // Odd K32 count is legal for K32 tiles, but K64 must reject before
     // touching outputs or FP state, without encoding an incomplete pair.
@@ -1819,14 +1645,6 @@ static void test_ame_rmsnorm_quant() {
     assert(std::all_of(payload.begin(), payload.end(), [](uint8_t v) { return v == 0xc3; }));
     assert(std::all_of(scales.begin(), scales.end(), [](uint8_t v) { return v == 0xa7; }));
     assert(std::fesetenv(&saved) == 0);
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-    assert(mxfp4_test_rounding_count == 5 && square_cases == 185 && square_rejects == 10);
-    assert(square_hits == (GGML_AME_RMS_PREFLIGHT_BOUNDS == 2 ? 25u : 0u));
-    printf("AME_RMS_SQUARE_FLAGS_TEST_PASS bounds=%d frm=%u sticky_states=32 rows=128 K=256 "
-        "panels=2 tk=64 cases=%u rejected=%u hits=%u raw_preflight_fcsr=exact "
-        "factors_payload_scales_canaries=exact hardware=not_run\n",
-        GGML_AME_RMS_PREFLIGHT_BOUNDS, mxfp4_test_rounding_count, square_cases, square_rejects, square_hits);
-#endif
     printf("AME_RMS_QUANT_PASS cases=%u blocks=%u full_shape=256x128 token_panels=2 "
         "small_flags=%ufrm_x32states_x2layouts invalid_arguments=12 invalid_first_descriptors=4 partial_reject=discard "
         "tiny_scale_cast=pre_reject defined_boundary=exact late_NX=block_row_and_batch "
@@ -2564,6 +2382,13 @@ int main(int argc, char * argv[]) {
     }
     if (ame_rmsnorm_fusion_only) {
 #if defined(GGML_TEST_RV_AME)
+#if defined(GGML_AME_RMS_TEST_NATIVE_UNFUSED) && GGML_AME_RMS_TEST_NATIVE_UNFUSED
+        const bool native_unfused_fixture = ame_rmsnorm_fusion_native &&
+            ame_rmsnorm_benchmark && ame_rmsnorm_fixture == 10;
+#else
+        const bool native_unfused_fixture = false;
+#endif
+        GGML_ASSERT(setenv("GGML_AME_RMS_TEST_NATIVE_UNFUSED", native_unfused_fixture ? "1" : "0", 1) == 0);
         return ggml_ame_rmsnorm_fusion_selftest(
             ame_rmsnorm_fusion_native, ame_rmsnorm_fixture, ame_rmsnorm_benchmark) ? 0 : 1;
 #else

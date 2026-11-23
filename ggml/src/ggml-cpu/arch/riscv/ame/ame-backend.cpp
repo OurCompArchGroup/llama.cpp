@@ -1707,6 +1707,10 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
     // allocator/abort/OOM acceptance remains in the native-only entry.
     // Never change the historical fixtures' validation schedule.
     const bool screen_only = benchmark && target_fixture;
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+    const bool expect_unfused_adjacent = run_native && screen_only &&
+        ame_backend_env_enabled("GGML_AME_RMS_TEST_NATIVE_UNFUSED");
+#endif
     const bool chunk_fixture = fixture >= 4 && fixture <= 9;
     const int K = target_fixture ? 256 : chunk_fixture ? (fixture >= 7 ? 64 : 32) : 128;
     const int nb = K / 32;
@@ -1977,13 +1981,20 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
                 actual_first_panels == unsigned(fused) && actual_callbacks == expected_callbacks &&
                 actual_visits == expected_chunks && actual_chunks == expected_chunks && actual_drains == 0;
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+            const uint64_t off_calls = expect_unfused_adjacent ? uint64_t(N) * ((nb + 7) / 8) : 0;
+            const uint64_t off_blocks = expect_unfused_adjacent ? uint64_t(N) * nb : 0;
             ok &= packed_phase.adjacent_fallbacks == 0 && (fused ?
                 packed_phase.adjacent_calls > 0 && packed_phase.adjacent_blocks > 0 :
-                packed_phase.adjacent_calls == 0 && packed_phase.adjacent_blocks == 0);
+                packed_phase.adjacent_calls == off_calls && packed_phase.adjacent_blocks == off_blocks);
+            if (!fused && expect_unfused_adjacent) {
+                ok &= packed_phase.calls == off_calls && packed_phase.packed_calls == off_calls &&
+                    packed_phase.packed_blocks == off_blocks && packed_phase.qualification_fallbacks == 0 &&
+                    packed_phase.packed_nv_fallbacks == 0;
+            }
 #endif
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-            ok &= packed_phase.amax_reuse_calls == packed_phase.adjacent_calls &&
-                packed_phase.amax_reuse_blocks == packed_phase.adjacent_blocks &&
+            ok &= packed_phase.amax_reuse_calls == (fused ? packed_phase.adjacent_calls : 0) &&
+                packed_phase.amax_reuse_blocks == (fused ? packed_phase.adjacent_blocks : 0) &&
                 packed_phase.amax_reuse_fallbacks == 0;
 #endif
             const bool prior_ok = ok;
@@ -2183,11 +2194,18 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
 #endif
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
                 fprintf(stderr, "AME_RMS_ADJACENT_OUTPUT mode=%s phase=%s sample=%d "
-                    "calls=%llu packed_blocks=%llu fallbacks=%llu generic_layout_unchanged=yes\n",
+                    "calls=%llu packed_blocks=%llu fallbacks=%llu generic_layout_unchanged=yes "
+                    "quant_calls=%llu vector_calls=%llu vector_blocks=%llu "
+                    "qualification_fallbacks=%llu packed_nv_fallbacks=%llu\n",
                     mode, phase, sample,
                     (unsigned long long) packed_phase.adjacent_calls,
                     (unsigned long long) packed_phase.adjacent_blocks,
-                    (unsigned long long) packed_phase.adjacent_fallbacks);
+                    (unsigned long long) packed_phase.adjacent_fallbacks,
+                    (unsigned long long) packed_phase.calls,
+                    (unsigned long long) packed_phase.packed_calls,
+                    (unsigned long long) packed_phase.packed_blocks,
+                    (unsigned long long) packed_phase.qualification_fallbacks,
+                    (unsigned long long) packed_phase.packed_nv_fallbacks);
 #endif
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
                 fprintf(stderr, "AME_RMS_AMAX_REUSE mode=%s phase=%s sample=%d "

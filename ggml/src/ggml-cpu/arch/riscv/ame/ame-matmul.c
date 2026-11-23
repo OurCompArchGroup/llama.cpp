@@ -1254,7 +1254,7 @@ void ggml_ame_mx_prepare_activation(
     // Prepare once per worker/op, not once per M tile. Deliberately no
     // persistent activation cache until graph/write identity is proven.
     if (format == AME_MCFG_MXFP4) {
-        // Amortize the existing CPU entry over bounded adjacent K32 blocks.
+        // Quantize bounded batches of adjacent K32 blocks.
         // The quantizer still chooses an independent scale for every block.
         // Preserve legacy bytes/flags, not a new RNE profile; the activation
         // precision change from usual Q8 to MXFP4 remains explicit opt-in.
@@ -1262,6 +1262,10 @@ void ggml_ame_mx_prepare_activation(
         // destination: scatter each group through the canonical index/packer.
         enum { batch_blocks = 8 };
         block_mxfp4 encoded[batch_blocks];
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+        uint8_t packed_adjacent[batch_blocks * AME_MXFP4_K / 2];
+        uint8_t packed_scales[batch_blocks];
+#endif
         const int groups = tile_k / AME_MXFP4_K;
         for (int64_t nt = 0; nt < N / tile_mn; ++nt) {
             for (int row = 0; row < tile_mn; ++row) {
@@ -1269,10 +1273,28 @@ void ggml_ame_mx_prepare_activation(
                 const float * x = (const float *) ((const char *) src1 + logical_row * src1_stride);
                 for (int64_t kb = 0; kb < nb; kb += batch_blocks) {
                     const int count = (int) (nb - kb < batch_blocks ? nb - kb : batch_blocks);
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+                    const bool adjacent_valid = ggml_quantize_row_mxfp4_adjacent(
+                        x + kb * AME_MXFP4_K, encoded, packed_adjacent, packed_scales,
+                        count * AME_MXFP4_K
+#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
+                        , NULL
+#endif
+                    );
+#else
                     quantize_row_mxfp4(x + kb * AME_MXFP4_K, encoded, count * AME_MXFP4_K);
+#endif
                     for (int offset = 0; offset < count; offset += groups) {
                         const size_t index = ggml_ame_mx_packed_block_index(
                             logical_row, (size_t) (kb + offset), (size_t) nb, tile_k, tile_mn);
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+                        if (adjacent_valid) {
+                            memcpy(b + index * block_bytes, packed_adjacent + offset * block_bytes,
+                                groups * block_bytes);
+                            memcpy(sb + index, packed_scales + offset, (size_t) groups);
+                            continue;
+                        }
+#endif
                         GGML_ASSERT(ggml_ame_pack_mxfp4_blocks(
                             b + index * block_bytes, sb + index, encoded + offset, groups));
                     }

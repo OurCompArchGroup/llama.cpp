@@ -66,11 +66,12 @@ void ggml_mxfp4_packed_stats_reset(void);
 void ggml_mxfp4_packed_stats_get(struct ggml_mxfp4_packed_stats * result);
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
 // Same runtime quantizer and one real fallback, with its normal input/size
-// preconditions. true: blocks[].e and adjacent[k/2] are valid; qs is untouched.
-// false: the complete legacy blocks are valid; adjacent bytes are provisional
-// and must not be consumed. This is NOT a request to quantize again.
+// preconditions. On true, adjacent and scales hold the native payload (k/2
+// bytes) and E8M0 plane (k/QK_MXFP4 bytes); legacy blocks are untouched.
+// On false, only the complete legacy blocks are valid. Do not quantize again.
 bool ggml_quantize_row_mxfp4_adjacent(const float * GGML_RESTRICT x,
-    void * GGML_RESTRICT blocks, uint8_t * GGML_RESTRICT adjacent, int64_t k
+    void * GGML_RESTRICT blocks, uint8_t * GGML_RESTRICT adjacent,
+    uint8_t * GGML_RESTRICT scales, int64_t k
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     // Internal same-call metadata ONLY: k/32 exact sign-cleared maxima of x,
     // produced by the RMS helper's two-rounded weighted lanes. No cached or

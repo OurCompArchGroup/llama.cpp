@@ -149,12 +149,7 @@ static bool ame_rmsnorm_block(
     // Retain BOTH F32 roundings. Only fuse the scratch traffic, never r*gamma
     // or the ordered RMS reduction. The quantizer still consumes this block.
     for (size_t lane = 0; lane < QK_MXFP4;) {
-#if defined(GGML_AME_RMS_FIXED_K32_VL) && GGML_AME_RMS_FIXED_K32_VL && \
-        QK_MXFP4 == 32 && defined(__riscv_v_min_vlen) && __riscv_v_min_vlen >= 128
-        const size_t vl = QK_MXFP4;
-#else
         const size_t vl = __riscv_vsetvl_e32m8(QK_MXFP4 - lane);
-#endif
         const vfloat32m8_t vx = __riscv_vle32_v_f32m8(x + lane, vl);
         const vfloat32m8_t scaled = __riscv_vfmul_vf_f32m8(vx, r, vl);
         const vfloat32m8_t vg = __riscv_vle32_v_f32m8(gamma + lane, vl);
@@ -354,6 +349,7 @@ bool ggml_ame_rmsnorm_pack_mxfp4(
     block_mxfp4 encoded[batch_blocks];
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
     uint8_t packed_adjacent[batch_blocks * QK_MXFP4 / 2];
+    uint8_t packed_scales[batch_blocks];
 #endif
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     // Same-call scratch, never cached across rows, generations or source writes.
@@ -392,7 +388,7 @@ bool ggml_ame_rmsnorm_pack_mxfp4(
             bool adjacent_valid = false;
             if (quantize == quantize_row_mxfp4) {
                 adjacent_valid = ggml_quantize_row_mxfp4_adjacent(
-                    normalized, encoded, packed_adjacent, count * QK_MXFP4
+                    normalized, encoded, packed_adjacent, packed_scales, count * QK_MXFP4
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
                     , normalized_amax_bits
 #endif
@@ -405,7 +401,11 @@ bool ggml_ame_rmsnorm_pack_mxfp4(
 #else
             quantize(normalized, encoded, count * QK_MXFP4);
 #endif
-            if (!ggml_ame_mxfp4_native_domain(encoded, count)) {
+            if (
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+                !adjacent_valid &&
+#endif
+                !ggml_ame_mxfp4_native_domain(encoded, count)) {
                 return false;
             }
 #if defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE
@@ -418,9 +418,7 @@ bool ggml_ame_rmsnorm_pack_mxfp4(
                 if (adjacent_valid) {
                     memcpy(payload + index * 16, packed_adjacent + offset * 16,
                         (size_t) groups * 16);
-                    for (int group = 0; group < groups; ++group) {
-                        scales[index + group] = encoded[offset + group].e;
-                    }
+                    memcpy(scales + index, packed_scales + offset, (size_t) groups);
                     continue;
                 }
 #endif

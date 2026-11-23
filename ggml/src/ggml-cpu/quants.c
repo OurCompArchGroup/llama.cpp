@@ -331,7 +331,7 @@ static void mxfp4_adjacent_to_split_half(
 static bool quantize_row_mxfp4_packed(
     const float * x, block_mxfp4 * blocks, int64_t nb
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-    , uint8_t * adjacent_output
+    , uint8_t * adjacent_output, uint8_t * scale_output
 #endif
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     , const uint32_t * normalized_amax_bits
@@ -363,7 +363,12 @@ static bool quantize_row_mxfp4_packed(
     const uint64_t qualify_begin = mxfp4_packed_phase_tick(0.0f, 0);
 #endif
     for (int64_t i = 0; i < nb; i += MXFP4_PACKED_BATCH) {
-        uint8_t scales[MXFP4_PACKED_BATCH];
+        uint8_t scale_scratch[MXFP4_PACKED_BATCH];
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+        uint8_t * const scales = scale_output == NULL ? scale_scratch : scale_output + i;
+#else
+        uint8_t * const scales = scale_scratch;
+#endif
         const int count = (int) (nb - i < MXFP4_PACKED_BATCH
             ? nb - i : MXFP4_PACKED_BATCH);
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
@@ -382,8 +387,13 @@ static bool quantize_row_mxfp4_packed(
             ++mxfp4_packed_stats_state.qualification_fallbacks;
             return false;
         }
-        for (int offset = 0; offset < count; ++offset) {
-            blocks[i + offset].e = scales[offset];
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+        if (scale_output == NULL)
+#endif
+        {
+            for (int offset = 0; offset < count; ++offset) {
+                blocks[i + offset].e = scales[offset];
+            }
         }
     }
 #if defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE
@@ -393,12 +403,20 @@ static bool quantize_row_mxfp4_packed(
 #endif
 
     for (int64_t i = 0; i < nb; i += MXFP4_PACKED_BATCH) {
-        uint8_t scales[MXFP4_PACKED_BATCH];
+        uint8_t scale_scratch[MXFP4_PACKED_BATCH];
         uint8_t adjacent[MXFP4_PACKED_BATCH * QK_MXFP4 / 2];
         const int count = (int) (nb - i < MXFP4_PACKED_BATCH
             ? nb - i : MXFP4_PACKED_BATCH);
-        for (int offset = 0; offset < count; ++offset) {
-            scales[offset] = blocks[i + offset].e;
+#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
+        const uint8_t * const scales = scale_output == NULL ? scale_scratch : scale_output + i;
+        if (scale_output == NULL)
+#else
+        const uint8_t * const scales = scale_scratch;
+#endif
+        {
+            for (int offset = 0; offset < count; ++offset) {
+                scale_scratch[offset] = blocks[i + offset].e;
+            }
         }
 #if defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE
         const uint64_t encode_begin = mxfp4_packed_phase_tick(0.0f, 0);
@@ -452,7 +470,8 @@ static bool quantize_row_mxfp4_packed(
 // One body owns both the ordinary format and the opt-in packed sink. Failed
 // packed qualification proceeds into the ORIGINAL fallback below exactly once.
 static bool quantize_row_mxfp4_output(const float * GGML_RESTRICT x,
-    void * GGML_RESTRICT y, int64_t k, uint8_t * GGML_RESTRICT adjacent_output
+    void * GGML_RESTRICT y, int64_t k, uint8_t * GGML_RESTRICT adjacent_output,
+    uint8_t * GGML_RESTRICT scale_output
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     , const uint32_t * GGML_RESTRICT normalized_amax_bits
 #endif
@@ -472,7 +491,7 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
         if (normalized_amax_bits != NULL) ++mxfp4_packed_stats_state.amax_reuse_calls;
 #endif
-        if (quantize_row_mxfp4_packed(x, blocks, nb, adjacent_output
+        if (quantize_row_mxfp4_packed(x, blocks, nb, adjacent_output, scale_output
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
                 , normalized_amax_bits
 #endif
@@ -645,7 +664,7 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 
 #if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    (void) quantize_row_mxfp4_output(x, y, k, NULL
+    (void) quantize_row_mxfp4_output(x, y, k, NULL, NULL
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
         , NULL
 #endif
@@ -653,12 +672,14 @@ void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
 }
 
 bool ggml_quantize_row_mxfp4_adjacent(const float * GGML_RESTRICT x,
-    void * GGML_RESTRICT blocks, uint8_t * GGML_RESTRICT adjacent, int64_t k
+    void * GGML_RESTRICT blocks, uint8_t * GGML_RESTRICT adjacent,
+    uint8_t * GGML_RESTRICT scales, int64_t k
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
     , const uint32_t * GGML_RESTRICT normalized_amax_bits
 #endif
 ) {
-    return quantize_row_mxfp4_output(x, blocks, k, adjacent
+    GGML_ASSERT(adjacent != NULL && scales != NULL);
+    return quantize_row_mxfp4_output(x, blocks, k, adjacent, scales
 #if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
         , normalized_amax_bits
 #endif
