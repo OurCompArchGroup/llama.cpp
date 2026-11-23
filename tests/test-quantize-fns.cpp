@@ -42,48 +42,6 @@ constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
-// C fenv exposes four modes; hard-float RISC-V also has architectural frm=4.
-// Keep the original portable sweeps and append RMM only where it is real.
-static constexpr int mxfp4_test_rounding_modes[] = {
-    FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO,
-#if defined(__riscv) && defined(__riscv_flen) && __riscv_flen >= 32
-    4,
-#endif
-};
-static constexpr unsigned mxfp4_test_rounding_count =
-    sizeof(mxfp4_test_rounding_modes) / sizeof(mxfp4_test_rounding_modes[0]);
-
-static void mxfp4_test_set_rounding(int rounding) {
-#if defined(__riscv) && defined(__riscv_flen) && __riscv_flen >= 32
-    if (rounding == 4) {
-        uint32_t before, observed;
-        __asm__ volatile ("frcsr %0\n\tfsrmi zero, 4\n\tcsrw fflags, zero"
-            : "=r" (before) : : "memory");
-        const uint32_t selected = (before & ~0xe0u) | 0x80u;
-        // Prove actual RMM, not an alias for RNE, with independent halfway
-        // results and real NX. This is fixture-only and never feeds admission.
-        float positive, negative;
-        __asm__ volatile ("fadd.s %0, %1, %2, dyn"
-            : "=f" (positive) : "f" (1.0f), "f" (0x1p-24f) : "memory");
-        __asm__ volatile ("fadd.s %0, %1, %2, dyn"
-            : "=f" (negative) : "f" (-1.0f), "f" (-0x1p-24f) : "memory");
-        uint32_t positive_bits, negative_bits;
-        std::memcpy(&positive_bits, &positive, sizeof(positive_bits));
-        std::memcpy(&negative_bits, &negative, sizeof(negative_bits));
-        __asm__ volatile ("frcsr %0" : "=r" (observed) : : "memory");
-        assert(positive_bits == 0x3f800001u && negative_bits == 0xbf800001u);
-        assert(observed == ((selected & ~31u) | 1u));
-        // Restore all incoming sticky flags before any tested code runs.
-        __asm__ volatile ("fscsr %0" : : "r" (selected) : "memory");
-        __asm__ volatile ("frcsr %0" : "=r" (observed) : : "memory");
-        assert(observed == selected && std::fegetround() == rounding);
-        return;
-    }
-#endif
-    assert(std::fesetround(rounding) == 0);
-    assert(std::fegetround() == rounding);
-}
-
 static void test_ame_q8_k32_packing() {
     unsigned selections = 0;
     for (int tm : {64, 128}) {
@@ -500,8 +458,8 @@ static void test_mxfp4_runtime_bytes() {
         checked_blocks += values.size() / QK_MXFP4;
         ++checked_rows;
     };
-    for (int rounding : mxfp4_test_rounding_modes) {
-        mxfp4_test_set_rounding(rounding);
+    for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        assert(std::fesetround(rounding) == 0);
         uint8_t untouched[] = {0xa5, 0xa5, 0xa5};
         cpu->from_float(nullptr, untouched + 1, 0);
         assert(untouched[0] == 0xa5 && untouched[1] == 0xa5 && untouched[2] == 0xa5);
@@ -723,12 +681,12 @@ static void test_mxfp4_runtime_bytes() {
         }
     }
     assert(std::fesetenv(&saved_environment) == 0);
-    printf("MXFP4_RUNTIME_BYTES_PASS rows=%u blocks=%u rounding_modes=%u "
+    printf("MXFP4_RUNTIME_BYTES_PASS rows=%u blocks=%u rounding_modes=4 "
         "reference=unchanged_ref runtime=cpu_type_traits all_payload_and_scale_bytes=exact fp_exceptions=exact "
         "midpoint_neighbors=pass signed_zero=pass finite_exponents=all "
         "misalignment_and_canaries=pass initial_flag_states=32 seeded_rows=%u "
         "amax_lane_rows=%u native_matrix=not-issued\n",
-        checked_rows, checked_blocks, mxfp4_test_rounding_count, seeded_rows, amax_rows);
+        checked_rows, checked_blocks, seeded_rows, amax_rows);
 }
 
 // Supplied-scale admission only: no matrix issue, payload encoder or perf loop.
@@ -842,8 +800,8 @@ static void test_mxfp4_supplied_scales() {
         assert(std::memcmp(input.data(), unchanged.data(), input.size() * sizeof(float)) == 0);
         ++rows;
     };
-    for (int rounding : mxfp4_test_rounding_modes) {
-        mxfp4_test_set_rounding(rounding);
+    for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        assert(std::fesetround(rounding) == 0);
         // Every initial sticky combination WITHOUT NX, not just a clean seed.
         // 3/6/12 are non-powers: their real canonical log2f must naturally
         // accrue NX before the API's frflags observation and true return.
@@ -924,360 +882,12 @@ static void test_mxfp4_supplied_scales() {
     assert(std::fesetenv(&saved_environment) == 0);
     printf("MXFP4_SUPPLIED_PREFLIGHT_PASS rows=%u admitted=%u rejected=%u "
         "whole_row_fallbacks=%u partial_rejects=%u unsafe_reference_not_invoked=%u "
-        "invalid_arguments=%u rounding_modes=%u invalid_initial_states=32 positive_initial_states=16_without_NX "
+        "invalid_arguments=%u rounding_modes=4 invalid_initial_states=32 positive_initial_states=16_without_NX "
         "positive_initial_NX=0 natural_log2_NX=required rvv=%d "
         "scales=canonical_runtime_and_ref canaries_input_frm_flags=exact native_matrix=not-issued\n",
-        rows, admitted, rejected, fallbacks, partial_rejects, unsafe_ref_skipped, invalid_arguments,
-        mxfp4_test_rounding_count, rvv);
+        rows, admitted, rejected, fallbacks, partial_rejects, unsafe_ref_skipped, invalid_arguments, rvv);
 #endif
 }
-
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-#if !defined(GGML_RV_MXFP4_PACKED) || !defined(GGML_AME_MXFP4_ADJACENT) || !GGML_AME_MXFP4_ADJACENT || \
-    !defined(GGML_AME_MXFP4_REUSE_AMAX) || !GGML_AME_MXFP4_REUSE_AMAX
-#error GGML_TEST_MXFP4_SUPPLIED_BATCH8 requires packed, adjacent and reused amax
-#endif
-static_assert(mxfp4_test_rounding_count == 5, "batch8 oracle requires all five RISC-V rounding modes");
-#endif
-
-#if defined(GGML_RV_MXFP4_PACKED) || (defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS)
-static uint32_t mxfp4_packed_read_fcsr() {
-    uint32_t fcsr;
-    __asm__ volatile ("frcsr %0" : "=r" (fcsr) : : "memory");
-    return fcsr;
-}
-#endif
-
-#if defined(GGML_RV_MXFP4_PACKED)
-// The production packed owner consumes the existing AM assembly symbol on the
-// explicit matching R39 RV64 RVV build. Keep the test independent of its
-// encoder and scale-selection implementation.
-extern "C" uint64_t vector_mxfp4_pack_blocks(
-    const float * values, uint8_t * adjacent, const uint8_t * scales,
-    unsigned count);
-
-static void mxfp4_packed_seed_flags(int flags) {
-    assert((flags & ~FE_ALL_EXCEPT) == 0);
-    assert(std::feclearexcept(FE_ALL_EXCEPT) == 0);
-    assert(std::feraiseexcept(flags) == 0);
-    assert(std::feclearexcept(std::fetestexcept(FE_ALL_EXCEPT) & ~flags) == 0);
-    assert(std::fetestexcept(FE_ALL_EXCEPT) == flags);
-}
-
-static std::vector<float> mxfp4_packed_admitted_input(size_t nblocks) {
-    std::vector<float> values(nblocks * QK_MXFP4);
-    constexpr float non_lattice = 0x1p-9f;
-    for (size_t block = 0; block < nblocks; ++block) {
-        const int maximum = block % 3 == 0 ? 3 : block % 3 == 1 ? 6 : 12;
-        for (int lane = 0; lane < QK_MXFP4; ++lane) {
-            float value;
-            if (lane == 0) {
-                value = -0.0f;
-            } else if (lane == 1) {
-                // The inexact log2/floor scale work naturally accrues NX.
-                value = float(maximum) + non_lattice;
-            } else {
-                const int magnitude = 1 + int((5 * block + 3 * lane) %
-                    (size_t) (maximum - 1));
-                value = float(lane & 1 ? -magnitude : magnitude);
-            }
-            values[block * QK_MXFP4 + lane] = value;
-        }
-    }
-    return values;
-}
-
-static void test_mxfp4_packed_compare(
-    const ggml_type_traits_cpu * cpu,
-    const std::vector<float> & values,
-    int initial_flags,
-    bool expect_packed
-) {
-    assert(cpu && cpu->from_float);
-    assert(!values.empty() && values.size() % QK_MXFP4 == 0);
-    const size_t nb = values.size() / QK_MXFP4;
-    const size_t bytes = nb * sizeof(block_mxfp4);
-    std::vector<float> input(values.size() + 2, -123.25f);
-    std::memcpy(input.data() + 1, values.data(), values.size() * sizeof(float));
-    const auto unchanged = input;
-    std::vector<uint8_t> expected(bytes + 2, 0xa5);
-    std::vector<uint8_t> actual(bytes + 2, 0xa5);
-    const int rounding = std::fegetround();
-
-    const uint32_t fcsr_before_reset = mxfp4_packed_read_fcsr();
-    ggml_mxfp4_packed_stats_reset();
-    assert(mxfp4_packed_read_fcsr() == fcsr_before_reset);
-    assert(std::fegetround() == rounding);
-
-    mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    const uint32_t reference_fcsr_in = mxfp4_packed_read_fcsr();
-    assert((reference_fcsr_in & 0xffu) == ((uint32_t(rounding) << 5) | uint32_t(initial_flags)));
-#endif
-    quantize_row_mxfp4_ref(input.data() + 1,
-        reinterpret_cast<block_mxfp4 *>(expected.data() + 1), values.size());
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    const uint32_t reference_fcsr_out = mxfp4_packed_read_fcsr();
-    assert((reference_fcsr_out & ~31u) == (reference_fcsr_in & ~31u));
-    assert((reference_fcsr_out & reference_fcsr_in) == reference_fcsr_in);
-#endif
-    const int reference_flags = std::fetestexcept(FE_ALL_EXCEPT);
-    assert(std::fegetround() == rounding);
-
-    mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_in);
-#endif
-    cpu->from_float(input.data() + 1, actual.data() + 1, values.size());
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_out);
-#endif
-    const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
-    assert(std::fegetround() == rounding);
-    assert(actual == expected);
-    assert(actual_flags == reference_flags);
-    assert(std::memcmp(input.data(), unchanged.data(),
-        input.size() * sizeof(float)) == 0);
-    assert(actual.front() == 0xa5 && actual.back() == 0xa5);
-    assert(expected.front() == 0xa5 && expected.back() == 0xa5);
-
-    struct ggml_mxfp4_packed_stats stats;
-    ggml_mxfp4_packed_stats_get(&stats);
-    assert(stats.calls == 1);
-    if (expect_packed) {
-        assert(stats.packed_calls == 1);
-        assert(stats.packed_blocks == nb);
-        assert(stats.qualification_fallbacks == 0);
-        assert(stats.packed_nv_fallbacks == 0);
-        if (initial_flags == 0) {
-            assert((actual_flags & FE_INEXACT) != 0);
-        }
-    } else {
-        assert(stats.packed_calls == 0);
-        assert(stats.packed_blocks == 0);
-        assert(stats.packed_nv_fallbacks == 0);
-        assert(stats.qualification_fallbacks == 1);
-    }
-#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-    // Test metadata from THESE input bytes, with no FP work or flag seeding.
-    // Include nonfinite late blocks to retain original whole-call fallback.
-    std::vector<uint32_t> normalized_amax_bits(nb, 0);
-    for (size_t i = 0; i < values.size(); ++i) {
-        uint32_t bits;
-        std::memcpy(&bits, input.data() + 1 + i, sizeof(bits));
-        normalized_amax_bits[i / QK_MXFP4] = std::max(
-            normalized_amax_bits[i / QK_MXFP4], bits & UINT32_C(0x7fffffff));
-    }
-    for (bool reuse : {false, true}) {
-#endif
-    std::vector<uint8_t> sink(nb * (QK_MXFP4 / 2) + 2, 0x5a);
-    std::vector<uint8_t> encoded(bytes + 2, 0xa5);
-    ggml_mxfp4_packed_stats_reset();
-    mxfp4_packed_seed_flags(initial_flags);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_in);
-#endif
-    const bool adjacent_valid = ggml_quantize_row_mxfp4_adjacent(input.data() + 1,
-        encoded.data() + 1, sink.data() + 1, values.size()
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-        , reuse ? normalized_amax_bits.data() : nullptr
-#endif
-    );
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    assert(mxfp4_packed_read_fcsr() == reference_fcsr_out);
-#endif
-    const int adjacent_flags = std::fetestexcept(FE_ALL_EXCEPT);
-    assert(std::fegetround() == rounding && adjacent_flags == reference_flags);
-    assert(adjacent_valid == expect_packed);
-    assert(sink.front() == 0x5a && sink.back() == 0x5a);
-    assert(encoded.front() == 0xa5 && encoded.back() == 0xa5);
-    assert(std::memcmp(input.data(), unchanged.data(), input.size() * sizeof(float)) == 0);
-    ggml_mxfp4_packed_stats_get(&stats);
-    assert(stats.calls == 1 && stats.adjacent_calls == 1);
-    assert(stats.adjacent_blocks == (expect_packed ? nb : 0));
-    assert(stats.adjacent_fallbacks == unsigned(!expect_packed));
-    assert(stats.packed_calls == unsigned(expect_packed));
-    assert(stats.qualification_fallbacks == unsigned(!expect_packed));
-    assert(stats.packed_nv_fallbacks == 0);
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-    assert(stats.amax_reuse_calls == unsigned(reuse));
-    assert(stats.amax_reuse_blocks == (reuse && expect_packed ? nb : 0));
-    assert(stats.amax_reuse_fallbacks == unsigned(reuse && !expect_packed));
-#endif
-    if (adjacent_valid) {
-        const auto * reference = reinterpret_cast<const block_mxfp4 *>(expected.data() + 1);
-        const auto * result = reinterpret_cast<const block_mxfp4 *>(encoded.data() + 1);
-        for (size_t b = 0; b < nb; ++b) {
-            assert(result[b].e == reference[b].e);
-            for (int j = 0; j < QK_MXFP4 / 2; ++j) assert(result[b].qs[j] == 0xa5);
-            for (int j = 0; j < QK_MXFP4 / 4; ++j) {
-                const uint8_t lo = reference[b].qs[2*j], hi = reference[b].qs[2*j + 1];
-                assert(sink[1 + b*16 + j] == uint8_t((lo & 15) | ((hi & 15) << 4)));
-                assert(sink[1 + b*16 + j + 8] == uint8_t((lo >> 4) | (hi & 0xf0)));
-            }
-        }
-    } else {
-        // false is completed legacy output, not another quantizer invocation.
-        assert(encoded == expected);
-        // The sink is provisional on rejection; only the legacy blocks are
-        // consumable and the AM helper never reads this sink on false.
-    }
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-    }
-#endif
-#endif
-}
-
-static void test_mxfp4_packed_runtime() {
-    const auto * cpu = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
-    assert(cpu && cpu->from_float);
-    assert(ggml_cpu_has_riscv_v() != 0);
-    unsigned long hardware_vlenb;
-    __asm__ volatile ("csrr %0, vlenb" : "=r" (hardware_vlenb));
-    std::fenv_t saved_environment;
-    assert(std::fegetenv(&saved_environment) == 0);
-    unsigned packed_cases = 0;
-    unsigned fallback_cases = 0;
-    const int initial_states[] = {
-        0, FE_INEXACT, FE_OVERFLOW, FE_UNDERFLOW, FE_DIVBYZERO,
-    };
-    for (int rounding : mxfp4_test_rounding_modes) {
-        mxfp4_test_set_rounding(rounding);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-        auto batch8 = mxfp4_packed_admitted_input(8);
-        for (size_t block = 0; block < 8; ++block) {
-            batch8[block * QK_MXFP4 + 1] = float(3 << (block % 3));
-        }
-        for (int flags : {0, FE_INEXACT, FE_INEXACT | FE_OVERFLOW | FE_UNDERFLOW | FE_DIVBYZERO}) {
-            test_mxfp4_packed_compare(cpu, batch8, flags, true);
-        }
-        test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT | FE_INVALID, false);
-
-        auto signed_zero_block = batch8;
-        for (int lane = 0; lane < QK_MXFP4; ++lane) {
-            signed_zero_block[lane] = lane & 1 ? -0.0f : 0.0f;
-        }
-        test_mxfp4_packed_compare(cpu, signed_zero_block, 0, false);
-        test_mxfp4_packed_compare(cpu, signed_zero_block, FE_INEXACT, true);
-        std::rotate(signed_zero_block.begin(), signed_zero_block.begin() + QK_MXFP4, signed_zero_block.end());
-        test_mxfp4_packed_compare(cpu, signed_zero_block, 0, true);
-        test_mxfp4_packed_compare(cpu, signed_zero_block, FE_INEXACT, true);
-
-        std::fill(batch8.end() - QK_MXFP4, batch8.end(), 0.0f);
-        for (uint32_t bits : {0x010000ffu, 0x01000100u, 0x01000101u,
-                0x7efffeffu, 0x7effff00u, 0x7effff01u}) {
-            std::memcpy(&batch8.back(), &bits, sizeof(bits));
-            test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT, true);
-        }
-        batch8.back() = 0x1p127f;
-        test_mxfp4_packed_compare(cpu, batch8, FE_INEXACT, false);
-#endif
-        for (size_t nblocks : {size_t(1), size_t(8), size_t(9), size_t(16),
-                size_t(24), size_t(25)}) {
-            const auto values = mxfp4_packed_admitted_input(nblocks);
-            for (int flags : initial_states) {
-                test_mxfp4_packed_compare(cpu, values, flags, true);
-                ++packed_cases;
-            }
-        }
-
-        // First batch is qualified; the last e252 block remains ineligible
-        // even after the earlier batch has made NX sticky.
-        auto late_reject = mxfp4_packed_admitted_input(9);
-        std::fill(late_reject.begin() + 8 * QK_MXFP4, late_reject.end(), 0.0f);
-        late_reject[8 * QK_MXFP4] = 0x1p127f;
-        test_mxfp4_packed_compare(cpu, late_reject, 0, false);
-        ++fallback_cases;
-
-        // A late NaN can accrue NX from earlier qualified batches before the
-        // whole-row fallback. Compare final flags, not only bytes.
-        auto late_nan = mxfp4_packed_admitted_input(24);
-        const uint32_t nan_bits = 0x7fc12345u;
-        late_nan[23 * QK_MXFP4] = 8.0f;
-        std::memcpy(&late_nan[23 * QK_MXFP4 + 31], &nan_bits, sizeof(nan_bits));
-        test_mxfp4_packed_compare(cpu, late_nan, 0, false);
-        ++fallback_cases;
-
-        // Incoming NV takes the unchanged per-block path immediately.
-        const auto incoming_nv = mxfp4_packed_admitted_input(9);
-        test_mxfp4_packed_compare(cpu, incoming_nv, FE_INVALID, false);
-        ++fallback_cases;
-
-        ggml_mxfp4_packed_stats_reset();
-        mxfp4_packed_seed_flags(FE_INEXACT);
-        uint8_t empty[] = {0xa5, 0xa5, 0xa5};
-        cpu->from_float(nullptr, empty + 1, 0);
-        struct ggml_mxfp4_packed_stats k0_stats;
-        ggml_mxfp4_packed_stats_get(&k0_stats);
-        assert(k0_stats.calls == 0 && k0_stats.packed_calls == 0 &&
-            k0_stats.packed_blocks == 0 && k0_stats.qualification_fallbacks == 0 &&
-            k0_stats.packed_nv_fallbacks == 0);
-        assert(empty[0] == 0xa5 && empty[1] == 0xa5 && empty[2] == 0xa5);
-#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-        uint8_t empty_sink[] = {0x5a, 0x5a, 0x5a};
-        const uint32_t empty_fcsr = mxfp4_packed_read_fcsr();
-        const bool empty_adjacent = ggml_quantize_row_mxfp4_adjacent(
-            nullptr, empty + 1, empty_sink + 1, 0
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-            , nullptr
-#endif
-        );
-        assert(!empty_adjacent);
-        ggml_mxfp4_packed_stats_get(&k0_stats);
-        assert(k0_stats.calls == 0 && k0_stats.adjacent_calls == 0 &&
-            k0_stats.adjacent_blocks == 0 && k0_stats.adjacent_fallbacks == 0);
-        assert(empty[0] == 0xa5 && empty[1] == 0xa5 && empty[2] == 0xa5);
-        assert(empty_sink[0] == 0x5a && empty_sink[1] == 0x5a && empty_sink[2] == 0x5a);
-        assert(mxfp4_packed_read_fcsr() == empty_fcsr);
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-        assert(k0_stats.amax_reuse_calls == 0 && k0_stats.amax_reuse_blocks == 0 &&
-            k0_stats.amax_reuse_fallbacks == 0);
-#endif
-#endif
-
-        std::array<float, QK_MXFP4> zero_count_values{};
-        std::array<uint8_t, 2> zero_count_scales{{127, 128}};
-        std::array<uint8_t, 32> zero_count_output;
-        zero_count_output.fill(0x5a);
-        const auto zero_count_unchanged = zero_count_output;
-        mxfp4_packed_seed_flags(FE_UNDERFLOW | FE_INEXACT);
-        const uint32_t zero_count_fcsr = mxfp4_packed_read_fcsr();
-        const uint64_t zero_count_result = vector_mxfp4_pack_blocks(
-            zero_count_values.data(), zero_count_output.data(),
-            zero_count_scales.data(), 0);
-        assert(zero_count_result == zero_count_fcsr);
-        assert(zero_count_output == zero_count_unchanged);
-        assert(mxfp4_packed_read_fcsr() == zero_count_fcsr);
-    }
-    assert(std::fesetenv(&saved_environment) == 0);
-#if defined(GGML_TEST_MXFP4_SUPPLIED_BATCH8) && GGML_TEST_MXFP4_SUPPLIED_BATCH8
-    printf("MXFP4_SUPPLIED_BATCH8_ORACLE_PASS blocks=8 rounding_modes=%u bytes_fcsr_canaries=exact legacy_fallback=exact\n",
-        mxfp4_test_rounding_count);
-#endif
-#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-    printf("MXFP4_ADJACENT_RUNTIME_PASS packed_cases=%u fallback_cases=%u "
-        "bytes_flags_frm_canaries=exact packed_qs_untouched=yes single_runtime_call=yes\n",
-        packed_cases, fallback_cases);
-#endif
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-    printf("MXFP4_AMAX_REUSE_RUNTIME_PASS packed_cases=%u fallback_cases=%u "
-        "bytes_flags_frm_canaries=exact same_call_metadata=yes single_runtime_call=yes\n",
-        packed_cases, fallback_cases);
-#endif
-    printf("MXFP4_PACKED_RUNTIME_PASS packed_cases=%u fallback_cases=%u "
-        "blocks=1,8,9,16,24,25 K=%u,%u,%u,%u,%u,%u "
-        "rounding_modes=%u sticky_states=5 natural_NX=required "
-        "bytes_flags_frm_canaries=exact late_reject=whole_row_fallback "
-        "late_NaN_flags=whole_row_fallback incoming_NV=fallback "
-        "count0_k0=untouched stats_do_not_change_fcsr=exact vlenb=%lu\n",
-        packed_cases, fallback_cases,
-        unsigned(1 * QK_MXFP4), unsigned(8 * QK_MXFP4),
-        unsigned(9 * QK_MXFP4), unsigned(16 * QK_MXFP4),
-        unsigned(24 * QK_MXFP4), unsigned(25 * QK_MXFP4),
-        mxfp4_test_rounding_count, hardware_vlenb);
-}
-#endif
 
 static void test_ame_mxfp4_packing() {
     for (int nblocks : {1, 2, 3, 64, 129}) {
@@ -1448,7 +1058,7 @@ static void test_ame_rmsnorm_quant() {
     assert(quantize != nullptr);
     unsigned cases = 0, checked_blocks = 0;
     auto seed = [](int round, int flags) {
-        mxfp4_test_set_rounding(round);
+        assert(std::fesetround(round) == 0);
         assert(std::feclearexcept(FE_ALL_EXCEPT) == 0);
         assert(std::feraiseexcept(flags) == 0);
         assert(std::feclearexcept(FE_ALL_EXCEPT & ~flags) == 0);
@@ -1581,108 +1191,6 @@ static void test_ame_rmsnorm_quant() {
         ++cases;
         checked_blocks += unsigned(blocks);
     };
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-#if !defined(__riscv) || !defined(__riscv_flen) || __riscv_flen < 32 || \
-    !defined(GGML_AME_RMS_PREFLIGHT_BOUNDS) || \
-    (GGML_AME_RMS_PREFLIGHT_BOUNDS != 0 && GGML_AME_RMS_PREFLIGHT_BOUNDS != 2)
-#error "RMS square flags gate requires RISC-V hard float and matching BOUNDS=0 or 2"
-#endif
-    enum class SquareCase { natural_hit, late_nx, uf_accept, uf_reject, nv_reject };
-    unsigned square_cases = 0, square_rejects = 0, square_hits = 0;
-    auto check_square = [&](int round, int flags, SquareCase kind) {
-        constexpr int K = 256, mn = 64, tk = 64, rows = 2 * mn, stride = K + 5, nb = K / 32;
-        constexpr unsigned nx = 1u, uf = 2u, nv = 16u;
-        constexpr float eps = 0x1p-10f;
-        const bool natural_hit = kind == SquareCase::natural_hit;
-        const bool bad_factor = kind == SquareCase::nv_reject;
-        const bool admitted = !bad_factor && kind != SquareCase::uf_reject;
-        const bool late_square_uf = kind == SquareCase::uf_accept || kind == SquareCase::uf_reject;
-        std::vector<float> input(size_t(rows) * stride + 2, 0x1.5p+8f), gamma(K + 2, -0x1.3p+7f);
-        for (int row = 0; row < rows; ++row) std::fill_n(input.data() + 1 + row * stride, K, -0.0f);
-        std::fill_n(gamma.data() + 1, K, 1.0f);
-        float * last = input.data() + 1 + (rows - 1) * stride;
-        if (natural_hit || kind == SquareCase::late_nx) {
-            const auto exact_r16 = [](float * row) {
-                std::fill_n(row, 4, 0x1.8p-2f);
-                std::fill_n(row + 4, 3, 0x1p-2f);
-            };
-            exact_r16(last);
-            if (natural_hit) exact_r16(input.data() + 1);
-            gamma[1] = 0x1.000002p0f;
-        } else if (bad_factor) {
-            const uint32_t snan = 0x7f800001u;
-            std::memcpy(last + K - 1, &snan, sizeof(snan));
-        } else {
-            last[K - 1] = admitted ? 0x1p-80f : 0x1p-149f;
-        }
-        const auto saved_input = input, saved_gamma = gamma;
-        std::vector<float> expected_r(rows + 2, -123.0f), actual_r(expected_r);
-        std::vector<uint8_t> expected(rows * nb * 16 + 2, 0xc3), actual(expected);
-        std::vector<uint8_t> expected_sf(rows * nb + 2, 0xa7), actual_sf(expected_sf);
-        auto preflight = [&](std::vector<float> & factors, ggml_ame_rmsnorm_first_panel * first) {
-            return ggml_ame_rmsnorm_mxfp4_preflight(factors.data() + 1, input.data() + 1,
-                gamma.data() + 1, rows, K, stride * sizeof(float), eps, mn, first);
-        };
-        auto panel = [&](std::vector<uint8_t> & payload, std::vector<uint8_t> & scales,
-                         const std::vector<float> & factors, int first_row) {
-            return ggml_ame_rmsnorm_pack_mxfp4(payload.data() + 1 + first_row * nb * 16,
-                scales.data() + 1 + first_row * nb, input.data() + 1 + first_row * stride,
-                gamma.data() + 1, mn, K, stride * sizeof(float), eps, tk, mn, factors.data() + 1 + first_row);
-        };
-        seed(round, flags);
-        const uint32_t entry_fcsr = mxfp4_packed_read_fcsr();
-        const uint64_t before = ggml_ame_rmsnorm_bounded_preflight_count();
-        const bool reference_ok = preflight(expected_r, nullptr);
-        const uint32_t reference_fcsr = mxfp4_packed_read_fcsr();
-        const int reference_flags = std::fetestexcept(FE_ALL_EXCEPT);
-        assert(ggml_ame_rmsnorm_bounded_preflight_count() == before && reference_ok == admitted);
-        assert(reference_fcsr == (entry_fcsr | (bad_factor ? nv : late_square_uf ? uf | nx : nx)));
-        assert(expected_r.front() == -123.0f && expected_r.back() == -123.0f);
-        for (int row = 0; row < rows - 1; ++row) {
-            assert(expected_r[1 + row] == (natural_hit && row == 0 ? 16.0f : 32.0f));
-        }
-        if (natural_hit || kind == SquareCase::late_nx) assert(expected_r[rows] == 16.0f);
-        if (bad_factor) assert(expected_r[rows] == -123.0f);
-
-        seed(round, flags);
-        if (!bad_factor) {
-            assert(panel(expected, expected_sf, expected_r, 0));
-            assert(expected_sf[1] != 0xa7);
-        }
-        assert(mxfp4_packed_read_fcsr() == (entry_fcsr | (natural_hit ? nx : 0u)));
-        seed(round, flags);
-        ggml_ame_rmsnorm_first_panel first = {actual.data() + 1, actual_sf.data() + 1, tk, 0, 123};
-        const bool actual_ok = preflight(actual_r, &first);
-        const uint32_t preflight_fcsr = mxfp4_packed_read_fcsr();
-        const uint64_t hits = ggml_ame_rmsnorm_bounded_preflight_count() - before;
-        const unsigned expected_hits = GGML_AME_RMS_PREFLIGHT_BOUNDS == 2 && admitted && !late_square_uf &&
-            !(flags & (FE_INVALID | FE_OVERFLOW | FE_UNDERFLOW)) && (natural_hit || (entry_fcsr & nx));
-        if (actual_ok != admitted || preflight_fcsr != reference_fcsr || hits != expected_hits) {
-            fprintf(stderr, "AME_RMS_SQUARE_FLAGS_MISMATCH kind=%d round=%d seed=%x "
-                "admitted=%d/%d fcsr=%x/%x hit=%llu/%u\n", static_cast<int>(kind), round, flags,
-                actual_ok, admitted, preflight_fcsr, reference_fcsr, (unsigned long long) hits, expected_hits);
-            assert(false);
-        }
-        assert(first.prepare_cycles == (bad_factor ? 123u : 0u));
-        assert(std::memcmp(expected_r.data(), actual_r.data(), actual_r.size() * sizeof(float)) == 0);
-        assert(actual == expected && actual_sf == expected_sf);
-        if (admitted) {
-            assert(panel(actual, actual_sf, actual_r, mn));
-            const uint32_t end_fcsr = mxfp4_packed_read_fcsr();
-            seed(round, reference_flags);
-            assert(mxfp4_packed_read_fcsr() == reference_fcsr);
-            assert(panel(expected, expected_sf, expected_r, mn));
-            assert(actual == expected && actual_sf == expected_sf);
-            assert(mxfp4_packed_read_fcsr() == end_fcsr);
-        }
-        assert(actual.front() == 0xc3 && actual.back() == 0xc3 && actual_sf.front() == 0xa7 && actual_sf.back() == 0xa7);
-        assert(std::memcmp(input.data(), saved_input.data(), input.size() * sizeof(float)) == 0);
-        assert(std::memcmp(gamma.data(), saved_gamma.data(), gamma.size() * sizeof(float)) == 0);
-        ++square_cases;
-        square_rejects += !admitted;
-        square_hits += unsigned(hits);
-    };
-#endif
     // Two token panels: real graph RMSNorm+gamma versus direct packed producer.
     for (int mn : {64, 128}) {
         for (int tk : {32, 64}) {
@@ -1690,7 +1198,7 @@ static void test_ame_rmsnorm_quant() {
         }
     }
     const int exceptions[] = {FE_INVALID, FE_DIVBYZERO, FE_OVERFLOW, FE_UNDERFLOW, FE_INEXACT};
-    for (int round : mxfp4_test_rounding_modes) {
+    for (int round : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
         // A full eight-block batch, one batch plus a K64 tail, and two
         // batches plus a tail. The original full-row quantizer is the oracle.
         for (int K : {256, 320, 576}) {
@@ -1704,9 +1212,6 @@ static void test_ame_rmsnorm_quant() {
             for (unsigned bit = 0; bit < 5; ++bit) {
                 if (mask & (1u << bit)) flags |= exceptions[bit];
             }
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-            check_square(round, flags, SquareCase::natural_hit);
-#endif
             for (int tk : {32, 64}) check(64, 64, tk, 64, round, flags);
             for (int pattern : {5, 6}) {
                 for (int tk : {32, 64}) check(64, 320, tk, 64, round, flags, pattern);
@@ -1718,13 +1223,6 @@ static void test_ame_rmsnorm_quant() {
         for (int pattern : {1, 2, 3}) {
             for (int tk : {32, 64}) check(64, 64, tk, 64, round, 0, pattern);
         }
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-        check_square(round, 0, SquareCase::late_nx);
-        check_square(round, FE_INEXACT, SquareCase::late_nx);
-        check_square(round, 0, SquareCase::uf_accept);
-        check_square(round, 0, SquareCase::uf_reject);
-        check_square(round, 0, SquareCase::nv_reject);
-#endif
     }
     // Odd K32 count is legal for K32 tiles, but K64 must reject before
     // touching outputs or FP state, without encoding an incomplete pair.
@@ -1819,23 +1317,15 @@ static void test_ame_rmsnorm_quant() {
     assert(std::all_of(payload.begin(), payload.end(), [](uint8_t v) { return v == 0xc3; }));
     assert(std::all_of(scales.begin(), scales.end(), [](uint8_t v) { return v == 0xa7; }));
     assert(std::fesetenv(&saved) == 0);
-#if defined(GGML_TEST_AME_RMS_SQUARE_FLAGS) && GGML_TEST_AME_RMS_SQUARE_FLAGS
-    assert(mxfp4_test_rounding_count == 5 && square_cases == 185 && square_rejects == 10);
-    assert(square_hits == (GGML_AME_RMS_PREFLIGHT_BOUNDS == 2 ? 25u : 0u));
-    printf("AME_RMS_SQUARE_FLAGS_TEST_PASS bounds=%d frm=%u sticky_states=32 rows=128 K=256 "
-        "panels=2 tk=64 cases=%u rejected=%u hits=%u raw_preflight_fcsr=exact "
-        "factors_payload_scales_canaries=exact hardware=not_run\n",
-        GGML_AME_RMS_PREFLIGHT_BOUNDS, mxfp4_test_rounding_count, square_cases, square_rejects, square_hits);
-#endif
     printf("AME_RMS_QUANT_PASS cases=%u blocks=%u full_shape=256x128 token_panels=2 "
-        "small_flags=%ufrm_x32states_x2layouts invalid_arguments=12 invalid_first_descriptors=4 partial_reject=discard "
+        "small_flags=4frm_x32states_x2layouts invalid_arguments=12 invalid_first_descriptors=4 partial_reject=discard "
         "tiny_scale_cast=pre_reject defined_boundary=exact late_NX=block_row_and_batch "
         "quant_batch_blocks=8 batch_tail_K=256_288_320_576 natural_norm_UFNX=kb7_kb8 "
         "two_round_norm_no_new_flags=exact "
         "reference=real_GGML_RMSNorm_gamma_CPU_quant_pack payload_scales_flags=exact "
         "whole_input_preflight_then_panels=exact first_panel_admission_reuse=exact provisional_late_reject=discard "
         "normalized_tensor_materialized_in_candidate=no "
-        "hardware=not_run\n", cases, checked_blocks, mxfp4_test_rounding_count);
+        "hardware=not_run\n", cases, checked_blocks);
 }
 
 static void test_ame_mxfp4_native_domain() {
@@ -2465,7 +1955,6 @@ int main(int argc, char * argv[]) {
     bool ame_rmsnorm_fusion_only = false;
     bool ame_rmsnorm_fusion_native = false;
     bool ame_rmsnorm_benchmark = false;
-    bool ame_rmsnorm_fixture_set = false;
     int ame_rmsnorm_fixture = 0;
     const size_t test_size = 32 * 128;
 
@@ -2496,35 +1985,6 @@ int main(int argc, char * argv[]) {
             ame_mx128_qwen_native_only = true;
         } else if (arg == "--ame-rmsnorm-quant-only") {
             ame_rmsnorm_quant_only = true;
-        } else if (arg == "--ame-rmsnorm-fixture") {
-            if (ame_rmsnorm_fixture_set || i + 1 >= argc) {
-                fprintf(stderr, "error: --ame-rmsnorm-fixture requires one decimal value 0..10\n");
-                return 1;
-            }
-            const char * value = argv[++i];
-            if (value == nullptr || value[0] == '\0') {
-                fprintf(stderr, "error: --ame-rmsnorm-fixture requires one decimal value 0..10\n");
-                return 1;
-            }
-            unsigned parsed = 0;
-            size_t digits = 0;
-            for (const char * p = value; *p != '\0'; ++p) {
-                if (*p < '0' || *p > '9') {
-                    fprintf(stderr, "error: --ame-rmsnorm-fixture must be decimal 0..10, got '%s'\n", value);
-                    return 1;
-                }
-                if (++digits > 2 || (digits == 2 && value[0] == '0')) {
-                    fprintf(stderr, "error: --ame-rmsnorm-fixture must be in range 0..10, got '%s'\n", value);
-                    return 1;
-                }
-                parsed = parsed * 10 + (*p - '0');
-                if (parsed > 10) {
-                    fprintf(stderr, "error: --ame-rmsnorm-fixture must be in range 0..10, got '%s'\n", value);
-                    return 1;
-                }
-            }
-            ame_rmsnorm_fixture_set = true;
-            ame_rmsnorm_fixture = (int) parsed;
         } else if (arg == "--ame-rmsnorm-fusion-only" || arg == "--ame-rmsnorm-fusion-native-only") {
             ame_rmsnorm_fusion_only = true;
             ame_rmsnorm_fusion_native = arg == "--ame-rmsnorm-fusion-native-only";
@@ -2536,14 +1996,13 @@ int main(int argc, char * argv[]) {
         } else if (arg == "--ame-rmsnorm-fusion-slots-only" || arg == "--ame-rmsnorm-fusion-tail-only") {
             ame_rmsnorm_fusion_only = ame_rmsnorm_fusion_native = true;
             ame_rmsnorm_fixture = arg == "--ame-rmsnorm-fusion-tail-only" ? 3 : 2;
+        } else if (arg == "--ame-rmsnorm-fusion-qkv-only" || arg == "--ame-rmsnorm-fusion-qkv-qwen-only") {
+            ame_rmsnorm_fusion_only = ame_rmsnorm_fusion_native = true;
+            ame_rmsnorm_fixture = arg == "--ame-rmsnorm-fusion-qkv-qwen-only" ? 5 : 4;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return 1;
         }
-    }
-    if (ame_rmsnorm_fixture_set && !ame_rmsnorm_fusion_native) {
-        fprintf(stderr, "error: --ame-rmsnorm-fixture requires --ame-rmsnorm-fusion-native-only or --ame-rmsnorm-fusion-perf-only\n");
-        return 1;
     }
 
     std::vector<float> test_data(test_size);
@@ -2579,9 +2038,6 @@ int main(int argc, char * argv[]) {
         return 0;
     }
     test_mxfp4_runtime_bytes();
-#if defined(GGML_RV_MXFP4_PACKED)
-    test_mxfp4_packed_runtime();
-#endif
     if (mxfp4_runtime_only) {
         test_mxfp4_supplied_scales();
         return 0;

@@ -3,16 +3,11 @@
 void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
     const uint8_t * a, const uint8_t * sa,
     const uint8_t * b, const uint8_t * sb, int64_t k_tiles, float * c, int format, int tile_k, int tile_mn,
-    ggml_ame_overlap_fn overlap_fn, void * overlap_opaque,
-    enum ggml_ame_overlap_schedule overlap_schedule
+    ggml_ame_overlap_fn overlap_fn, void * overlap_opaque
 ) {
     const size_t block_bytes = ggml_ame_mx_block_bytes(format);
-    const int transpose_c = format == AME_MCFG_MXFP4 && tile_mn == AME_TILE_M_MAX &&
-        ggml_ame_transposed_c_epilogue_enabled();
     GGML_ASSERT(ggml_ame_mx_tile_k_supported(format, tile_k));
     GGML_ASSERT(tile_mn == 64 || tile_mn == AME_TILE_M_MAX);
-    GGML_ASSERT(overlap_schedule == GGML_AME_OVERLAP_LAST_K ||
-        overlap_schedule == GGML_AME_OVERLAP_EACH_K);
     const size_t blocks_per_row = (size_t) tile_k / AME_MXFP4_K;
     const size_t row_bytes = block_bytes * blocks_per_row;
     int tmp;
@@ -52,8 +47,7 @@ void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
         // Input bases/scales above have already been acquired. Only compute
         // is pending here: reuse the canonical INT8 pre-MSC overlap ordering,
         // never run RVV memory traffic alongside a pending matrix store.
-        if (overlap_fn != NULL &&
-                (overlap_schedule == GGML_AME_OVERLAP_EACH_K || kb + 1 == k_tiles)) {
+        if (kb + 1 == k_tiles && overlap_fn != NULL) {
             asm volatile("" ::: "memory");
             overlap_fn(overlap_opaque); // CPU producer only, no AMU instructions
             asm volatile("fence rw, rw" ::: "memory");
@@ -67,11 +61,7 @@ void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
     }
     // Keep acc0 across K blocks: a CPU store/add would introduce a second
     // rounding and would not implement the frozen per-block-RNE contract.
-    if (transpose_c) {
-        MSCT(acc0, c_live, tile_mn * (int) sizeof(float));
-    } else {
-        MSC(acc0, c_live, tile_mn * (int) sizeof(float));
-    }
+    MSC(acc0, c_live, tile_mn * (int) sizeof(float));
     ggml_ame_sync_release_acquire_store();
     asm volatile("" : "+r"(c_live) : : "memory");
     asm volatile("csrw 0x809, %0" : : "r"(saved_mfrm) : "memory");

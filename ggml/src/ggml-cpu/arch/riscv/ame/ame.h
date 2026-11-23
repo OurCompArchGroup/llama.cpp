@@ -18,6 +18,10 @@
 #define GGML_AME_THREAD_LOCAL _Thread_local
 #endif
 
+static inline bool ggml_ame_rmsnorm_qkv_enabled(const char * mode) {
+    return mode != NULL && (strcmp(mode, "qkv") == 0 || strcmp(mode, "pipeline+qkv") == 0);
+}
+
 // AME debug logging can be forced at build time with AME_DEBUG=1 or enabled at
 // runtime with GGML_AME_LOG=1 so logs are visible in QEMU serial output.
 #ifndef AME_DEBUG
@@ -833,18 +837,10 @@ void ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
 
 // Shared K32 path: compact 16-byte E2M1 or 32-byte FP8 data rows and one E8M0
 // byte per row. Only called after the explicit MX32 capability attestation.
-enum ggml_ame_overlap_schedule {
-    GGML_AME_OVERLAP_LAST_K = 0,
-    GGML_AME_OVERLAP_EACH_K = 1,
-};
-// One worker-local cache for the existing transpose knob, shared by native
-// matrix writeback and its matching CPU epilogue; not two independent caches.
-int ggml_ame_transposed_c_epilogue_enabled(void);
 void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
     const uint8_t * a, const uint8_t * sa,
     const uint8_t * b, const uint8_t * sb, int64_t k_tiles, float * c, int format, int tile_k, int tile_mn,
-    ggml_ame_overlap_fn overlap_fn, void * overlap_opaque,
-    enum ggml_ame_overlap_schedule overlap_schedule);
+    ggml_ame_overlap_fn overlap_fn, void * overlap_opaque);
 
 // Lossless GGML low=k/high=k+16 -> consecutive-K nibbles, separate E8M0.
 // Output sizes are nblocks*16 and nblocks bytes. Buffers must not overlap.
@@ -889,9 +885,6 @@ GGML_API bool ggml_ame_rmsnorm_mxfp4_preflight(
     int64_t rows, int64_t K, size_t src_stride, float eps, int tile_mn,
     struct ggml_ame_rmsnorm_first_panel * first);
 
-// Backend-private telemetry only; no first-panel/public layout changes.
-uint64_t ggml_ame_rmsnorm_bounded_preflight_count(void);
-
 // Native dispatch domain, deliberately stricter than the raw lossless packer:
 // GGML's half-scale decoder treats e=255 as finite; MX ISA treats it as NaN.
 GGML_API bool ggml_ame_mxfp4_native_domain(const void * src, int64_t nblocks);
@@ -922,34 +915,52 @@ struct ggml_ame_rmsnorm_input {
     const float * gamma;
     const float * row_scales; // whole-input preflight, exclusive workspace prefix
     float eps;
-    int pipeline; // 0: serial, 1: original last-MMACC panel, 2: pipeline-chunk
+    int pipeline;
     int first_panel_prepared;
     uint64_t preflight_cycles;
     uint64_t prepare_cycles;
     uint64_t prepared_panels;
     uint64_t overlap_callbacks;
-    // Chunk-mode counts exclude the first panel admitted by preflight.
-    // Visits include no-op callbacks; overlap_callbacks counts useful work.
-    uint64_t chunk_callback_visits;
-    uint64_t prepared_chunks;
-    uint64_t drain_chunks;
-    // Subsets of prepare_cycles, never additional top-level phase charges.
-    uint64_t callback_prepare_cycles;
-    uint64_t drain_prepare_cycles;
 };
+struct ggml_ame_mx_activation_reuse {
+    const struct ggml_cgraph * graph;
+    const struct ggml_tensor * source;
+    struct ggml_tensor * qkv_norm;
+    struct ggml_tensor * qkv_last;
+    const void * source_data;
+    const void * workspace;
+    size_t workspace_bytes;
+    void * interposer_work;
+    size_t interposer_bytes;
+    size_t stride;
+    int tile_k;
+    int tile_mn;
+    unsigned interposers;
+    unsigned qkv_dispatched;
+    unsigned fcsr;
+    int saved_errno;
+    bool legacy;
+    bool incoming;
+    bool published;
+    bool hit;
+};
+
 void ggml_ame_mul_mat_mx(
     const uint8_t * a, const uint8_t * sa, const void * src1, float * dst,
     int64_t M, int64_t N, int64_t K, size_t src1_stride,
     void * work_data, int ith, int nth,
     uint64_t weight_prepare_cycles, int weight_cache_hit, int format, int tile_k, int tile_mn,
-    struct ggml_ame_rmsnorm_input * rms);
+    struct ggml_ame_rmsnorm_input * rms, struct ggml_ame_mx_activation_reuse * reuse);
 void ggml_ame_mx_profile_finish(uint64_t elapsed_cycles, int format, int tile_k);
+void ggml_ame_mx_profile_qkv_producer(uint64_t elapsed_cycles, int tile_k);
 
 struct ggml_compute_params;
+bool ggml_ame_mx_activation_interpose(
+    struct ggml_ame_mx_activation_reuse * reuse, const struct ggml_tensor * node, int node_index);
+bool ggml_ame_begin_rmsnorm_qkv(
+    struct ggml_compute_params * params, const struct ggml_cgraph * graph, int node_index);
 bool ggml_ame_try_fuse_rmsnorm_mxfp4(
     struct ggml_compute_params * params, const struct ggml_cgraph * graph, int node_index);
-// Fixtures 0..3 retain the original cases. 4..9 add 1/2/3 panels at K32/K64,
-// including pipeline-chunk; the caller still owns native execution authority.
 bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, bool benchmark);
 
 void ggml_ame_bf16_profile_reset(void);

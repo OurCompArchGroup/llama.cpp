@@ -4,23 +4,20 @@
 #include "ame-backend.h"
 #include "ame.h"
 
+#include "binary-ops.h"
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
-#include "ggml-cpu/vec.h"
 #include "ggml-quants.h"
 #include "ops.h"
 #include "traits.h"
-#if (defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE) || \
-    (defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT)
-#include "ggml-cpu/quants.h"
-#endif
 #if defined(GGML_XSAI_ALLOC)
 #include "xsai_alloc.h"
 #endif
 
 #include <cassert>
+#include <cerrno>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
@@ -90,8 +87,7 @@ static bool ame_backend_env_enabled(const char * name) {
 static int ame_rmsnorm_mode() {
     const char * mode = getenv("GGML_AME_RMSNORM_MXFP4");
     return mode != nullptr && strcmp(mode, "serial") == 0 ? 1 :
-        mode != nullptr && strcmp(mode, "pipeline") == 0 ? 2 :
-        mode != nullptr && strcmp(mode, "pipeline-chunk") == 0 ? 3 : 0;
+        mode != nullptr && (strcmp(mode, "pipeline") == 0 || strcmp(mode, "pipeline+qkv") == 0) ? 2 : 0;
 }
 
 static inline uint64_t ame_backend_read_cycle() {
@@ -1113,17 +1109,98 @@ static bool ame_disjoint_ranges(const void * a, size_t na, const void * b, size_
     return pa + na <= pb || pb + nb <= pa;
 }
 
+static bool ame_shared_rms_activation(const ggml_cgraph * graph, const ggml_tensor * activation) {
+    if (graph == nullptr || graph->use_counts == nullptr || graph->visited_hash_set.size == 0 ||
+        graph->visited_hash_set.keys == nullptr || graph->visited_hash_set.used == nullptr ||
+        graph->grads != nullptr || graph->grad_accs != nullptr || activation->view_src != nullptr ||
+        activation->op != GGML_OP_MUL || activation->src[0] == nullptr ||
+        activation->src[0]->op != GGML_OP_RMS_NORM || activation->src[1] == nullptr ||
+        activation->src[1]->type != GGML_TYPE_F32 ||
+        (activation->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT))) return false;
+    const size_t index = ggml_hash_find(&graph->visited_hash_set, activation);
+    return index != GGML_HASHSET_FULL && ggml_bitset_get(graph->visited_hash_set.used, index) &&
+        graph->use_counts[index] == 3;
+}
+
+static bool ame_rmsnorm_graph_supported(const ggml_cgraph * graph, int index);
+
+extern "C" bool ggml_ame_mx_activation_interpose(
+    ggml_ame_mx_activation_reuse * reuse, const ggml_tensor * node, int node_index
+) {
+    if (!reuse->incoming || reuse->interposers >= 3 || reuse->interposer_work == nullptr ||
+        node->type != GGML_TYPE_F32 || node->src[0] == nullptr || node->src[0]->type != GGML_TYPE_F32 ||
+        !(node->op == GGML_OP_ROPE || node->op == GGML_OP_MUL || node->op == GGML_OP_RMS_NORM) ||
+        !ame_disjoint_ranges(node->data, ggml_nbytes(node),
+            reuse->source_data, ggml_nbytes(reuse->source)) ||
+        !ame_disjoint_ranges(node->data, ggml_nbytes(node), reuse->workspace, reuse->workspace_bytes)) return false;
+
+    if (node->op == GGML_OP_RMS_NORM && ame_rmsnorm_mode() != 0 &&
+        ame_rmsnorm_graph_supported(reuse->graph, node_index)) return false;
+    if (node->op == GGML_OP_ROPE &&
+        (uint64_t) node->ne[0] > reuse->interposer_bytes / sizeof(float)) return false;
+    for (auto buft : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (buft != nullptr && buft->context != nullptr &&
+            static_cast<ggml::cpu::extra_buffer_type *>(buft->context)->get_tensor_traits(node) != nullptr) return false;
+    }
+    for (const ggml_tensor * src : node->src) {
+        if (src != nullptr &&
+            !ame_disjoint_ranges(src->data, ggml_nbytes(src), reuse->workspace, reuse->workspace_bytes)) return false;
+    }
+    ++reuse->interposers;
+    return true;
+}
+
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_fused_calls;
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_prepared_panels;
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_admitted_first_panels;
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_overlap_callbacks;
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_last_preflight_cycles;
 static GGML_AME_THREAD_LOCAL uint64_t g_rms_last_prepare_cycles;
-static GGML_AME_THREAD_LOCAL uint64_t g_rms_chunk_callback_visits;
-static GGML_AME_THREAD_LOCAL uint64_t g_rms_prepared_chunks;
-static GGML_AME_THREAD_LOCAL uint64_t g_rms_drain_chunks;
-static GGML_AME_THREAD_LOCAL uint64_t g_rms_last_callback_prepare_cycles;
-static GGML_AME_THREAD_LOCAL uint64_t g_rms_last_drain_prepare_cycles;
+static GGML_AME_THREAD_LOCAL uint64_t g_mx_activation_reuse_hits;
+static GGML_AME_THREAD_LOCAL uint64_t g_rms_qkv_packs;
+static GGML_AME_THREAD_LOCAL uint64_t g_rms_qkv_native;
+static GGML_AME_THREAD_LOCAL uint64_t g_rms_qkv_fallbacks;
+
+#if defined(__riscv_flen)
+static unsigned ame_read_fcsr() {
+    unsigned flags;
+    asm volatile("frcsr %0" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static void ame_restore_fcsr(unsigned flags) {
+    asm volatile("fscsr %0" : : "r"(flags) : "memory");
+}
+#endif
+
+static ggml_ame_mx_activation_reuse * ame_rms_qkv_for(
+    const ggml_compute_params * params, const ggml_tensor * op
+) {
+    auto * reuse = params->ame_mx_reuse;
+    return reuse != nullptr && reuse->qkv_norm != nullptr && op->src[1] == reuse->source ? reuse : nullptr;
+}
+
+static void ame_rms_qkv_materialize(ggml_compute_params * params, ggml_ame_mx_activation_reuse * reuse) {
+#if defined(__riscv_flen)
+    ggml_tensor * norm = reuse->qkv_norm;
+    ggml_tensor * mul = const_cast<ggml_tensor *>(reuse->source);
+    const unsigned flags = ame_read_fcsr();
+    const int saved_errno = errno;
+    if (flags != reuse->fcsr) ame_restore_fcsr(reuse->fcsr);
+    errno = reuse->saved_errno;
+    ggml_compute_forward_rms_norm(params, norm);
+    ggml_compute_forward_mul(params, mul);
+    ame_restore_fcsr(flags);
+    errno = saved_errno;
+    reuse->qkv_norm = nullptr;
+    reuse->incoming = reuse->published = false;
+    ++g_rms_qkv_fallbacks;
+#else
+    GGML_UNUSED(params);
+    GGML_UNUSED(reuse);
+    GGML_ABORT("RMS/QKV is supported only on RISC-V with FCSR");
+#endif
+}
 
 // A declined fusion attempt is speculative CPU work, not part of the original
 // graph. Restore exactly its entering scalar environment on decline (including
@@ -1150,6 +1227,7 @@ static bool ame_compute_mx_forward(
     const bool profile = ame_backend_env_enabled("GGML_AME_PROFILE");
     const uint64_t op_start = profile ? ame_backend_read_cycle() : 0;
     const bool fused = rms_src != nullptr;
+    auto * shared = !fused ? ame_rms_qkv_for(params, op) : nullptr;
     ame_scalar_transaction scalar_try(fused);
     if (!scalar_try.valid || params->nth != 1 || !ame_backend_mx_metadata_supported(op)) return false;
     const int tile_k = ame_backend_mx_tile_k(op, params->nth);
@@ -1180,12 +1258,12 @@ static bool ame_compute_mx_forward(
         rms.gamma = static_cast<const float *>(gamma->data);
         rms.row_scales = reinterpret_cast<const float *>(work);
         rms.eps = eps;
-        rms.pipeline = rms_mode - 1; // serial=0, legacy pipeline=1, chunk=2
+        rms.pipeline = rms_mode == 2;
         rms.first_panel_prepared = 1;
         rms.prepare_cycles = first.prepare_cycles;
         rms.prepared_panels = 1;
         rms.preflight_cycles = profile ? ame_backend_read_cycle() - preflight_start - first.prepare_cycles : 0;
-    } else if (!(format == AME_MCFG_MXFP4 ? ame_mxfp4_activations_supported(op->src[1]) :
+    } else if (shared == nullptr && !(format == AME_MCFG_MXFP4 ? ame_mxfp4_activations_supported(op->src[1]) :
             ggml_ame_mxfp8_f32_domain(static_cast<const float *>(op->src[1]->data),
                 ggml_nelements(op->src[1]), format))) {
         AME_LOG("mx_compute_reject format=0x%x reason=activation_domain", format);
@@ -1205,7 +1283,7 @@ static bool ame_compute_mx_forward(
         op->src[0], &cache_hit, format, tile_k, tile_mn);
     const uint64_t weight_cycles = profile ? ame_backend_read_cycle() - weight_start : 0;
     if (packed == nullptr) return false;
-    if (fused && (!ame_disjoint_ranges(work, worker_size, packed->data, packed->size) ||
+    if ((fused || shared != nullptr) && (!ame_disjoint_ranges(work, worker_size, packed->data, packed->size) ||
         !ame_disjoint_ranges(op->data, ggml_nbytes(op), packed->data, packed->size))) return false;
 #if defined(GGML_XSAI_ALLOC)
     // Anonymous host-test mode is simulator-only, never physical AMU DMA.
@@ -1214,6 +1292,32 @@ static bool ame_compute_mx_forward(
 #else
     return false;
 #endif
+    const ggml_tensor * activation = op->src[1];
+    const ggml_tensor * weight = op->src[0];
+    ggml_ame_mx_activation_reuse * reuse = shared;
+    if (reuse == nullptr && !fused && params->ame_mx_reuse != nullptr && params->ame_mx_reuse->legacy &&
+        format == AME_MCFG_MXFP4 &&
+        activation->ne[1] == 256 && tile_mn == 128 &&
+        ((packed->K == 288 && tile_k == 32) || (packed->K == 1024 && tile_k == 64)) &&
+        ame_shared_rms_activation(params->ame_mx_reuse->graph, activation) &&
+        ame_disjoint_ranges(activation->data, ggml_nbytes(activation), work, worker_size) &&
+        ame_disjoint_ranges(activation->data, ggml_nbytes(activation), op->data, ggml_nbytes(op)) &&
+        ame_disjoint_ranges(weight->data, ggml_nbytes(weight), work, worker_size) &&
+        ame_disjoint_ranges(work, worker_size, op->data, ggml_nbytes(op)) &&
+        ame_disjoint_ranges(work, worker_size, packed->data, packed->size) &&
+        ame_disjoint_ranges(op->data, ggml_nbytes(op), packed->data, packed->size)) {
+        reuse = params->ame_mx_reuse;
+        reuse->incoming = reuse->incoming && reuse->source == activation &&
+            reuse->source_data == activation->data && reuse->workspace == work &&
+            reuse->stride == activation->nb[1] && reuse->tile_k == tile_k && reuse->tile_mn == tile_mn;
+        reuse->source = activation;
+        reuse->source_data = activation->data;
+        reuse->workspace = work;
+        reuse->workspace_bytes = worker_size;
+        reuse->stride = activation->nb[1];
+        reuse->tile_k = tile_k;
+        reuse->tile_mn = tile_mn;
+    }
     {
         const ame_worker_affinity affinity(params->ith, params->nth);
         const uint8_t * a = static_cast<const uint8_t *>(packed->data);
@@ -1222,13 +1326,38 @@ static bool ame_compute_mx_forward(
             format == AME_MCFG_MXFP4 ? "mxfp4" : "mxfp8", format, tile_k, tile_mn,
             params->ith, params->nth, (long long) packed->M,
             (long long) op->src[1]->ne[1], (long long) packed->K);
+#if defined(__riscv_flen)
+        if (shared != nullptr && (!shared->incoming || shared->workspace != work ||
+            shared->tile_k != tile_k || shared->tile_mn != tile_mn ||
+            shared->fcsr != ame_read_fcsr() || shared->saved_errno != errno)) {
+            ame_rms_qkv_materialize(params, shared);
+            shared = reuse = nullptr;
+        }
+#endif
         scalar_try.commit(); // All bool-false paths precede native submission.
         ggml_ame_mul_mat_mx(
             a, a + blocks * ggml_ame_mx_block_bytes(format),
             fused ? rms_src->data : op->src[1]->data, static_cast<float *>(op->data),
             packed->M, op->src[1]->ne[1], packed->K, fused ? rms_src->nb[1] : op->src[1]->nb[1],
             work, params->ith, params->nth, weight_cycles, cache_hit ? 1 : 0, format, tile_k, tile_mn,
-            fused ? &rms : nullptr);
+            fused ? &rms : nullptr, reuse);
+        if (shared != nullptr) {
+            ++g_rms_qkv_native;
+            ++shared->qkv_dispatched;
+            AME_LOG("rms_qkv_native weight=%s M=%lld N=%lld K=%lld tile_k=%d projection=%u fcsr=%02x weight_cache_hit=%d",
+                weight->name, (long long) packed->M, (long long) activation->ne[1],
+                (long long) packed->K, tile_k, shared->qkv_dispatched, shared->fcsr, cache_hit);
+        }
+        if (reuse != nullptr && reuse->hit && (shared == nullptr || shared->qkv_dispatched > 1)) {
+            ++g_mx_activation_reuse_hits;
+            AME_LOG("mx_activation_reuse weight=%s N=%lld K=%lld packed_k32_skipped=%lld",
+                weight->name, (long long) activation->ne[1], (long long) packed->K,
+                (long long) (activation->ne[1] * packed->K / AME_MXFP4_K));
+        }
+        if (shared != nullptr && op == shared->qkv_last) {
+            shared->qkv_norm = nullptr;
+            shared->published = false;
+        }
     }
     if (profile) {
         const uint64_t elapsed = ame_backend_read_cycle() - op_start;
@@ -1241,12 +1370,33 @@ static bool ame_compute_mx_forward(
         g_rms_overlap_callbacks += rms.overlap_callbacks;
         g_rms_last_preflight_cycles = rms.preflight_cycles;
         g_rms_last_prepare_cycles = rms.prepare_cycles;
-        g_rms_chunk_callback_visits += rms.chunk_callback_visits;
-        g_rms_prepared_chunks += rms.prepared_chunks;
-        g_rms_drain_chunks += rms.drain_chunks;
-        g_rms_last_callback_prepare_cycles = rms.callback_prepare_cycles;
-        g_rms_last_drain_prepare_cycles = rms.drain_prepare_cycles;
     }
+    return true;
+}
+
+static bool ame_rmsnorm_pair_supported(const ggml_tensor * norm, const ggml_tensor * mul) {
+    if (norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+        norm->src[0] == nullptr || mul->src[0] != norm || mul->src[1] == nullptr ||
+        ((norm->flags | mul->flags) & GGML_TENSOR_FLAG_INPUT) != 0) return false;
+    const ggml_tensor * x = norm->src[0], * gamma = mul->src[1];
+    if (x->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
+        norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(gamma) ||
+        !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul) ||
+        !ggml_are_same_shape(x, norm) || !ggml_are_same_shape(norm, mul) ||
+        x->ne[2] != 1 || x->ne[3] != 1 || gamma->ne[0] != x->ne[0] ||
+        gamma->ne[1] != 1 || gamma->ne[2] != 1 || gamma->ne[3] != 1 ||
+        x->view_src != nullptr || gamma->view_src != nullptr) return false;
+    for (int src = 1; src < GGML_MAX_SRC; ++src) if (norm->src[src] != nullptr) return false;
+    for (int src = 2; src < GGML_MAX_SRC; ++src) if (mul->src[src] != nullptr) return false;
+    return true;
+}
+
+static bool ame_rmsnorm_projection_supported(const ggml_tensor * op, const ggml_tensor * mul) {
+    if (op->op != GGML_OP_MUL_MAT || op->src[1] != mul || op->src[0] == nullptr ||
+        op->src[0]->type != GGML_TYPE_MXFP4 || op->view_src != nullptr ||
+        op->src[0]->view_src != nullptr || !ame_backend_mx_metadata_supported(op)) return false;
+    for (int src = 2; src < GGML_MAX_SRC; ++src) if (op->src[src] != nullptr) return false;
     return true;
 }
 
@@ -1257,28 +1407,144 @@ static bool ame_rmsnorm_graph_supported(const ggml_cgraph * graph, int index) {
         graph->grads != nullptr || graph->grad_accs != nullptr) return false;
     const ggml_op ops[] = {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT};
     const int outputs[] = {index + 2};
-    if (!ggml_can_fuse_subgraph(graph, index, 3, ops, outputs, 1)) return false;
-    const ggml_tensor * norm = graph->nodes[index], * mul = graph->nodes[index + 1];
-    const ggml_tensor * op = graph->nodes[index + 2];
-    if (norm->src[0] == nullptr || mul->src[0] != norm || mul->src[1] == nullptr ||
-        op->src[1] != mul || op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_MXFP4 ||
-        ((norm->flags | mul->flags) & GGML_TENSOR_FLAG_INPUT) != 0 ||
-        !ame_backend_mx_metadata_supported(op)) return false;
-    const ggml_tensor * x = norm->src[0], * gamma = mul->src[1];
-    if (x->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
-        norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(x) || !ggml_is_contiguous(gamma) ||
-        !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul) ||
-        !ggml_are_same_shape(x, norm) || !ggml_are_same_shape(norm, mul) ||
-        x->ne[2] != 1 || x->ne[3] != 1 || gamma->ne[0] != x->ne[0] ||
-        gamma->ne[1] != 1 || gamma->ne[2] != 1 || gamma->ne[3] != 1 ||
-        x->view_src != nullptr || gamma->view_src != nullptr ||
-        op->view_src != nullptr || op->src[0]->view_src != nullptr) return false;
-    for (int src = 1; src < GGML_MAX_SRC; ++src) if (norm->src[src] != nullptr) return false;
-    for (int src = 2; src < GGML_MAX_SRC; ++src) {
-        if (mul->src[src] != nullptr || op->src[src] != nullptr) return false;
+    return ggml_can_fuse_subgraph(graph, index, 3, ops, outputs, 1) &&
+        ame_rmsnorm_pair_supported(graph->nodes[index], graph->nodes[index + 1]) &&
+        ame_rmsnorm_projection_supported(graph->nodes[index + 2], graph->nodes[index + 1]);
+}
+
+extern "C" bool ggml_ame_begin_rmsnorm_qkv(
+    ggml_compute_params * params, const ggml_cgraph * graph, int index
+) {
+#if defined(__riscv_flen)
+    const char * mode = getenv("GGML_AME_RMSNORM_MXFP4");
+    if (!ggml_ame_rmsnorm_qkv_enabled(mode) || params->nth != 1 || params->ith != 0 ||
+        graph == nullptr || params->ame_mx_reuse == nullptr ||
+        params->ame_mx_reuse->qkv_norm != nullptr || index < 0 || index > graph->n_nodes - 5 ||
+        params->wdata == nullptr) return false;
+    ggml_tensor * norm = graph->nodes[index], * mul = graph->nodes[index + 1];
+    const bool profile = ame_backend_env_enabled("GGML_AME_PROFILE");
+    const uint64_t producer_start = profile ? ame_backend_read_cycle() : 0;
+    if (!ame_shared_rms_activation(graph, mul) || !ame_rmsnorm_pair_supported(norm, mul) ||
+        norm->view_src != nullptr || mul->ne[1] != 256) return false;
+    const int64_t depth = mul->ne[0];
+    const int tile_mn = ggml_ame_mx_config_tile_mn(getenv("GGML_AME_MX_CONFIG"));
+    if (tile_mn != 128 || (depth != 288 && depth != 1024)) return false;
+    const int tile_k = depth == 288 ? 32 : 64;
+    ggml_tensor * projection[3] = {};
+    int matches[] = {index, index + 1, -1, -1, -1};
+    const ggml_op ops[] = {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT};
+    int count = 0;
+    for (int j = index + 2; j < graph->n_nodes && j - index <= 12 && count < 3; ++j) {
+        auto * node = graph->nodes[j];
+        if (!ggml_op_is_empty(node->op) && (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            node->op == GGML_OP_MUL_MAT) {
+            if (!ame_rmsnorm_projection_supported(node, mul) || ame_backend_mx_tile_k(node, 1) != tile_k ||
+                node->src[0]->buffer == nullptr || node->src[0]->extra == nullptr ||
+                node->src[0]->buffer->buft != ggml_backend_cpu_riscv_ame_buffer_type()) return false;
+            for (int k = 0; k < count; ++k) if (projection[k]->src[0] == node->src[0]) return false;
+            projection[count] = node;
+            matches[2 + count++] = j;
+        }
     }
+    if (count != 3 || matches[2] != index + 2 ||
+        !ggml_can_fuse_subgraph_ext(graph, matches, 5, ops, matches + 2, 3)) return false;
+
+    const ggml_tensor * input = norm->src[0], * gamma = mul->src[1];
+    const size_t alignment = (64 - uintptr_t(params->wdata) % 64) % 64;
+    const size_t worker_bytes = ame_mx_worker_wsize(projection[0]);
+    if (worker_bytes == 0 || alignment > params->wsize || worker_bytes > params->wsize - alignment) return false;
+    auto * work = static_cast<uint8_t *>(params->wdata) + alignment;
+    const size_t blocks = size_t(mul->ne[1]) * (size_t(depth) / AME_MXFP4_K);
+    ggml_ame_mx_activation_reuse next = {};
+    next.graph = graph;
+    next.source = mul;
+    next.qkv_norm = norm;
+    next.qkv_last = projection[2];
+    next.source_data = mul->data;
+    next.workspace = work;
+    next.workspace_bytes = worker_bytes;
+    next.interposer_work = work + blocks * sizeof(block_mxfp4);
+    next.interposer_bytes = size_t(tile_mn) * tile_mn * sizeof(float);
+    next.stride = mul->nb[1];
+    next.tile_k = tile_k;
+    next.tile_mn = tile_mn;
+    next.legacy = params->ame_mx_reuse->legacy;
+    next.incoming = true;
+
+    const auto disjoint = [](const ggml_tensor * lhs, const ggml_tensor * rhs) {
+        return ame_disjoint_ranges(lhs->data, ggml_nbytes(lhs), rhs->data, ggml_nbytes(rhs));
+    };
+    const auto writes_disjoint = [&](const ggml_tensor * tensor) {
+        return disjoint(tensor, norm) && disjoint(tensor, mul);
+    };
+    const auto outside_work = [&](const ggml_tensor * tensor) {
+        return ame_disjoint_ranges(tensor->data, ggml_nbytes(tensor), work, worker_bytes);
+    };
+    if (norm->data != mul->data && !disjoint(norm, mul)) return false;
+    for (const auto * tensor : {input, gamma}) if (!writes_disjoint(tensor)) return false;
+    for (const ggml_tensor * tensor : {input, gamma, static_cast<const ggml_tensor *>(norm),
+            static_cast<const ggml_tensor *>(mul)}) if (!outside_work(tensor)) return false;
+    for (int j = index; j <= matches[4]; ++j) {
+        const auto * node = graph->nodes[j];
+        if (ggml_op_is_empty(node->op) || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) continue;
+        const bool is_projection = j == matches[2] || j == matches[3] || j == matches[4];
+        if (j <= index + 1 || is_projection) {
+            for (auto buft : ggml_backend_cpu_get_extra_buffer_types()) {
+                if (buft != nullptr && buft->context != nullptr &&
+                    !(is_projection && buft == ggml_backend_cpu_riscv_ame_buffer_type()) &&
+                    static_cast<ggml::cpu::extra_buffer_type *>(buft->context)->get_tensor_traits(node) != nullptr) return false;
+            }
+            if (j <= index + 1) continue;
+        }
+        if (!disjoint(node, input) || !disjoint(node, gamma) || !writes_disjoint(node) ||
+            !outside_work(node)) return false;
+        for (const auto * src : node->src) {
+            if (src != nullptr && src != mul && (!writes_disjoint(src) || !outside_work(src))) return false;
+        }
+        if (!is_projection && !ggml_ame_mx_activation_interpose(&next, node, j)) return false;
+    }
+    const auto & visited = graph->visited_hash_set;
+    for (size_t i = 0; i < visited.size; ++i) {
+        if (!ggml_bitset_get(visited.used, i)) continue;
+        const auto * other = visited.keys[i];
+        if (other == nullptr || (other->data != nullptr &&
+            (other->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) &&
+            !writes_disjoint(other))) return false;
+    }
+
+    const unsigned flags = ame_read_fcsr();
+    if ((flags & 1u) == 0 || flags >> 5 > 4) return false;
+    const int saved_errno = errno;
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(eps));
+    const bool packed = ggml_ame_rmsnorm_pack_mxfp4(work, work + blocks * 16,
+        static_cast<const float *>(input->data), static_cast<const float *>(gamma->data),
+        mul->ne[1], depth, input->nb[1], eps, tile_k, tile_mn, nullptr);
+    const unsigned after = ame_read_fcsr();
+    if (!packed || after != flags || errno != saved_errno) {
+        if (after != flags) ame_restore_fcsr(flags);
+        errno = saved_errno;
+        return false;
+    }
+    next.fcsr = flags;
+    next.saved_errno = saved_errno;
+    next.interposers = 0;
+    next.published = true;
+    *params->ame_mx_reuse = next;
+    ++g_rms_qkv_packs;
+    if (profile) {
+        ggml_ame_mx_profile_qkv_producer(ame_backend_read_cycle() - producer_start, tile_k);
+        errno = saved_errno;
+    }
+    AME_LOG("rms_qkv_pack N=%lld K=%lld tile_k=%d fcsr=%02x packed_k32=%zu",
+        (long long) mul->ne[1], (long long) depth, tile_k, flags, blocks);
     return true;
+#else
+    GGML_UNUSED(params);
+    GGML_UNUSED(graph);
+    GGML_UNUSED(index);
+    return false;
+#endif
 }
 
 extern "C" bool ggml_ame_try_fuse_rmsnorm_mxfp4(
@@ -1371,7 +1637,13 @@ public:
         }
 
         if (op->src[0]->type == GGML_TYPE_MXFP4 || op->src[0]->type == GGML_TYPE_F32) {
-            return ame_compute_mx_forward(params, op);
+            const bool computed = ame_compute_mx_forward(params, op);
+            if (!computed) {
+                if (auto * shared = ame_rms_qkv_for(params, op)) {
+                    ame_rms_qkv_materialize(params, shared);
+                }
+            }
+            return computed;
         }
 
         static bool scalar_mode = (getenv("GGML_AME_SCALAR") != nullptr);
@@ -1676,10 +1948,196 @@ public:
 
 }  // namespace ggml::cpu::riscv_ame
 
+static bool ame_rmsnorm_qkv_pack_selftest(bool qwen) {
+    const int depth = qwen ? 1024 : 288, tokens = 256, blocks_per_row = depth / AME_MXFP4_K;
+    const int channels[] = {qwen ? 2048 : 288, qwen ? 1024 : 288, qwen ? 1024 : 288};
+    const int head_width = qwen ? 128 : 48;
+    constexpr uint32_t canary = 0x7fc56789;
+    ggml_context * meta = ggml_init({1048576, nullptr, true});
+    GGML_ASSERT(meta != nullptr);
+    ggml_tensor * input = ggml_new_tensor_2d(meta, GGML_TYPE_F32, depth, tokens);
+    ggml_tensor * gamma = ggml_new_tensor_1d(meta, GGML_TYPE_F32, depth);
+    ggml_tensor * norm = ggml_rms_norm(meta, input, 0x1p-16f);
+    ggml_tensor * activation = ggml_mul(meta, norm, gamma);
+    std::vector<float> source(depth * tokens), gamma_data(depth), norm_data(depth * tokens), activation_data(depth * tokens);
+    for (int index = 0; index < depth * tokens; ++index) source[index] = float(index % 101 - 50) * 0x1p-5f;
+    for (int index = 0; index < depth; ++index) gamma_data[index] = float(32 + index % 65) * 0x1p-6f;
+    input->data = source.data(); gamma->data = gamma_data.data();
+    norm->data = norm_data.data(); activation->data = activation_data.data();
+    ggml_tensor * projections[3];
+    ggml_backend_buffer_t weight_buffers[3];
+    std::vector<float> out[4];
+    for (int arm = 0; arm < 3; ++arm) {
+        ggml_tensor * weight = ggml_new_tensor_2d(meta, GGML_TYPE_MXFP4, depth, channels[arm]);
+        ggml_tensor * matrix = projections[arm] = ggml_mul_mat(meta, weight, activation);
+        weight_buffers[arm] = ggml_backend_ame_buffer_type_alloc_buffer(
+            ggml_backend_cpu_riscv_ame_buffer_type(), ggml_nbytes(weight));
+        GGML_ASSERT(weight_buffers[arm] != nullptr);
+        weight->buffer = weight_buffers[arm]; weight->data = ggml_backend_buffer_get_base(weight->buffer);
+        GGML_ASSERT(ggml_backend_buffer_init_tensor(weight->buffer, weight) == GGML_STATUS_SUCCESS);
+        std::vector<block_mxfp4> weights(channels[arm] * blocks_per_row);
+        for (size_t block = 0; block < weights.size(); ++block) {
+            weights[block].e = uint8_t(121 + (block + arm) % 7);
+            for (int byte = 0; byte < 16; ++byte)
+                weights[block].qs[byte] = uint8_t(13 * block + 7 * byte + 37 * arm);
+        }
+        ggml_backend_tensor_set(weight, weights.data(), 0, ggml_nbytes(weight));
+        ggml_set_output(matrix);
+        out[arm].resize(channels[arm] * tokens + 16);
+        matrix->data = out[arm].data() + 8;
+    }
+    ggml_tensor * positions = ggml_new_tensor_1d(meta, GGML_TYPE_I32, tokens);
+    int32_t position_data[tokens];
+    for (int index = 0; index < tokens; ++index) position_data[index] = index;
+    positions->data = position_data;
+    ggml_tensor * heads = ggml_reshape_3d(meta, projections[0], head_width, channels[0] / head_width, tokens);
+    heads->data = projections[0]->data;
+    std::vector<float> q_norm_data, q_mul_data;
+    if (qwen) {
+        ggml_tensor * q_norm = ggml_rms_norm(meta, heads, 0x1p-16f);
+        ggml_tensor * q_gamma = ggml_new_tensor_1d(meta, GGML_TYPE_F32, head_width);
+        q_gamma->data = gamma_data.data();
+        heads = ggml_mul(meta, q_norm, q_gamma);
+        q_norm_data.resize(channels[0] * tokens); q_mul_data.resize(channels[0] * tokens);
+        q_norm->data = q_norm_data.data(); heads->data = q_mul_data.data();
+    }
+    ggml_tensor * rope = ggml_rope_ext(meta, heads, positions, nullptr, head_width,
+        qwen ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL, tokens, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_set_output(rope);
+    out[3].resize(channels[0] * tokens + 16);
+    rope->data = out[3].data() + 8;
+    ggml_cgraph * graph = ggml_new_graph(meta);
+    ggml_build_forward_expand(graph, rope);
+    ggml_build_forward_expand(graph, projections[1]);
+    ggml_build_forward_expand(graph, projections[2]);
+    ggml_cgraph slice = ggml_graph_view(graph, 0, graph->n_nodes);
+    auto pool_params = ggml_threadpool_params_default(1);
+    auto pool = ggml_threadpool_new(&pool_params);
+    ggml_cplan plan = ggml_graph_plan(&slice, 1, pool);
+    plan.work_data = static_cast<uint8_t *>(ggml_aligned_malloc(plan.work_size));
+    GGML_ASSERT(plan.work_data != nullptr);
+    const size_t pack_bytes = size_t(tokens) * blocks_per_row * sizeof(block_mxfp4);
+    uint8_t * packed = plan.work_data + (64 - uintptr_t(plan.work_data) % 64) % 64;
+    GGML_ASSERT(pack_bytes <= plan.work_size - (packed - plan.work_data));
+    bool ok = ame_shared_rms_activation(&slice, activation);
+    ggml_ame_mx_activation_reuse alias = {};
+    alias.graph = &slice; alias.source = activation; alias.source_data = activation->data;
+    alias.workspace = packed; alias.workspace_bytes = pack_bytes + 128 * 128 * sizeof(float);
+    alias.interposer_work = packed + pack_bytes; alias.interposer_bytes = 128 * 128 * sizeof(float);
+    alias.incoming = true;
+    void * rope_data = rope->data;
+    rope->data = activation_data.data() + 1;
+    ok &= !ggml_ame_mx_activation_interpose(&alias, rope, slice.n_nodes - 3);
+    ggml_ame_mx_activation_reuse probe_reuse = {};
+    ggml_compute_params probe = {};
+    probe.nth = 1; probe.wdata = plan.work_data; probe.wsize = plan.work_size;
+    probe.ame_mx_reuse = &probe_reuse;
+    setenv("GGML_AME_RMSNORM_MXFP4", "pipeline+qkv", 1);
+    ok &= !ggml_ame_begin_rmsnorm_qkv(&probe, &slice, 0);
+    rope->data = rope_data;
+    auto partial = ggml_graph_view(graph, 0, graph->n_nodes - 1);
+    ok &= !ggml_ame_begin_rmsnorm_qkv(&probe, &partial, 0);
+    norm->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    ok &= !ggml_ame_begin_rmsnorm_qkv(&probe, &slice, 0);
+    norm->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    ame_restore_fcsr(0x06);
+    ok &= !ggml_ame_begin_rmsnorm_qkv(&probe, &slice, 0) && ame_read_fcsr() == 0x06;
+
+    std::vector<float> reference[4];
+    std::vector<uint8_t> reference_pack;
+    unsigned reference_csr = 0;
+    int reference_errno = 0;
+    auto * v_ctx = ame_buffer_ctx(weight_buffers[1]);
+    for (int test : {0, 1, 2}) {
+        if (qwen && test == 2) continue;
+        const unsigned initial = test == 1 ? 0x17 : 0x07;
+        if (test == 2) {
+            ame_packed_mx_info & entry = v_ctx->packed_mxfp4.at(projections[1]->src[0]);
+            ggml_aligned_free(entry.data, entry.size);
+            v_ctx->packed_mxfp4.clear();
+            v_ctx->mx_allocate = [](size_t) -> void * { errno = ENOMEM; return nullptr; };
+        }
+        for (int mode : {0, 1, 2}) {
+            if (test == 2 && mode == 1) continue;
+            setenv("GGML_AME_MXFP4_REUSE_ACTIVATION", mode == 1 ? "1" : "0", 1);
+            setenv("GGML_AME_RMSNORM_MXFP4", mode == 2 ? "pipeline+qkv" : "pipeline", 1);
+            for (auto & values : out)
+                for (auto & value : values) memcpy(&value, &canary, sizeof(value));
+            for (auto * values : {&norm_data, &activation_data})
+                for (auto & value : *values) memcpy(&value, &canary, sizeof(value));
+            memset(packed, mode ? 0x5a : 0xa5, pack_bytes);
+            const uint64_t before = g_mx_activation_reuse_hits;
+            const uint64_t pack_before = g_rms_qkv_packs;
+            const uint64_t native_before = g_rms_qkv_native;
+            const uint64_t fallback_before = g_rms_qkv_fallbacks;
+            const uint64_t v_alloc_before = v_ctx->mxfp4_allocation_attempts;
+            errno = 0;
+            ame_restore_fcsr(initial);
+            const auto status = ggml_graph_compute(&slice, &plan);
+            const unsigned after = ame_read_fcsr();
+            const int after_errno = errno;
+            const auto hits = g_mx_activation_reuse_hits - before;
+            const auto packs = g_rms_qkv_packs - pack_before;
+            const auto native = g_rms_qkv_native - native_before;
+            const auto fallbacks = g_rms_qkv_fallbacks - fallback_before;
+            ok &= status == GGML_STATUS_SUCCESS && hits == (test != 2 && (mode == 2 || (mode == 1 && test == 0)) ? 2 : 0);
+            ok &= packs == (mode == 2 ? 1u : 0u) && native == (mode == 2 ? (test == 2 ? 1u : 3u) : 0u) &&
+                fallbacks == (test == 2 && mode == 2 ? 1u : 0u);
+            for (const auto * values : {&norm_data, &activation_data}) {
+                for (const float & value : *values) {
+                    uint32_t bits;
+                    memcpy(&bits, &value, sizeof(bits));
+                    ok &= (bits == canary) == (mode == 2 && test != 2);
+                }
+            }
+            for (int index = 0; index < 3; ++index) {
+                const auto * ctx = ame_buffer_ctx(weight_buffers[index]);
+                if (test == 2 && index == 1) {
+                    ok &= ctx->mxfp4_allocation_attempts == v_alloc_before + 1 &&
+                        ctx->packed_mxfp4.at(projections[index]->src[0]).data == nullptr;
+                } else {
+                    ok &= ctx->mxfp4_allocation_attempts == 1 && ctx->packed_mxfp4.count(projections[index]->src[0]) == 1;
+                }
+            }
+            for (size_t index = 0; index < 4; ++index) {
+                const auto & values = out[index];
+                for (size_t offset = 0; offset < values.size(); ++offset) {
+                    uint32_t bits;
+                    memcpy(&bits, values.data() + offset, sizeof(bits));
+                    const bool is_guard = offset < 8 || offset >= values.size() - 8;
+                    ok &= (bits == canary) == is_guard;
+                }
+                if (mode == 0) reference[index] = values;
+                else ok &= memcmp(reference[index].data(), values.data(), values.size() * sizeof(float)) == 0;
+            }
+            if (mode == 0) {
+                reference_csr = after;
+                reference_errno = after_errno;
+                reference_pack.assign(packed, packed + pack_bytes);
+            } else {
+                ok &= after == reference_csr && after_errno == reference_errno &&
+                    memcmp(reference_pack.data(), packed, pack_bytes) == 0;
+            }
+            printf("AME_RMS_QKV_PACK_CASE K=%d tile_k=%d entry=%02x exit=%02x mode=%d hits=%llu "
+                "producer=%llu fused_native=%llu late_fallback=%llu oom=%d ok=%d\n",
+                depth, qwen ? 64 : 32, initial, after, mode, (unsigned long long) hits,
+                (unsigned long long) packs, (unsigned long long) native, (unsigned long long) fallbacks,
+                test == 2, ok);
+            fflush(stdout);
+        }
+        source[0] += 0.25f;
+    }
+    ggml_aligned_free(plan.work_data, plan.work_size);
+    ggml_threadpool_free(pool);
+    for (auto * buffer : weight_buffers) ggml_backend_buffer_free(buffer);
+    ggml_free(meta);
+    return ok;
+}
+
 extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, bool benchmark) {
     const char * names[] = {"GGML_AME_MX_CONFIG", "GGML_AME_MXFP4", "GGML_AME_MX32_VERIFIED",
         "GGML_AME_MXFP4_K64", "GGML_AME_SCALAR", "GGML_AME_RMSNORM_MXFP4",
-        "GGML_XSAI_OP_PROFILE_DETAIL", "GGML_XSAI_OP_PROGRESS_LOG"};
+        "GGML_XSAI_OP_PROFILE_DETAIL", "GGML_XSAI_OP_PROGRESS_LOG", "GGML_AME_MXFP4_REUSE_ACTIVATION"};
     std::vector<std::string> saved;
     std::vector<bool> present;
     for (const char * name : names) {
@@ -1690,6 +2148,12 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
     }
     std::fenv_t original_env;
     GGML_ASSERT(std::fegetenv(&original_env) == 0);
+    auto restore = [&]() {
+        for (size_t index = 0; index < saved.size(); ++index) {
+            if (present[index]) setenv(names[index], saved[index].c_str(), 1); else unsetenv(names[index]);
+        }
+        GGML_ASSERT(std::fesetenv(&original_env) == 0);
+    };
     GGML_ASSERT(std::fesetround(FE_TONEAREST) == 0);
     auto seed = []() {
         GGML_ASSERT(std::feclearexcept(FE_ALL_EXCEPT) == 0);
@@ -1698,24 +2162,17 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
     setenv("GGML_AME_MX_CONFIG", "CUTE_2Tops_128SCP", 1);
     setenv("GGML_AME_MXFP4", "1", 1);
     setenv("GGML_AME_MX32_VERIFIED", "1", 1);
-    GGML_ASSERT(fixture >= 0 && fixture <= 10);
-    // Keep fixtures 0..3 unchanged; add each legal single-Ktile boundary
-    // with 1/2/3 token panels, including two-slot reuse on the third panel.
-    // Fixture 10 is the explicit large performance shape, not a K-tail case.
-    const bool target_fixture = fixture == 10;
-    // The large perf entry keeps its timed output/work/light gates. Full
-    // allocator/abort/OOM acceptance remains in the native-only entry.
-    // Never change the historical fixtures' validation schedule.
-    const bool screen_only = benchmark && target_fixture;
-    const bool chunk_fixture = fixture >= 4 && fixture <= 9;
-    const int K = target_fixture ? 256 : chunk_fixture ? (fixture >= 7 ? 64 : 32) : 128;
-    const int nb = K / 32;
-    const int tile_k = chunk_fixture ? K : 64;
-    setenv("GGML_AME_MXFP4_K64", tile_k == 64 ? "1" : "0", 1);
-    setenv("GGML_AME_RMSNORM_MXFP4", chunk_fixture ? "pipeline-chunk" : "pipeline", 1);
-    const int M = target_fixture ? 512 : fixture == 3 ? 288 : fixture != 0 ? 256 : 128;
-    const int N = target_fixture ? 2048 : chunk_fixture ? 128 * (1 + (fixture - 4) % 3) :
-        fixture >= 2 ? 384 : fixture == 1 ? 128 : 256;
+    setenv("GGML_AME_MXFP4_K64", "1", 1);
+    setenv("GGML_AME_RMSNORM_MXFP4", "pipeline", 1);
+    if (fixture == 4 || fixture == 5) {
+        const bool ok = ame_rmsnorm_qkv_pack_selftest(fixture == 5);
+        restore();
+        return ok;
+    }
+    GGML_ASSERT(fixture >= 0 && fixture <= 3);
+    constexpr int K = 128, nb = K / 32;
+    const int M = fixture == 3 ? 288 : fixture != 0 ? 256 : 128;
+    const int N = fixture >= 2 ? 384 : fixture == 1 ? 128 : 256;
     const unsigned n_panels = unsigned(N / 128);
     constexpr uint32_t poison = 0x7fc56789;
     auto fill_poison = [&](std::vector<float> & values) {
@@ -1760,7 +2217,6 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
         input[row * K + k] = float((row * 17 + k * 13) % 127 - 63) * 0x1p-5f;
     for (int k = 0; k < K; ++k) gamma[k] = float(32 + k % 65) * 0x1p-6f;
     const auto source_before = input, gamma_before = gamma;
-    const auto weight_source_before = weights;
     x->data = input.data(); g->data = gamma.data();
     norm->data = norm_data.data() + 16; mul->data = mul_data.data() + 16;
     dst->data = output.data() + 16;
@@ -1883,12 +2339,8 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             fflush(stdout);
             fprintf(stderr, "AME_RMS_MEASUREMENT warmups_per_path=1 measured_per_path=3 "
             "mode_order=rotating cold_weight_pack_each_sample=yes oracle=once_outside_timers "
-            "profile=%s timing=whole_graph platform=caller_defined "
-            "fixture=%d M=%d N=%d K=%d logical_ops=%llu "
-            "oracle_reuse=%s\n",
-            ame_backend_env_enabled("GGML_AME_PROFILE") ? "enabled" : "disabled",
-            fixture, M, N, K, (unsigned long long) (2ULL * M * N * K),
-            target_fixture ? "packed_row_bitidentity" : "none");
+            "profile=%s timing=whole_graph platform=caller_defined\n",
+            ame_backend_env_enabled("GGML_AME_PROFILE") ? "enabled" : "disabled");
         }
         auto pool_params = ggml_threadpool_params_default(1);
         auto pool = ggml_threadpool_new(&pool_params);
@@ -1907,22 +2359,18 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
         bool oracle_ready = false;
         unsigned long saved_mfrm;
         asm volatile("csrr %0, 0x809" : "=r"(saved_mfrm));
-        const char * modes[] = {"off", "serial", "pipeline", "pipeline-chunk"};
-        const int mode_count = int(sizeof(modes) / sizeof(modes[0]));
+        const char * modes[] = {"off", "serial", "pipeline"};
         const int rounds = benchmark ? 4 : 1;
-        for (int invocation = 0; invocation < mode_count * rounds && ok; ++invocation) {
-            const int sample = invocation / mode_count, mode_index = invocation % mode_count;
-            const char * mode = modes[(mode_index + sample) % mode_count];
+        for (int invocation = 0; invocation < 3 * rounds && ok; ++invocation) {
+            const int sample = invocation / 3, mode_index = invocation % 3;
+            const char * mode = modes[(mode_index + sample) % 3];
             const char * phase = !benchmark ? "correctness" : sample == 0 ? "warmup" : "measured";
             setenv("GGML_AME_RMSNORM_MXFP4", mode, 1);
             fill_poison(norm_data); fill_poison(mul_data); fill_poison(output);
             const uint64_t calls = g_rms_fused_calls, panels = g_rms_prepared_panels;
             const uint64_t initial_panels = g_rms_admitted_first_panels;
             const uint64_t callbacks = g_rms_overlap_callbacks;
-            const uint64_t visits = g_rms_chunk_callback_visits;
-            const uint64_t chunks = g_rms_prepared_chunks, drains = g_rms_drain_chunks;
-            const uint64_t bounded_before = ggml_ame_rmsnorm_bounded_preflight_count();
-            // Same cold packed-weight identity for ALL variants. Do
+            // Same cold packed-weight identity for ALL three variants. Do
             // not compare the first cold baseline to later cache-hit fusion.
             // Source provisioning is outside every timer; actual repacking
             // and allocation remain inside graph compute.
@@ -1932,10 +2380,6 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             // test only. Reset/dump and all oracle/checker work are outside
             // its timer; the graph still includes cache allocation/packing.
             if (benchmark) ggml_ame_profile_reset();
-#if (defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE) || \
-    (defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT)
-            ggml_mxfp4_packed_stats_reset();
-#endif
             seed();
             const uint64_t begin = ame_backend_read_cycle();
             const auto status = ggml_graph_compute(graph, &plan);
@@ -1943,92 +2387,18 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             const int flags = std::fetestexcept(FE_ALL_EXCEPT);
             unsigned long after_mfrm;
             asm volatile("csrr %0, 0x809" : "=r"(after_mfrm));
-#if (defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE) || \
-    (defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT)
-            struct ggml_mxfp4_packed_stats packed_phase;
-            ggml_mxfp4_packed_stats_get(&packed_phase); // Before the untimed oracle.
-#endif
             const bool fused = strcmp(mode, "off") != 0;
-            const bool chunk = strcmp(mode, "pipeline-chunk") == 0;
-            const uint64_t expected_chunks = chunk ? uint64_t(n_panels - 1) * (K / tile_k) : 0;
-            const uint64_t expected_callbacks = chunk ? expected_chunks :
-                strcmp(mode, "pipeline") == 0 ? n_panels - 1 : 0U;
-            const uint64_t actual_calls = g_rms_fused_calls - calls;
-            const uint64_t actual_allocations = ame_buffer_ctx(buffer)->mxfp4_allocation_attempts - allocations;
-            const uint64_t actual_panels = g_rms_prepared_panels - panels;
-            const uint64_t actual_first_panels = g_rms_admitted_first_panels - initial_panels;
-            const uint64_t actual_callbacks = g_rms_overlap_callbacks - callbacks;
-            const uint64_t actual_visits = g_rms_chunk_callback_visits - visits;
-            const uint64_t actual_chunks = g_rms_prepared_chunks - chunks;
-            const uint64_t actual_drains = g_rms_drain_chunks - drains;
-            const uint64_t bounded_preflights =
-                ggml_ame_rmsnorm_bounded_preflight_count() - bounded_before;
-#if defined(GGML_AME_RMS_PREFLIGHT_BOUNDS) && GGML_AME_RMS_PREFLIGHT_BOUNDS
-            const unsigned bounds_compiled = 1;
-#else
-            const unsigned bounds_compiled = 0;
-#endif
-            const bool bounds_ok = !target_fixture ||
-                bounded_preflights == (fused ? bounds_compiled : 0U);
-            const bool status_ok = status == GGML_STATUS_SUCCESS;
-            const bool mfrm_ok = after_mfrm == saved_mfrm;
-            const bool counters_ok = actual_calls == unsigned(fused) && actual_allocations == 1 &&
-                actual_panels == (fused ? n_panels : 0U) &&
-                actual_first_panels == unsigned(fused) && actual_callbacks == expected_callbacks &&
-                actual_visits == expected_chunks && actual_chunks == expected_chunks && actual_drains == 0;
-#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-            ok &= packed_phase.adjacent_fallbacks == 0 && (fused ?
-                packed_phase.adjacent_calls > 0 && packed_phase.adjacent_blocks > 0 :
-                packed_phase.adjacent_calls == 0 && packed_phase.adjacent_blocks == 0);
-#endif
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-            ok &= packed_phase.amax_reuse_calls == packed_phase.adjacent_calls &&
-                packed_phase.amax_reuse_blocks == packed_phase.adjacent_blocks &&
-                packed_phase.amax_reuse_fallbacks == 0;
-#endif
-            const bool prior_ok = ok;
-            const bool first_oracle = !oracle_ready;
-            if (first_oracle) {
+            ok &= status == GGML_STATUS_SUCCESS && after_mfrm == saved_mfrm &&
+                g_rms_fused_calls - calls == unsigned(fused) &&
+                ame_buffer_ctx(buffer)->mxfp4_allocation_attempts == allocations + 1 &&
+                g_rms_prepared_panels - panels == (fused ? n_panels : 0U) &&
+                g_rms_admitted_first_panels - initial_panels == unsigned(fused) &&
+                g_rms_overlap_callbacks - callbacks == (strcmp(mode, "pipeline") == 0 ? n_panels - 1 : 0U);
+            if (!oracle_ready) {
                 GGML_ASSERT(!fused); // The first warmup/control is always off.
                 baseline.assign(output.begin() + 16, output.end() - 16);
                 weighted.assign(mul_data.begin() + 16, mul_data.end() - 16);
                 baseline_flags = flags;
-                if (target_fixture) {
-                    // Independent original ordered RMS, not another GGML
-                    // graph compiled with the same candidate reduction flag.
-                    // This fixture's exact F32-square inputs also require
-                    // bitexact normalized/weighted values before its oracle.
-                    uint32_t max_factor_ulp = 0;
-                    bool reference_match = true;
-                    for (int row = 0; row < N; ++row) {
-                        const float * xr = input.data() + row * K;
-                        const float reference_r = ggml_vec_rms_norm_scale_f32_reference(K, xr, eps);
-                        const float candidate_r = ggml_vec_rms_norm_scale_f32(K, xr, eps);
-                        uint32_t reference_bits, candidate_bits;
-                        memcpy(&reference_bits, &reference_r, sizeof(reference_bits));
-                        memcpy(&candidate_bits, &candidate_r, sizeof(candidate_bits));
-                        const uint32_t ulp = reference_bits >= candidate_bits ?
-                            reference_bits - candidate_bits : candidate_bits - reference_bits;
-                        max_factor_ulp = std::max(max_factor_ulp, ulp);
-                        reference_match &= reference_r > 0 && candidate_r > 0 &&
-                            std::isfinite(reference_r) && std::isfinite(candidate_r);
-                        for (int k = 0; k < K; ++k) {
-                            volatile float reference_norm = xr[k] * reference_r;
-                            volatile float reference_weighted = reference_norm * gamma[k];
-                            const float rn = reference_norm, rw = reference_weighted;
-                            reference_match &= memcmp(&rn, norm_data.data() + 16 + row * K + k,
-                                sizeof(float)) == 0 &&
-                                memcmp(&rw, weighted.data() + row * K + k, sizeof(float)) == 0;
-                        }
-                    }
-                    const bool reference_ok = reference_match && max_factor_ulp <= 3;
-                    ok &= reference_ok;
-                    fprintf(stderr, "AME_RMS_REFERENCE_CHECK fixture=10 rows=%d K=%d "
-                        "ordered_reference=yes max_factor_ulp=%u factor_ulp_limit=3 "
-                        "normalized_weighted=fixed_fixture_bitexact timing=outside_samples "
-                        "exact=%s full_model_quality=not_inferred\n",
-                        N, K, max_factor_ulp, reference_ok ? "PASS" : "FAIL");
-                }
                 // Independent logical GGML blocks, exact double products,
                 // explicit F32 rounding after every K32, never a whole-K dot.
                 std::vector<block_mxfp4> activations(N * nb);
@@ -2040,95 +2410,27 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
                     const unsigned code = (b.qs[lane % 16] >> (lane < 16 ? 0 : 4)) & 15;
                     return std::ldexp((code & 8 ? -1.0 : 1.0) * mag[code & 7], int(b.e) - 127);
                 };
-                for (int col = 0; col < N; ++col) {
-                    // The deterministic input generator repeats every 127 rows.
-                    // Reuse only the untimed reference, and only after proving
-                    // the actual packed rows equal; mismatches use the full dot.
-                    if (target_fixture && col >= 127 && memcmp(
-                            activations.data() + col * nb,
-                            activations.data() + (col % 127) * nb,
-                            size_t(nb) * sizeof(block_mxfp4)) == 0) {
-                        memcpy(oracle.data() + col * M, oracle.data() + (col % 127) * M,
-                            size_t(M) * sizeof(float));
-                        continue;
+                for (int col = 0; col < N; ++col) for (int row = 0; row < M; ++row) {
+                    float acc = 0;
+                    for (int kb = 0; kb < nb; ++kb) {
+                        double sum = 0;
+                        for (int lane = 0; lane < 32; ++lane)
+                            sum += decode(weights[row * nb + kb], lane) * decode(activations[col * nb + kb], lane);
+                        volatile float rounded = float(double(acc) + sum);
+                        acc = rounded;
                     }
-                    for (int row = 0; row < M; ++row) {
-                        // Weight exponents/codes repeat every lcm(5,16)=80 rows.
-                        // No assumption about generator identity substitutes for
-                        // checking the packed bytes used by this oracle.
-                        if (target_fixture && row >= 80 && memcmp(
-                                weights.data() + row * nb,
-                                weights.data() + (row % 80) * nb,
-                                size_t(nb) * sizeof(block_mxfp4)) == 0) {
-                            oracle[col * M + row] = oracle[col * M + row % 80];
-                            continue;
-                        }
-                        float acc = 0;
-                        for (int kb = 0; kb < nb; ++kb) {
-                            double sum = 0;
-                            for (int lane = 0; lane < 32; ++lane)
-                                sum += decode(weights[row * nb + kb], lane) * decode(activations[col * nb + kb], lane);
-                            volatile float rounded = float(double(acc) + sum);
-                            acc = rounded;
-                        }
-                        oracle[col * M + row] = acc;
-                    }
+                    oracle[col * M + row] = acc;
                 }
+                ok &= memcmp(baseline.data(), oracle.data(), oracle.size() * sizeof(float)) == 0;
                 oracle_ready = true;
+            } else {
+                ok &= memcmp(output.data() + 16, oracle.data(), oracle.size() * sizeof(float)) == 0 &&
+                    flags == baseline_flags;
             }
-            size_t mismatch_index = SIZE_MAX;
-            uint32_t mismatch_actual = 0, mismatch_expected = 0;
-            for (size_t i = 0; i < oracle.size(); ++i) {
-                uint32_t actual_bits, expected_bits;
-                memcpy(&actual_bits, output.data() + 16 + i, sizeof(actual_bits));
-                memcpy(&expected_bits, oracle.data() + i, sizeof(expected_bits));
-                if (actual_bits != expected_bits) {
-                    mismatch_index = i;
-                    mismatch_actual = actual_bits;
-                    mismatch_expected = expected_bits;
-                    break;
-                }
-            }
-            const bool oracle_match = mismatch_index == SIZE_MAX;
-            const bool flags_ok = first_oracle || flags == baseline_flags;
-            const bool norm_canary_ok = !fused || is_poison(norm_data.data(), norm_data.size());
-            const bool mul_canary_ok = !fused || is_poison(mul_data.data(), mul_data.size());
-            const bool output_canary_ok = is_poison(output.data(), 16) &&
-                is_poison(output.data() + 16 + M * N, 16);
-            const bool input_unchanged = input == source_before;
-            const bool gamma_unchanged = gamma == gamma_before;
-            const bool weight_source_unchanged = memcmp(
-                weights.data(), weight_source_before.data(), weights.size() * sizeof(weights[0])) == 0;
-            const bool iteration_ok = status_ok && mfrm_ok && counters_ok && oracle_match && flags_ok &&
-                norm_canary_ok && mul_canary_ok && output_canary_ok && input_unchanged && gamma_unchanged &&
-                bounds_ok;
-            ok &= iteration_ok;
-            if (!iteration_ok) {
-                fprintf(stderr,
-                    "AME_RMS_FUSION_DIAG mode=%s phase=%s sample=%d prior_ok=%d "
-                    "status_ok=%d mfrm_before=%lx mfrm_after=%lx mfrm_ok=%d "
-                    "calls=%llu/%u allocations=%llu/1 panels=%llu/%u first_panels=%llu/%u "
-                    "callbacks=%llu/%llu visits=%llu/%llu chunks=%llu/%llu drains=%llu/0 "
-                    "oracle_match=%d mismatch_index=%zu actual=0x%08x expected=0x%08x "
-                    "flags=0x%x expected_flags=0x%x flags_ok=%d "
-                    "norm_canary=%d mul_canary=%d output_canary=%d input_unchanged=%d "
-                    "gamma_unchanged=%d weight_source_unchanged=%d\n",
-                    mode, phase, sample, prior_ok ? 1 : 0, status_ok ? 1 : 0,
-                    saved_mfrm, after_mfrm, mfrm_ok ? 1 : 0,
-                    (unsigned long long) actual_calls, unsigned(fused),
-                    (unsigned long long) actual_allocations,
-                    (unsigned long long) actual_panels, fused ? n_panels : 0U,
-                    (unsigned long long) actual_first_panels, unsigned(fused),
-                    (unsigned long long) actual_callbacks, (unsigned long long) expected_callbacks,
-                    (unsigned long long) actual_visits, (unsigned long long) expected_chunks,
-                    (unsigned long long) actual_chunks, (unsigned long long) expected_chunks,
-                    (unsigned long long) actual_drains,
-                    oracle_match ? 1 : 0, mismatch_index, mismatch_actual, mismatch_expected,
-                    flags, baseline_flags, flags_ok ? 1 : 0,
-                    norm_canary_ok ? 1 : 0, mul_canary_ok ? 1 : 0, output_canary_ok ? 1 : 0,
-                    input_unchanged ? 1 : 0, gamma_unchanged ? 1 : 0,
-                    weight_source_unchanged ? 1 : 0);
-            }
+            if (fused) ok &= is_poison(norm_data.data(), norm_data.size()) &&
+                is_poison(mul_data.data(), mul_data.size());
+            ok &= is_poison(output.data(), 16) && is_poison(output.data() + 16 + M * N, 16) &&
+                input == source_before && gamma == gamma_before;
             fprintf(benchmark ? stderr : stdout,
                 "AME_RMS_FUSION_CASE mode=%s phase=%s sample=%d seq=%d hidden=%d output=%d cycles=%llu "
                 "scope=whole_graph_RMS_gamma_quant_pack_GEMM_output flags=%x "
@@ -2136,9 +2438,6 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
                 "fused_calls=%llu panels=%llu callbacks=%llu norm_gamma_preflight=%llu panel_quant_pack=%llu "
                 "first_panels_admitted=%llu "
                 "activation_slots=%u slot_rewrites=%u output_channel_tiles=%d "
-                "chunk_callback_visits=%llu prepared_chunks=%llu drain_chunks=%llu "
-                "callback_prepare_cycles=%llu drain_prepare_cycles=%llu prepare_subsets_not_additive=yes "
-                "bounded_preflights=%llu bounds_compiled=%u "
                 "exact=%s performance_platform=caller_defined\n",
                 mode, phase, sample, N, K, M, (unsigned long long) elapsed, flags,
                 (unsigned long long) (g_rms_fused_calls - calls),
@@ -2148,55 +2447,11 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
                 (unsigned long long) (fused ? g_rms_last_prepare_cycles : 0),
                 (unsigned long long) (g_rms_admitted_first_panels - initial_panels),
                 fused ? std::min(n_panels, 2U) : 0U, fused && n_panels > 2 ? n_panels - 2 : 0U,
-                (M + 127) / 128,
-                (unsigned long long) (g_rms_chunk_callback_visits - visits),
-                (unsigned long long) (g_rms_prepared_chunks - chunks),
-                (unsigned long long) (g_rms_drain_chunks - drains),
-                (unsigned long long) (fused ? g_rms_last_callback_prepare_cycles : 0),
-                (unsigned long long) (fused ? g_rms_last_drain_prepare_cycles : 0),
-                (unsigned long long) bounded_preflights, bounds_compiled,
-                ok ? "PASS" : "FAIL");
+                (M + 127) / 128, ok ? "PASS" : "FAIL");
             if (benchmark) {
                 fprintf(stderr, "AME_RMS_SAMPLE_PROFILE_BEGIN mode=%s phase=%s sample=%d calls_expected=1\n",
                     mode, phase, sample);
                 ggml_ame_profile_dump_now();
-#if defined(GGML_MXFP4_PACKED_PHASE_PROFILE) && GGML_MXFP4_PACKED_PHASE_PROFILE
-                fprintf(stderr, "AME_RMS_PACKED_PHASE mode=%s phase=%s sample=%d "
-                    "calls=%llu packed_calls=%llu packed_blocks=%llu qualification_fallbacks=%llu packed_nv_fallbacks=%llu "
-                    "rms_rows=%llu rms_blocks=%llu rms_stats=%llu rms_apply=%llu rms_finite_scan=%llu "
-                    "packed_qualification=%llu vector_pack=%llu split_reorder=%llu rms_AME_reorder=%llu "
-                    "scope=production_packed_instrumented raw_cycles_no_overhead_subtraction=yes "
-                    "helper_counters_exclude_unfused_RMS=yes rejected_qualification_cycles_not_counted=yes\n",
-                    mode, phase, sample,
-                    (unsigned long long) packed_phase.calls, (unsigned long long) packed_phase.packed_calls,
-                    (unsigned long long) packed_phase.packed_blocks,
-                    (unsigned long long) packed_phase.qualification_fallbacks,
-                    (unsigned long long) packed_phase.packed_nv_fallbacks,
-                    (unsigned long long) packed_phase.rms_rows, (unsigned long long) packed_phase.rms_blocks,
-                    (unsigned long long) packed_phase.rms_stats_cycles,
-                    (unsigned long long) packed_phase.rms_apply_cycles,
-                    (unsigned long long) packed_phase.rms_scan_cycles,
-                    (unsigned long long) packed_phase.qualification_cycles,
-                    (unsigned long long) packed_phase.vector_pack_cycles,
-                    (unsigned long long) packed_phase.split_reorder_cycles,
-                    (unsigned long long) packed_phase.rms_reorder_cycles);
-#endif
-#if defined(GGML_AME_MXFP4_ADJACENT) && GGML_AME_MXFP4_ADJACENT
-                fprintf(stderr, "AME_RMS_ADJACENT_OUTPUT mode=%s phase=%s sample=%d "
-                    "calls=%llu packed_blocks=%llu fallbacks=%llu generic_layout_unchanged=yes\n",
-                    mode, phase, sample,
-                    (unsigned long long) packed_phase.adjacent_calls,
-                    (unsigned long long) packed_phase.adjacent_blocks,
-                    (unsigned long long) packed_phase.adjacent_fallbacks);
-#endif
-#if defined(GGML_AME_MXFP4_REUSE_AMAX) && GGML_AME_MXFP4_REUSE_AMAX
-                fprintf(stderr, "AME_RMS_AMAX_REUSE mode=%s phase=%s sample=%d "
-                    "calls=%llu packed_blocks=%llu fallbacks=%llu same_call_weighted_lanes=yes\n",
-                    mode, phase, sample,
-                    (unsigned long long) packed_phase.amax_reuse_calls,
-                    (unsigned long long) packed_phase.amax_reuse_blocks,
-                    (unsigned long long) packed_phase.amax_reuse_fallbacks);
-#endif
                 fprintf(stderr, "AME_RMS_SAMPLE_PROFILE_END mode=%s phase=%s sample=%d\n", mode, phase, sample);
             }
             if (!ok) break;
@@ -2206,20 +2461,11 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             // The following allocation/abort/OOM correctness cases are NOT
             // samples. Keep them out of every delimited sample profile.
             ggml_ame_profile_reset();
-            if (screen_only) {
-                fprintf(stderr, "AME_RMS_MEASUREMENT_END measured_graphs=%u warmup_graphs=%d "
-                    "extra_correctness_follows=no full_acceptance=deferred exact=%s\n",
-                    native_variants >= unsigned(mode_count) ? native_variants - mode_count : 0,
-                    mode_count, ok ? "PASS" : "FAIL");
-            } else {
-                fprintf(stderr, "AME_RMS_MEASUREMENT_END measured_graphs=%u warmup_graphs=%d "
-                    "extra_correctness_follows=yes exact=%s\n",
-                    native_variants >= unsigned(mode_count) ? native_variants - mode_count : 0,
-                    mode_count, ok ? "PASS" : "FAIL");
-            }
+            fprintf(stderr, "AME_RMS_MEASUREMENT_END measured_graphs=%u warmup_graphs=3 "
+                "extra_correctness_follows=yes exact=%s\n",
+                native_variants >= 3 ? native_variants - 3 : 0, ok ? "PASS" : "FAIL");
         }
-        for (const char * allocator_mode : {"pipeline", "pipeline-chunk"}) {
-            if (!ok || screen_only) break;
+        if (ok) {
             // Exercise the REAL allocator seam: RMS/MUL may share an owned
             // allocation despite both having view_src == NULL.
             void * old_norm = norm->data, * old_mul = mul->data;
@@ -2231,7 +2477,7 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
                 memcpy(static_cast<float *>(norm->data) + i, &poison, 4);
             for (size_t i = 0; i < ggml_nelements(dst); ++i)
                 memcpy(static_cast<float *>(dst->data) + i, &poison, 4);
-            setenv("GGML_AME_RMSNORM_MXFP4", allocator_mode, 1);
+            setenv("GGML_AME_RMSNORM_MXFP4", "pipeline", 1);
             const uint64_t calls = g_rms_fused_calls;
             seed();
             const auto status = ggml_graph_compute(graph, &plan);
@@ -2248,10 +2494,8 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             norm->buffer = mul->buffer = dst->buffer = nullptr;
             ggml_gallocr_free(galloc);
         }
-        for (const char * abort_mode : {"pipeline", "pipeline-chunk"}) {
-            if (!ok || screen_only) break;
+        if (ok) {
             // A real abort after norm must not execute gamma or write Y.
-            setenv("GGML_AME_RMSNORM_MXFP4", abort_mode, 1);
             int abort_checks = 0;
             plan.abort_callback = [](void * opaque) {
                 ++*static_cast<int *>(opaque);
@@ -2269,7 +2513,7 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             printf("AME_RMS_ABORT_CASE checks=%d elided_nodes=0 output_untouched=%s\n",
                 abort_checks, ok ? "PASS" : "FAIL");
         }
-        if (ok && !screen_only) {
+        if (ok) {
             // Canonical allocation failure seam, on this test's OWN buffer.
             // Both controls must execute the real generic CPU fallback, not
             // compare fallback Q8 activations against successful W4A4 output.
@@ -2279,7 +2523,7 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             ggml_backend_tensor_set(w, weights.data(), 0, ggml_nbytes(w));
             std::vector<float> fallback;
             int fallback_flags = 0;
-            for (const char * mode : {"off", "pipeline", "pipeline-chunk"}) {
+            for (const char * mode : {"off", "pipeline"}) {
                 setenv("GGML_AME_RMSNORM_MXFP4", mode, 1);
                 fill_poison(norm_data); fill_poison(mul_data); fill_poison(output);
                 const auto calls = g_rms_fused_calls;
@@ -2300,7 +2544,7 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
             }
             ctx->mx_allocate = allocate;
             ok &= input == source_before && gamma == gamma_before;
-            printf("AME_RMS_OOM_CASE real_CPU_fallback_controls=3 fused_calls=0 "
+            printf("AME_RMS_OOM_CASE real_CPU_fallback_controls=2 fused_calls=0 "
                 "full_output_flags_exact=%s\n", ok ? "PASS" : "FAIL");
         }
         ggml_threadpool_free(pool);
@@ -2308,19 +2552,11 @@ extern "C" bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, b
     ggml_aligned_free(work, work_size);
     ggml_backend_buffer_free(buffer);
     ggml_free(meta);
-    for (size_t i = 0; i < saved.size(); ++i) {
-        if (present[i]) setenv(names[i], saved[i].c_str(), 1); else unsetenv(names[i]);
-    }
-    GGML_ASSERT(std::fesetenv(&original_env) == 0);
-    if (ok && screen_only) {
-        printf("AME_RMS_FULL_ACCEPTANCE_DEFERRED fixture=10 "
-            "post_sample_allocator_abort_oom=not_run original_native_fixture_retained=yes\n");
-    }
+    restore();
     if (ok) printf("AME_RMS_FUSION_%s_PASS rejected=%u observer_rejects=%u full_graph_variants=%u "
         "whole_domain_before_issue=yes scalar_decline_transaction=pass fanout_and_slice=reject "
         "live_partial_alias=reject input_unchanged=yes full_output_bitexact=%s "
-        "native_performance=not_inferred\n",
-        run_native ? (screen_only ? "SCREEN" : "NATIVE") : "SOFTWARE", rejected, observer_rejects, native_variants,
+        "native_performance=not_inferred\n", run_native ? "NATIVE" : "SOFTWARE", rejected, observer_rejects, native_variants,
         run_native ? "yes" : "not_run");
     return ok;
 }
