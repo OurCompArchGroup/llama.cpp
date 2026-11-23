@@ -245,7 +245,38 @@ if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
+    target_include_directories(test-quantize-fns PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    if (GGML_RV_MXFP4_ENCODE)
+        target_compile_definitions(test-quantize-fns PRIVATE GGML_RV_MXFP4_ENCODE)
+    endif()
+    if (GGML_RV_MXFP4_PACKED)
+        target_compile_definitions(test-quantize-fns PRIVATE GGML_RV_MXFP4_PACKED)
+    endif()
+    if (GGML_RV_AME)
+        target_compile_definitions(test-quantize-fns PRIVATE GGML_TEST_RV_AME)
+    else()
+        # Exercise the real, hardware-independent packer on hosts too. AME
+        # builds already link this implementation from ggml-cpu.
+        target_sources(test-quantize-fns PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu/arch/riscv/ame/ame-helper.c)
+    endif()
     llama_build_and_test(test-quantize-perf.cpp)
+    target_include_directories(test-quantize-perf PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    if (GGML_RV_AME)
+        target_compile_definitions(test-quantize-perf PRIVATE GGML_TEST_RV_AME)
+    endif()
+    # The one-row diagnostic calls private CPU op owners. Do not introduce
+    # references to hidden symbols into the ordinary shared-library build.
+    if (NOT BUILD_SHARED_LIBS)
+        target_compile_definitions(test-quantize-perf PRIVATE GGML_TEST_RMS_INTERNAL)
+    endif()
+    if (NOT GGML_RV_AME AND NOT BUILD_SHARED_LIBS)
+        target_sources(test-quantize-perf PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu/arch/riscv/ame/ame-helper.c)
+    endif()
+    if (GGML_MXFP4_PHASE_PROFILE)
+        target_compile_definitions(test-quantize-perf PRIVATE GGML_MXFP4_PHASE_PROFILE)
+    endif()
     llama_build_and_test(test-rope.cpp)
 endif()
 

@@ -53,6 +53,37 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
+    if (GGML_MXFP4_PHASE_PROFILE)
+        if (NOT GGML_SYSTEM_ARCH STREQUAL "riscv64" OR NOT GGML_RVV OR BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+            message(FATAL_ERROR "GGML_MXFP4_PHASE_PROFILE requires a static RV64 RVV build")
+        endif()
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_MXFP4_PHASE_PROFILE)
+    endif()
+
+    if (GGML_RV_MXFP4_ENCODE)
+        if (NOT GGML_SYSTEM_ARCH STREQUAL "riscv64" OR NOT GGML_RVV OR BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+            message(FATAL_ERROR "GGML_RV_MXFP4_ENCODE requires an explicit static RV64 RVV build and matching experimental CPU")
+        endif()
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_RV_MXFP4_ENCODE)
+    endif()
+
+    if (GGML_RV_MXFP4_PACKED)
+        if (NOT GGML_SYSTEM_ARCH STREQUAL "riscv64" OR NOT GGML_RVV OR NOT GGML_RV_AME OR
+            BUILD_SHARED_LIBS OR GGML_BACKEND_DL OR GGML_MXFP4_PHASE_PROFILE)
+            message(FATAL_ERROR "GGML_RV_MXFP4_PACKED requires a static RV64 RVV AME build, matching R39 CPU and no phase profiling")
+        endif()
+        if (NOT IS_ABSOLUTE "${GGML_RV_MXFP4_PACKED_ASM}" OR
+            NOT EXISTS "${GGML_RV_MXFP4_PACKED_ASM}")
+            message(FATAL_ERROR "GGML_RV_MXFP4_PACKED_ASM must name the existing AM matop.S owner")
+        endif()
+        # Reuse the accepted AM batch implementation, not a parallel encoder.
+        # ggml's existing ASM language and target architecture flags apply.
+        list(APPEND GGML_CPU_SOURCES "${GGML_RV_MXFP4_PACKED_ASM}")
+        set_source_files_properties("${GGML_RV_MXFP4_PACKED_ASM}" PROPERTIES
+            COMPILE_DEFINITIONS "MXFP_RVV_PACK=1;MXFP_RVV_PACK_BATCH=1;MXFP_RVV_PACK_PAIR=2")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_RV_MXFP4_PACKED)
+    endif()
+
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)

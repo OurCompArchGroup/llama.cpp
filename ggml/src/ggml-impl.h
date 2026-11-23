@@ -479,9 +479,15 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
     }
     // Note: NaNs are not handled here
 
+#if defined(GGML_MXFP4_INLINE_E8M0_HALF) && GGML_MXFP4_INLINE_E8M0_HALF
+    // Reuse the original exact bitcast. Avoid an out-of-line four-byte
+    // memcpy under AM -fno-builtin, without changing any scale arithmetic.
+    return fp32_from_bits(bits);
+#else
     float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
+#endif
 }
 
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)

@@ -25,6 +25,9 @@
 #include <algorithm>
 #include <array>
 #include <cfloat>
+#include <cerrno>
+#include <cfenv>
+#include <cmath>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
@@ -105,6 +108,8 @@ static inline uint64_t read_instret(void) {
 
 #if defined(__GNUC__)
 extern "C" void ggml_ame_profile_reset(void) __attribute__((weak));
+extern "C" void ggml_ame_profile_dump_now(void) __attribute__((weak));
+extern "C" void ggml_ame_quantize_whole_k_test(const float *, int64_t, int8_t *, float *) __attribute__((weak));
 #endif
 
 static void reset_ame_profile_if_available(void) {
@@ -115,8 +120,17 @@ static void reset_ame_profile_if_available(void) {
 #endif
 }
 
+static void dump_ame_profile_if_available(void) {
+#if defined(__GNUC__)
+    if (ggml_ame_profile_dump_now != nullptr) {
+        ggml_ame_profile_dump_now();
+    }
+#endif
+}
+
 static ggml_backend_buffer_type_t g_forced_buft = nullptr;
 static const char * g_forced_buft_name = nullptr;
+static int g_test_threads = 0;
 
 static ggml_backend_buffer_type_t test_buft_from_name(const char * name) {
     if (name == nullptr) {
@@ -142,7 +156,10 @@ static bool forced_buft_is_ame() {
 }
 
 static int effective_test_threads() {
-    return forced_buft_is_ame() ? 1 : (int) N_THREADS;
+    if (g_test_threads > 0) {
+        return g_test_threads;
+    }
+    return forced_buft_is_ame() ? 1 : std::max(1, (int) N_THREADS);
 }
 
 static bool xsai_test_progress_enabled() {
@@ -231,6 +248,112 @@ static int forced_ame_perf_runs() {
     }
 
     return (int) value;
+}
+
+static bool ame_perf_no_warmup() {
+    const char * env = std::getenv("GGML_TEST_BACKEND_OPS_AME_NO_WARMUP");
+    return forced_buft_is_ame() && env != nullptr && env[0] != '\0' &&
+        strcmp(env, "0") != 0 && strcmp(env, "false") != 0 &&
+        strcmp(env, "FALSE") != 0 && strcmp(env, "off") != 0 &&
+        strcmp(env, "OFF") != 0 && strcmp(env, "no") != 0;
+}
+
+static bool ame_whole_k_oracle_requested() {
+    const char * value = std::getenv("XSAI_TEST_BACKEND_OPS_AME_ORACLE");
+    return value != nullptr && value[0] != '\0';
+}
+
+// Reference rounding deliberately does not share code with the AME converter.
+// Its input is bounded before integer conversion, including nonfinite values.
+static int8_t ame_oracle_rne_i8(double value) {
+    if (std::isnan(value)) {
+        return 0;
+    }
+    if (value >= 127.0) {
+        return 127;
+    }
+    if (value <= -127.0) {
+        return -127;
+    }
+    const double magnitude = std::fabs(value);
+    int result = (int) magnitude;
+    const double fraction = magnitude - result;
+    result += fraction > 0.5 || (fraction == 0.5 && (result & 1));
+    return (int8_t) (value < 0.0 ? -result : result);
+}
+
+static float ame_oracle_static_sx() {
+    const char * value = std::getenv("GGML_AME_WHOLE_K_STATIC_SX");
+    if (value == nullptr || value[0] == '\0') {
+        return 0.0f;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const float sx = std::strtof(value, &end);
+    int exponent;
+    if (errno == ERANGE || end == value || *end != '\0' || !std::isfinite(sx) || sx < 0.0f ||
+        (sx != 0.0f && (std::frexp(sx, &exponent) != 0.5f ||
+         ggml_fp16_to_fp32(ggml_fp32_to_fp16(sx)) != sx))) {
+        return -1.0f;
+    }
+    return sx;
+}
+
+static bool ame_static_quantizer_selftest(float sx) {
+#if defined(__GNUC__)
+    if (ggml_ame_quantize_whole_k_test == nullptr) {
+        fprintf(stderr, "AME_STATIC_QUANT_FAIL missing production converter\n");
+        return false;
+    }
+    const float inf = INFINITY;
+    const std::vector<float> values = {
+        0.0f, -0.0f, sx * 0.5f, sx * -0.5f, sx * 1.5f, sx * -1.5f,
+        sx * 2.5f, sx * -2.5f, sx * 126.5f, sx * -126.5f,
+        sx * 127.5f, sx * -127.5f, sx * 128.0f, sx * -128.0f,
+        sx * 40000.0f, sx * -40000.0f, FLT_MAX, -FLT_MAX, inf, -inf, NAN,
+        std::nextafter(sx * 2.5f, inf), std::nextafter(sx * 2.5f, -inf),
+        std::nextafter(sx * -2.5f, inf), std::nextafter(sx * -2.5f, -inf),
+    };
+    const int original_round = std::fegetround();
+    bool ok = true;
+    size_t checked = 0;
+    for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        if (std::fesetround(rounding) != 0) {
+            ok = false;
+            break;
+        }
+        for (int k : {1, 31, 32, 63, 64, 65, 127, 128}) {
+            const int padded = ((k + 63) / 64) * 64;
+            std::vector<float> x(k);
+            for (int i = 0; i < k; ++i) {
+                x[i] = values[i % values.size()];
+            }
+            std::vector<int8_t> q(padded + 32, 0x55);
+            std::vector<float> scales(padded / 64 + 2, -1.0f);
+            ggml_ame_quantize_whole_k_test(x.data(), k, q.data() + 16, scales.data() + 1);
+            ok = ok && std::fegetround() == rounding;
+            for (int i = 0; i < padded; ++i) {
+                const int8_t expected = i < k ? ame_oracle_rne_i8(double(x[i]) / double(sx)) : 0;
+                ok = ok && q[16 + i] == expected;
+                ++checked;
+            }
+            for (int i = 0; i < 16; ++i) {
+                ok = ok && q[i] == 0x55 && q[16 + padded + i] == 0x55;
+            }
+            for (int i = 1; i <= padded / 64; ++i) {
+                ok = ok && scales[i] == sx;
+            }
+            ok = ok && scales.front() == -1.0f && scales.back() == -1.0f;
+        }
+    }
+    ok = (std::fesetround(original_round) == 0) && ok;
+    printf("AME_STATIC_QUANT_%s checked=%zu rounding_modes=4 padding_canaries=1 sx=%.9g\n",
+           ok ? "PASS" : "FAIL", checked, double(sx));
+    return ok;
+#else
+    GGML_UNUSED(sx);
+    return false;
+#endif
 }
 
 static void print_available_bufts() {
@@ -1480,6 +1603,15 @@ struct test_case {
         return 0;
     }
 
+    virtual bool verify_perf_result(ggml_tensor * out, std::string & error) {
+        GGML_UNUSED(out);
+        if (ame_whole_k_oracle_requested()) {
+            error = "whole-K oracle is only implemented for the selected MUL_MAT fixtures";
+            return false;
+        }
+        return true;
+    }
+
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual ggml_tensor * tensor_to_preallocate(ggml_tensor * out, ggml_backend_buffer_type_t buft) {
@@ -1817,14 +1949,20 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
         xsai_test_progress_log(cmp_ok ? "test_compare_done" : "test_compare_fail", current_op_name, vars());
 
+        // Reuse the post-compute oracle hook on the original backend1 tensors.
+        // CPU-vs-CPU can otherwise compare the very same implementation twice.
+        std::string verification_error;
+        const bool verified = cmp_ok && verify_perf_result(out, verification_error);
+
         ggml_backend_buffer_free(buf);
         free_extra_buffers();
 
         ggml_free(ctx);
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = ud.ok && cmp_ok && verified;
+        std::string error_msg   = !verified && cmp_ok ? verification_error :
+            (test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed"));
         test_result result(backend_display_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -1869,7 +2007,8 @@ struct test_case {
             test_result result(backend_display_name(backend), current_op_name, vars(), "perf", false, false,
                                prealloc_error);
             output_printer->print_test_result(result);
-            return true;
+            free_extra_buffers();
+            return !forced_buft_is_ame();
         }
         xsai_test_progress_log("perf_prealloc_done", current_op_name, vars());
 
@@ -1883,7 +2022,7 @@ struct test_case {
 
             free_extra_buffers();
 
-            return true;
+            return !forced_buft_is_ame();
         }
         xsai_test_progress_log("perf_support_done", current_op_name, vars());
 
@@ -1893,6 +2032,7 @@ struct test_case {
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
+            free_extra_buffers();
             return false;
         }
         xsai_test_progress_log("perf_alloc_done", current_op_name, vars());
@@ -1910,14 +2050,17 @@ struct test_case {
         nemu_signal(DISABLE_TIME_INTR);
         nemu_signal(NOTIFY_PROFILER);
 
-        // warmup run
-        xsai_test_progress_log("perf_warmup_compute_begin", current_op_name, vars());
-        ggml_status status = ggml_backend_graph_compute(backend, gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
-            return false;
+        if (!ame_perf_no_warmup()) {
+            xsai_test_progress_log("perf_warmup_compute_begin", current_op_name, vars());
+            ggml_status status = ggml_backend_graph_compute(backend, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                return false;
+            }
+            xsai_test_progress_log("perf_warmup_compute_done", current_op_name, vars());
+        } else {
+            printf("    AME perf sampling: warmup=0\n");
         }
-        xsai_test_progress_log("perf_warmup_compute_done", current_op_name, vars());
         reset_ame_profile_if_available();
 
         // determine number of runs
@@ -2019,16 +2162,27 @@ struct test_case {
             (op_flops(out) == 0) ? total_mem / ((use_cycle_metrics ? (double) total_cycles / (XSAI_CPU_FREQ_GHZ * 1e9) : total_time_us / 1e6)) / 1024.0 / 1024.0 / 1024.0 : 0.0;
         size_t calculated_memory_kb = op_size(out) / 1024;
 
-        test_result result(backend_display_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
+        // Validate the exact measured tensors after the timer, without another
+        // graph compute. Test-mode sentinels change RNG sequencing, so a separate
+        // correctness process alone does not validate these performance inputs.
+        std::string verification_error;
+        const bool verified = verify_perf_result(out, verification_error);
+        test_result result(backend_display_name(backend), current_op_name, vars(), "perf", true, verified, verification_error, avg_time_us,
                            calculated_flops, calculated_bandwidth, cycles_per_run, instret_per_run, ipc, calculated_memory_kb, total_runs);
 
         if (output_printer) {
             output_printer->print_test_result(result);
         }
 
+        if (ame_perf_no_warmup()) {
+            fflush(stdout);
+            dump_ame_profile_if_available();
+            reset_ame_profile_if_available();
+        }
+
         free_extra_buffers();
 
-        return true;
+        return verified;
     }
 
     bool eval_support(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
@@ -4212,9 +4366,11 @@ struct test_mul_mat : public test_case {
     const std::array<int64_t, 4> per; // permutation of dimensions
     const int64_t k_v; // size of k in memory, resulting in a non-contiguous view for k_v > k, no view for k_v == 0
     const uint32_t o; // number of outputs
+    const bool f16_oracle; // independent attention gate, not enabled for historical cases
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, per, k_v, o);
+        return VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, per, k_v, o) +
+            (f16_oracle ? ",f16_oracle=1" : "");
     }
 
     double max_nmse_err() override {
@@ -4238,13 +4394,262 @@ struct test_mul_mat : public test_case {
         return 2 * m * n * k * bs[0] * nr[0] * bs[1] * nr[1];
     }
 
+    bool verify_f16_attention(ggml_tensor * out, std::string & error) {
+        auto fail = [&](const char * reason) {
+            error = reason;
+            printf("F16_ATTENTION_ORACLE_FAIL reason=%s\n", reason);
+            return false;
+        };
+        if (type_a != GGML_TYPE_F16 || type_b != GGML_TYPE_F32 || o != 1 ||
+            out->op != GGML_OP_MUL_MAT || out->type != GGML_TYPE_F32 ||
+            m <= 0 || n <= 0 || k <= 0 || bs[0] <= 0 || bs[1] <= 0 ||
+            nr[0] <= 0 || nr[1] <= 0) {
+            return fail("unsupported-format-or-shape");
+        }
+        // The existing reader follows each tensor's actual ne/nb, including
+        // interleaved heads and padded rows; do not flatten physical storage.
+        const std::vector<float> a = tensor_to_float(out->src[0]);
+        std::vector<float> b = tensor_to_float(out->src[1]);
+        const std::vector<float> actual = tensor_to_float(out);
+        const size_t heads = size_t(bs[0] * nr[0] * bs[1] * nr[1]);
+        const size_t plane = size_t(m * n);
+        if (a.size() != size_t(k * m * bs[0] * bs[1]) ||
+            b.size() != size_t(k * n) * heads || actual.size() != plane * heads) {
+            return fail("tensor-size");
+        }
+        for (float value : a) {
+            if (!std::isfinite(value)) {
+                return fail("nonfinite-a");
+            }
+        }
+        // Match the existing F16 CPU trait: F32 B is rounded to F16 before
+        // the dot/second SGEMM attempt. Reuse the public conversion, not any
+        // backend-prepared workspace, dot kernel, SGEMM or BF16 conversion.
+        for (float & value : b) {
+            value = ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+            if (!std::isfinite(value)) {
+                return fail("nonfinite-b");
+            }
+        }
+        std::vector<float> expected(actual.size());
+        for (int64_t h3 = 0; h3 < bs[1] * nr[1]; ++h3) {
+            for (int64_t h2 = 0; h2 < bs[0] * nr[0]; ++h2) {
+                const size_t ah = size_t((h3 / nr[1]) * bs[0] + h2 / nr[0]);
+                const size_t bh = size_t(h3 * bs[0] * nr[0] + h2);
+                for (int64_t j = 0; j < n; ++j) {
+                    for (int64_t i = 0; i < m; ++i) {
+                        double sum = 0.0;
+                        for (int64_t l = 0; l < k; ++l) {
+                            sum += double(a[(ah * m + i) * k + l]) *
+                                   double(b[(bh * n + j) * k + l]);
+                        }
+                        expected[bh * plane + j * m + i] = float(sum);
+                    }
+                }
+            }
+        }
+        double max_abs = 0.0;
+        double max_head_nmse = 0.0;
+        auto check = [&](const std::vector<float> & values) {
+            for (size_t h = 0; h < heads; ++h) {
+                double squared_error = 0.0, squared_reference = 0.0;
+                for (size_t p = h * plane; p < (h + 1) * plane; ++p) {
+                    if (!std::isfinite(values[p]) || !std::isfinite(expected[p])) {
+                        return false;
+                    }
+                    const double diff = double(values[p]) - double(expected[p]);
+                    squared_error += diff * diff;
+                    squared_reference += double(expected[p]) * double(expected[p]);
+                    max_abs = std::max(max_abs, std::fabs(diff));
+                }
+                const double head_nmse = squared_reference != 0.0 ?
+                    squared_error / squared_reference : (squared_error == 0.0 ? 0.0 : INFINITY);
+                max_head_nmse = std::max(max_head_nmse, head_nmse);
+                if (!(head_nmse <= max_nmse_err())) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool ok = check(actual);
+        const double actual_max_abs = max_abs;
+        const double actual_max_head_nmse = max_head_nmse;
+        // Exercise the very same checker, including an error in the final head.
+        // These are local copies only; never modify backend tensors or REF data.
+        std::vector<float> corrupt(expected);
+        if (!check(expected)) {
+            return fail("checker-rejected-reference");
+        }
+        corrupt.back() = FLT_MAX;
+        if (check(corrupt)) {
+            return fail("checker-accepted-corrupt-output");
+        }
+        corrupt.back() = NAN;
+        if (check(corrupt)) {
+            return fail("checker-accepted-nonfinite-output");
+        }
+        printf("F16_ATTENTION_ORACLE_%s checked=%zu heads=%zu max_abs=%.9g"
+               " max_head_nmse=%.9g threshold=%.9g reference=f16xf16_double negative_checks=2\n",
+               ok ? "PASS" : "FAIL", actual.size(), heads, actual_max_abs, actual_max_head_nmse, max_nmse_err());
+        if (!ok) {
+            error = "independent F16 attention verification failed";
+        }
+        return ok;
+    }
+
+    bool verify_perf_result(ggml_tensor * out, std::string & error) override {
+        if (f16_oracle) {
+            // Never silently substitute this for the unrelated whole-K oracle.
+            if (ame_whole_k_oracle_requested()) {
+                error = "F16 attention and whole-K oracle contracts cannot be combined";
+                return false;
+            }
+            return verify_f16_attention(out, error);
+        }
+        if (!ame_whole_k_oracle_requested()) {
+            return true;
+        }
+        const char * oracle = std::getenv("XSAI_TEST_BACKEND_OPS_AME_ORACLE");
+        const float sx = ame_oracle_static_sx();
+        auto fail = [&](const char * reason) {
+            error = reason;
+            printf("AME_WHOLE_K_ORACLE_FAIL reason=%s\n", reason);
+            return false;
+        };
+        if (strcmp(oracle, "whole_k_i8") != 0 || !forced_buft_is_ame() || sx < 0.0f ||
+            type_a != GGML_TYPE_Q8_0 || type_b != GGML_TYPE_F32 ||
+            bs != std::array<int64_t, 2>{1, 1} || nr != std::array<int64_t, 2>{1, 1} ||
+            per != std::array<int64_t, 4>{0, 1, 2, 3} || k_v != 0 || o != 1 ||
+            k <= 0 || k % 32 || k > INT32_MAX / (127 * 127) ||
+            !ggml_is_contiguous(out) || !ggml_is_contiguous(out->src[0]) ||
+            !ggml_is_contiguous(out->src[1]) || std::fegetround() != FE_TONEAREST) {
+            return fail("unsupported-format-shape-or-rounding");
+        }
+        for (const char * knob : {"GGML_AME_WHOLE_K_Q8", "GGML_AME_I8_128_WHOLE_K",
+                                  "GGML_AME_WHOLE_K_FUSED_EPILOGUE"}) {
+            const char * value = std::getenv(knob);
+            if (value == nullptr || strcmp(value, "1") != 0) {
+                return fail("whole-K-controls-required");
+            }
+        }
+
+        // Reads the original Q8_0 payload, not backend-private packed A.
+        auto input_hash = [](ggml_tensor * tensor) {
+            std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+            uint64_t hash = UINT64_C(14695981039346656037);
+            for (uint8_t byte : bytes) {
+                hash = (hash ^ byte) * UINT64_C(1099511628211);
+            }
+            return hash;
+        };
+        printf("AME_ORACLE_INPUT a_fnv64=%016" PRIx64 " b_fnv64=%016" PRIx64 "\n",
+               input_hash(out->src[0]), input_hash(out->src[1]));
+        fflush(stdout);
+        const std::vector<float> w = tensor_to_float(out->src[0]);
+        const std::vector<float> x = tensor_to_float(out->src[1]);
+        const std::vector<float> y = tensor_to_float(out);
+        if (w.size() != (size_t) (m * k) || x.size() != (size_t) (n * k) ||
+            y.size() != (size_t) (m * n)) {
+            return fail("tensor-size");
+        }
+        std::vector<int8_t> qw(w.size()), qx(x.size());
+        std::vector<float> sw(m), scales_x(n);
+        for (int64_t row = 0; row < m; ++row) {
+            float amax = 0.0f;
+            for (int64_t col = 0; col < k; ++col) {
+                const float value = w[row * k + col];
+                if (!std::isfinite(value)) {
+                    return fail("nonfinite-weight");
+                }
+                amax = std::max(amax, std::fabs(value));
+            }
+            const float delta = amax / 127.0f;
+            const float inv = delta != 0.0f ? 1.0f / delta : 0.0f;
+            sw[row] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(delta));
+            for (int64_t col = 0; col < k; ++col) {
+                // Existing weight contract: ties AWAY, unrounded delta.
+                const float q = std::round(w[row * k + col] * inv);
+                qw[row * k + col] = (int8_t) std::max(-127.0f, std::min(127.0f, q));
+            }
+        }
+        size_t saturated = 0;
+        for (int64_t row = 0; row < n; ++row) {
+            float amax = 0.0f;
+            if (sx == 0.0f) {
+                for (int64_t col = 0; col < k; ++col) {
+                    const float value = x[row * k + col];
+                    if (!std::isfinite(value)) {
+                        return fail("nonfinite-dynamic-activation");
+                    }
+                    amax = std::max(amax, std::fabs(value));
+                }
+            }
+            const float delta = sx != 0.0f ? sx : amax / 127.0f;
+            const float inv = delta != 0.0f ? 1.0f / delta : 0.0f;
+            scales_x[row] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(delta));
+            for (int64_t col = 0; col < k; ++col) {
+                const float value = x[row * k + col];
+                // Dynamic path multiplies in FP32 before RNE; static power-of-
+                // two division is exact for all relevant rounding boundaries.
+                const double scaled = sx != 0.0f ? double(value) / double(sx) : double(value * inv);
+                saturated += std::fabs(scaled) > 127.0;
+                qx[row * k + col] = ame_oracle_rne_i8(scaled);
+            }
+        }
+        size_t mismatches = 0;
+        double max_abs = 0.0;
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t i = 0; i < m; ++i) {
+                int64_t sum = 0;
+                for (int64_t l = 0; l < k; ++l) {
+                    sum += int64_t(qw[i * k + l]) * int64_t(qx[j * k + l]);
+                }
+                if (sum < INT32_MIN || sum > INT32_MAX) {
+                    return fail("INT32-overflow");
+                }
+                // Pin the existing two FP32 multiplications; no double product
+                // or FMA, and no quantization-error tolerance in this oracle.
+                volatile float fp_sum = (float) (int32_t) sum;
+                volatile float factor = sw[i] * scales_x[j];
+                const float expected = fp_sum * factor;
+                const float actual = y[j * m + i];
+                if (!std::isfinite(actual) || !std::isfinite(expected) || actual != expected) {
+                    if (mismatches++ == 0) {
+                        printf("AME_ORACLE_FIRST_MISMATCH m=%" PRId64 " n=%" PRId64
+                               " sum=%" PRId64 " expected=%.9g actual=%.9g\n", i, j, sum, expected, actual);
+                    }
+                }
+                max_abs = std::max(max_abs, std::fabs(double(actual) - double(expected)));
+            }
+            // This scalar oracle is outside the measured graph and AME counters.
+            // Report completed work so long verification does not look like a
+            // UART stall; do not relax the hardware watchdog or skip outputs.
+            if ((j + 1) % 16 == 0 || j + 1 == n) {
+                printf("AME_ORACLE_PROGRESS rows=%" PRId64 "/%" PRId64 "\n", j + 1, n);
+                fflush(stdout);
+            }
+        }
+        const bool converter_ok = sx == 0.0f || ame_static_quantizer_selftest(sx);
+        const bool ok = mismatches == 0 && converter_ok;
+        printf("AME_WHOLE_K_ORACLE_%s format=%s checked=%" PRId64
+               " mismatches=%zu max_abs=%.9g saturated=%zu quality_not_gated=1\n",
+               ok ? "PASS" : "FAIL", sx != 0.0f ? "static_rne_i8" : "dynamic_rne_i8",
+               m * n, mismatches, max_abs, saturated);
+        if (!ok) {
+            error = "independent whole-K arithmetic verification failed";
+        }
+        return ok;
+    }
+
     test_mul_mat(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o) {}
+            int64_t k_v = 0, uint32_t o = 1, bool f16_oracle = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o),
+          f16_oracle(f16_oracle) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -4301,6 +4706,9 @@ struct test_mul_mat : public test_case {
         }
 
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        if (f16_oracle) {
+            ggml_mul_mat_set_prec(out, GGML_PREC_F32);
+        }
         ggml_set_name(out, "out");
         for (uint32_t i = 1; i < o; ++i) {
             ggml_tensor * out2 = ggml_mul_mat(ctx, a, b);
@@ -8148,8 +8556,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
+    // S03 aligned first: same-output short/long K controls, no edge padding.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 512, 512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 512, 4096, {1, 1}, {1, 1}));
+    // Worker partition regressions: an edge M tile, an edge N tile, and
+    // fewer output-row tiles than workers. K stays valid for Q8_0 blocks.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  193, 129,  96, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64, 128,  96, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 129, 65, 33, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_BF16, 129, 65, 33, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 129, 65, 33, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+    // Stories15M prefill p256: projection, FFN gate/up, and FFN down.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 256, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 256, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 256, 768, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768,   1, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288,   1, 768, {1, 1}, {1, 1}));
@@ -8295,10 +8717,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 193, {1,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1056, 1, 67,  {1,  1}, {4, 1}, {0, 2, 1, 3}));
+    // Stories KQ/KQV plus nearby dispatch boundaries. Use the same MUL_MAT
+    // fixture, preserving logical K and the original 5e-4 NMSE threshold.
+    // Select only this bounded independent gate with -p 'f16_oracle=1'.
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+            {256, 256, 48}, {48, 256, 256}}) {
+        for (const auto & permutation : std::vector<std::array<int64_t, 4>>{
+                {0, 1, 2, 3}, {0, 2, 1, 3}}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,
+                shape[0], shape[1], shape[2], {6, 1}, {1, 1}, permutation, 0, 1, true));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,
+            shape[0], shape[1], shape[2], {6, 1}, {1, 1}, {0, 1, 2, 3}, shape[2] + 16, 1, true));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,
+            shape[0], shape[1], shape[2], {3, 1}, {2, 1}, {0, 1, 2, 3}, 0, 1, true));
+    }
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+            {256, 255, 48}, {255, 256, 48}, {256, 256, 47},
+            {256, 256, 49}, {256, 1, 48}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,
+            shape[0], shape[1], shape[2], {6, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 16, 32, 32, { 1,  1}, {1, 1}, {0, 1, 2, 3}, 64, 3));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+    // Bounded MX32 bring-up and edge-fallback cases. With MX disabled these
+    // must remain ordinary canonical CPU operations. Native MXFP4 activation
+    // quantization has a different accuracy contract: do NOT relax this
+    // existing generic-vs-CPU threshold to make an opt-in run pass.
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+            {64, 64, 32}, {64, 64, 64}, {128, 64, 96},
+            {63, 64, 32}, {64, 65, 32}, {65, 63, 96}}) {
+        for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_mul_mat(
+                type, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+        }
+    }
+    // Backend-private MXFP8 must not change the canonical F32 K-tail fallback.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_F32, GGML_TYPE_F32, 64, 64, 33, {1, 1}, {1, 1}));
+    // A6 full128 CPU controls, independent of native capacity/scale support.
+    for (int64_t k : {32, 64, 128}) {
+        for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_F32}) {
+            test_cases.emplace_back(new test_mul_mat(
+                type, GGML_TYPE_F32, 128, 128, k, {1, 1}, {1, 1}));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
@@ -8888,6 +9353,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Bounded dense MXFP4 operator grid. Reuse the ordinary MUL_MAT fixture
+    // and perf timer, not the unrelated GPT-OSS MUL_MAT_ID cases below.
+    // K32/96 exercise single MX32 submissions; K64/128/256 may use K64 pairs.
+    // Keep an M edge, multiple output panels and representative model K sizes.
+    // This adds coverage, not a native accuracy oracle: native MX4 x MX4
+    // results still require the independent ordered-K32 reference before a
+    // measured run is accepted. Do not relax the generic CPU comparison.
+    for (const auto & shape : std::vector<std::array<int64_t, 3>>{
+            {128, 128, 32}, {128, 128, 64}, {128, 128, 96},
+            {128, 128, 128}, {128, 128, 256}, {129, 128, 64},
+            {256, 256, 128}, {288, 256, 288}, {256, 256, 1024}}) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_MXFP4, GGML_TYPE_F32, shape[0], shape[1], shape[2], {1, 1}, {1, 1}));
+    }
+
     // Model-independent XSAI calibration and holdout grid. The 512x128x512
     // point already exists immediately below and is intentionally not duplicated.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   64,  64,   64, {1, 1}, {1, 1}));
@@ -8903,8 +9383,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 128, 512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 512, 512, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, 512, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 128, 288, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 128, 768, {1, 1}, {1, 1}));
+    // Keep the performance cases identical to the Stories15M p256 gate.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 256, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  768, 256, 288, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  288, 256, 768, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 128, 2048, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 128, 8192, {1, 1}, {1, 1}));
@@ -9156,6 +9642,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
 static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer) {
+    // S03 is a separately labelled arithmetic contract, not a relaxation of
+    // test_mul_mat's original Q8_0-vs-CPU threshold. Validate actual perf outputs.
+    if (ame_whole_k_oracle_requested() || ame_oracle_static_sx() != 0.0f) {
+        const char * oracle = std::getenv("XSAI_TEST_BACKEND_OPS_AME_ORACLE");
+        if (mode != MODE_PERF || !forced_buft_is_ame() || oracle == nullptr ||
+            strcmp(oracle, "whole_k_i8") != 0 || ame_oracle_static_sx() < 0.0f || g_test_threads != 1 ||
+            !ame_perf_no_warmup() || forced_ame_perf_runs() != 1 ||
+            params_filter == nullptr || op_names_filter == nullptr ||
+            strcmp(op_names_filter, "MUL_MAT") != 0 || std::fegetround() != FE_TONEAREST) {
+            fprintf(stderr, "AME_WHOLE_K_ORACLE_FAIL requires explicit single-shot AME MUL_MAT perf contract\n");
+            return false;
+        }
+    }
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -9176,6 +9675,10 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     if (mode == MODE_TEST) {
         auto test_cases = make_test_cases_eval();
         filter_test_cases(test_cases, params_filter);
+        if (params_filter != nullptr && test_cases.empty()) {
+            fprintf(stderr, "error: correctness filter matched zero compiled test cases: %s\n", params_filter);
+            return false;
+        }
         ggml_backend_t backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
         if (backend_cpu == NULL) {
             test_operation_info info("", "", "CPU");
@@ -9236,10 +9739,11 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
             fprintf(stderr, "error: performance filter matched zero compiled test cases: %s\n", params_filter);
             return false;
         }
+        bool ok = true;
         for (auto & test : test_cases) {
-            test->eval_perf(backend, op_names_filter, output_printer);
+            ok = test->eval_perf(backend, op_names_filter, output_printer) && ok;
         }
-        return true;
+        return ok;
     }
 
     if (mode == MODE_SUPPORT) {
@@ -9375,6 +9879,7 @@ static void usage(char ** argv) {
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
     printf("    --list-ops lists all available GGML operations\n");
     printf("    --show-coverage shows test coverage\n");
+    printf("    --threads <1..256> sets candidate backend threads (CPU oracle stays single-threaded for AME)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -9415,6 +9920,19 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv);
+                return 1;
+            }
+            char * end = nullptr;
+            const char * value = argv[++i];
+            const long threads = strtol(value, &end, 10);
+            if (end == value || *end != '\0' || threads < 1 || threads > 256) {
+                fprintf(stderr, "Invalid --threads: %s (expected 1..256)\n", value);
+                return 1;
+            }
+            g_test_threads = (int) threads;
         } else if (strcmp(argv[i], "-p") == 0) {
             if (i + 1 < argc) {
                 params_filter = argv[++i];
@@ -9489,7 +10007,8 @@ int main(int argc, char ** argv) {
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         const int n_threads = effective_test_threads();
         if (ggml_backend_set_n_threads_fn) {
-            // AME path is currently validated/perf-tested as single-threaded.
+            // Keep the AME default conservative; explicitly exercise workers
+            // with --threads while the separate CPU reference stays at T1.
             ggml_backend_set_n_threads_fn(backend, n_threads);
         }
 
@@ -9499,7 +10018,8 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
         printf("  Requested backend threads: %d%s\n\n", n_threads,
-               forced_buft_is_ame() ? " (forced for RISCV_AME)" : "");
+               g_test_threads > 0 ? " (explicit)" :
+               (forced_buft_is_ame() ? " (default for RISCV_AME)" : ""));
 
         bool ok = test_backend(backend, mode, op_names_filter, params_filter, output_printer.get());
 

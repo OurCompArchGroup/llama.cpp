@@ -2093,8 +2093,85 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
 }
 
 size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
+    if (quant_weights) {
+        GGML_ASSERT(nrow >= 0 && n_per_row > 0 && n_per_row % QK_MXFP4 == 0 &&
+                    nrow <= INT64_MAX / n_per_row);
+        for (int64_t i = 0; i < n_per_row; ++i) {
+            GGML_ASSERT(isfinite(quant_weights[i]) && quant_weights[i] >= 0.0f);
+        }
+        for (int64_t i = 0; i < nrow * n_per_row; i += QK_MXFP4) {
+            float amax = 0.0f;
+            for (int j = 0; j < QK_MXFP4; ++j) {
+                GGML_ASSERT(isfinite(src[i + j]));
+                amax = MAX(amax, fabsf(src[i + j]));
+            }
+            // Retain the reference initializer's supported exponent domain;
+            // do not wrap a negative scale into uint8_t for tiny-only blocks.
+            GGML_ASSERT(amax == 0.0f || ilogbf(amax) >= -125);
+        }
+    }
     quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    if (quant_weights) {
+        const int64_t blocks_per_row = n_per_row / QK_MXFP4;
+        block_mxfp4 * output = (block_mxfp4 *) dst;
+        for (int64_t row = 0; row < nrow; ++row) {
+            for (int64_t block = 0; block < blocks_per_row; ++block) {
+                const float * x = src + row * n_per_row + block * QK_MXFP4;
+                const float * w = quant_weights + block * QK_MXFP4;
+                block_mxfp4 * y = output + row * blocks_per_row + block;
+                float amax = 0.0f;
+                bool has_weight = false;
+                for (int j = 0; j < QK_MXFP4; ++j) {
+                    amax = MAX(amax, fabsf(x[j]));
+                    has_weight = has_weight || w[j] > 0.0f;
+                }
+                // No calibration information: retain the reference bytes,
+                // including its deterministic choice when errors are tied.
+                if (!has_weight) {
+                    continue;
+                }
+                double best_error = INFINITY;
+                if (y->e < 255) {
+                    const float d = GGML_E8M0_TO_FP32_HALF(y->e);
+                    best_error = 0.0;
+                    for (int j = 0; j < QK_MXFP4; ++j) {
+                        const int shift = j < QK_MXFP4 / 2 ? 0 : 4;
+                        const int code = (y->qs[j % (QK_MXFP4 / 2)] >> shift) & 15;
+                        const double delta = (double) (kvalues_mxfp4[code] * d) - x[j];
+                        best_error += w[j] * delta * delta;
+                    }
+                }
+                const int center = amax > 0.0f ? MAX(0, MIN(254, ilogbf(amax) - 2 + 127)) : 0;
+                // Search nearby legal power-of-two scales, allowing clipping
+                // only when calibration-weighted error improves. The format,
+                // nearest-code rule and low/high-half nibble layout are unchanged.
+                for (int e = MAX(0, center - 2); e <= MIN(254, center + 1); ++e) {
+                    block_mxfp4 candidate;
+                    candidate.e = (uint8_t) e;
+                    const float d = GGML_E8M0_TO_FP32_HALF(candidate.e);
+                    double error = 0.0;
+                    for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+                        const int k = j + QK_MXFP4 / 2;
+                        const uint8_t x0 = best_index_mxfp4(x[j], d);
+                        const uint8_t x1 = best_index_mxfp4(x[k], d);
+                        candidate.qs[j] = x0 | (x1 << 4);
+                    }
+                    // Match the incumbent's summation order as well as its
+                    // FP32 reconstruction; reassociation is not an improvement.
+                    for (int j = 0; j < QK_MXFP4; ++j) {
+                        const int shift = j < QK_MXFP4 / 2 ? 0 : 4;
+                        const int code = (candidate.qs[j % (QK_MXFP4 / 2)] >> shift) & 15;
+                        const double delta = (double) (kvalues_mxfp4[code] * d) - x[j];
+                        error += w[j] * delta * delta;
+                    }
+                    if (error < best_error) {
+                        *y = candidate;
+                        best_error = error;
+                    }
+                }
+            }
+        }
+    }
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
 }
 
