@@ -4370,6 +4370,17 @@ void ggml_cpu_init(void) {
                     uint16_t u16;
                     ggml_fp16_t fp16;
                 } u = {i};
+#if defined(__riscv) && defined(__riscv_zfhmin) && defined(GGML_RV_MXFP4_PACKED) && defined(GGML_AME_FP16_LUT_INTEGER_NONFINITE) && GGML_AME_FP16_LUT_INTEGER_NONFINITE
+                if ((u.u16 & 0x7c00u) == 0x7c00u) {
+                    const uint32_t sign = (uint32_t) (u.u16 & 0x8000u) << 16;
+                    const uint32_t magnitude = (u.u16 & 0x03ffu) == 0 ? 0x7f800000u : 0x7fc00000u;
+                    const ggml_fp16_t gelu = u.u16 == 0x7c00u ? 0x7c00u : 0x7e00u;
+                    ggml_table_f32_f16[i] = fp32_from_bits(sign | magnitude);
+                    ggml_table_gelu_f16[i] = gelu;
+                    ggml_table_gelu_quick_f16[i] = gelu;
+                    continue;
+                }
+#endif
                 float f = GGML_COMPUTE_FP16_TO_FP32(u.fp16);
                 ggml_table_f32_f16[i] = f;
                 ggml_table_gelu_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(f));
