@@ -711,6 +711,64 @@ inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, co
 #endif
 }
 
+// Shared by ordinary RMSNorm and producers that consume its output by block.
+// Keep an independent original reference for opt-in reduction experiments.
+inline static float ggml_vec_rms_norm_scale_f32_reference(const int64_t n, const float * x, const float eps) {
+    ggml_float sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += (ggml_float) (x[i] * x[i]);
+    }
+    const float mean = sum/n;
+    return 1.0f/sqrtf(mean + eps);
+}
+
+inline static float ggml_vec_rms_norm_scale_f32(const int64_t n, const float * x, const float eps) {
+#if defined(GGML_RMS_RVV_F64) && GGML_RMS_RVV_F64 && defined(__riscv_v_intrinsic)
+    // Keep full VL while accumulating. Handle the final short block separately
+    // so tail-agnostic writes cannot destroy contributions in higher lanes.
+    const size_t vl = __riscv_vsetvlmax_e32m2();
+    if (n > 0 && vl != 0) {
+        vfloat64m4_t a0 = __riscv_vfmv_v_f_f64m4(0.0, vl);
+        vfloat64m4_t a1 = __riscv_vfmv_v_f_f64m4(0.0, vl);
+        vfloat64m4_t a2 = __riscv_vfmv_v_f_f64m4(0.0, vl);
+        vfloat64m4_t a3 = __riscv_vfmv_v_f_f64m4(0.0, vl);
+        size_t i = 0;
+        for (; (size_t)n - i >= 4 * vl; i += 4 * vl) {
+            vfloat32m2_t q0 = __riscv_vle32_v_f32m2(x + i, vl);
+            vfloat32m2_t q1 = __riscv_vle32_v_f32m2(x + i + vl, vl);
+            vfloat32m2_t q2 = __riscv_vle32_v_f32m2(x + i + 2 * vl, vl);
+            vfloat32m2_t q3 = __riscv_vle32_v_f32m2(x + i + 3 * vl, vl);
+            q0 = __riscv_vfmul_vv_f32m2(q0, q0, vl);
+            q1 = __riscv_vfmul_vv_f32m2(q1, q1, vl);
+            q2 = __riscv_vfmul_vv_f32m2(q2, q2, vl);
+            q3 = __riscv_vfmul_vv_f32m2(q3, q3, vl);
+            a0 = __riscv_vfwadd_wv_f64m4(a0, q0, vl);
+            a1 = __riscv_vfwadd_wv_f64m4(a1, q1, vl);
+            a2 = __riscv_vfwadd_wv_f64m4(a2, q2, vl);
+            a3 = __riscv_vfwadd_wv_f64m4(a3, q3, vl);
+        }
+        for (; (size_t)n - i >= vl; i += vl) {
+            vfloat32m2_t q = __riscv_vle32_v_f32m2(x + i, vl);
+            q = __riscv_vfmul_vv_f32m2(q, q, vl);
+            a0 = __riscv_vfwadd_wv_f64m4(a0, q, vl);
+        }
+        a0 = __riscv_vfadd_vv_f64m4(a0, a1, vl);
+        a2 = __riscv_vfadd_vv_f64m4(a2, a3, vl);
+        a0 = __riscv_vfadd_vv_f64m4(a0, a2, vl);
+        const vfloat64m1_t zero = __riscv_vfmv_v_f_f64m1(0.0, 1);
+        const vfloat64m1_t reduced = __riscv_vfredusum_vs_f64m4_f64m1(a0, zero, vl);
+        double sum = __riscv_vfmv_f_s_f64m1_f64(reduced);
+        for (; i < (size_t)n; ++i) {
+            // Preserve the original F32 square before widening, including UF/OF.
+            sum += (ggml_float) (x[i] * x[i]);
+        }
+        const float mean = sum / n;
+        return 1.0f/sqrtf(mean + eps);
+    }
+#endif
+    return ggml_vec_rms_norm_scale_f32_reference(n, x, eps);
+}
+
 //inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) { for (int i = 0; i < n; ++i) y[i] *= v;          }
 inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
 #if defined(GGML_USE_ACCELERATE)

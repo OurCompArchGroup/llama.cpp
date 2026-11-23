@@ -7,6 +7,10 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+#include "quants.h"
+#endif
+
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
 #endif
@@ -3673,26 +3677,33 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
-
-                const float mean = sum/ne00;
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+                const uint64_t rms_begin = mxfp4_phase_tick(0.0f);
+#endif
+                const float scale = ggml_vec_rms_norm_scale_f32(ne00, x, eps);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+                const uint64_t rms_stats = mxfp4_phase_tick(scale);
+#endif
 
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
                 memcpy(y, x, ne00 * sizeof(float));
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+                const uint64_t rms_copy = mxfp4_phase_tick(y[ne00 - 1]);
+#endif
                 // for (int i00 = 0; i00 < ne00; i00++) {
                 //     y[i00] = x[i00];
                 // }
-
-                const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
 
                 ggml_vec_scale_f32(ne00, y, scale);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+                const uint64_t rms_apply = mxfp4_phase_tick(y[ne00 - 1]);
+                ggml_mxfp4_phase_profile_rms(
+                    rms_stats - rms_begin, rms_copy - rms_stats, rms_apply - rms_copy);
+#endif
             }
         }
     }

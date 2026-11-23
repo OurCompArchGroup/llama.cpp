@@ -16,6 +16,7 @@
 
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
+#include "arch/riscv/ame/ame.h"
 #endif
 #include "ggml.h"
 #include "common.h"
@@ -3596,7 +3597,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_xsai_op_progress_log("begin", node_n, node);
         }
         const uint64_t xsai_profile_t0 = xsai_timing ? ggml_xsai_profile_read_cycle() : 0;
-        ggml_compute_forward(&params, node);
+        bool rms_fused = false;
+#if defined(GGML_USE_RV_AME)
+        // A fusion is one atomic completion unit. Preserve the original
+        // per-node cancellation/debug semantics by declining in those modes.
+        if (node->op == GGML_OP_RMS_NORM && params.nth == 1 && params.ith == 0 &&
+            cplan->abort_callback == NULL && !xsai_detail && !xsai_progress) {
+            rms_fused = ggml_ame_try_fuse_rmsnorm_mxfp4(&params, cgraph, node_n);
+            if (rms_fused) {
+                node_n += 2;
+                node = cgraph->nodes[node_n];
+            }
+        }
+#endif
+        if (!rms_fused) ggml_compute_forward(&params, node);
         const uint64_t xsai_profile_cycles = xsai_timing ? ggml_xsai_profile_read_cycle() - xsai_profile_t0 : 0;
         if (xsai_progress) {
             ggml_xsai_op_progress_log("end", node_n, node);

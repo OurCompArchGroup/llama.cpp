@@ -16,6 +16,7 @@ set(RISCV_ROOT_PATH "" CACHE PATH "root path to riscv toolchain")
 set(RISCV_MARCH "rv64gcv_zfh_zba_zicbop" CACHE STRING "RISC-V ISA extensions")
 set(RISCV_MABI "lp64d" CACHE STRING "RISC-V ABI")
 set(RISCV_USE_LLVM OFF CACHE BOOL "Use LLVM/Clang toolchain if ON, otherwise use GCC")
+set(RISCV_LLVM_HOST_LIBRARY_PATH "" CACHE STRING "Optional host-only library path for an existing compatible LLVM installation")
 set(RISCV_SYSROOT "" CACHE PATH "Override sysroot path (defaults to <root>/sysroot or gcc -print-sysroot)")
 set(RISCV_LIB_PATH "" CACHE PATH "Directory containing crtbeginS.o/libgcc (defaults to gcc -print-libgcc-file-name parent)")
 set(RISCV_ATOMIC_LIB_PATH "" CACHE PATH "Directory containing libatomic (defaults to gcc -print-file-name=libatomic.so parent)")
@@ -209,6 +210,17 @@ else()
         set(CMAKE_C_COMPILER   ${RISCV_ROOT_PATH}/bin/clang)
         set(CMAKE_CXX_COMPILER ${RISCV_ROOT_PATH}/bin/clang++)
         set(CMAKE_STRIP        ${RISCV_ROOT_PATH}/bin/llvm-strip)
+        if (RISCV_LLVM_HOST_LIBRARY_PATH)
+            # Scope compatibility libraries to compiler processes, never
+            # native CMake/make or guest executables. Reuse the installed LLVM.
+            set(CMAKE_C_COMPILER /usr/bin/env
+                "LD_LIBRARY_PATH=${RISCV_LLVM_HOST_LIBRARY_PATH}" "${RISCV_ROOT_PATH}/bin/clang")
+            set(CMAKE_CXX_COMPILER /usr/bin/env
+                "LD_LIBRARY_PATH=${RISCV_LLVM_HOST_LIBRARY_PATH}" "${RISCV_ROOT_PATH}/bin/clang++")
+            set(CMAKE_ASM_COMPILER /usr/bin/env
+                "LD_LIBRARY_PATH=${RISCV_LLVM_HOST_LIBRARY_PATH}" "${RISCV_ROOT_PATH}/bin/clang")
+            set(CMAKE_ASM_FLAGS_INIT "--target=${RISCV_TRIPLE} --sysroot=${RISCV_SYSROOT} -march=${RISCV_MARCH} -mabi=${RISCV_MABI}")
+        endif()
                 if (RISCV_NIX_LIBC AND EXISTS "${RISCV_NIX_LIBC}")
             set(RISCV_SYSROOT_FLAG "")
             set(CMAKE_SYSROOT "")
