@@ -55,6 +55,8 @@
 #include "simd-mappings.h"
 
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <type_traits>
 
 #ifdef _MSC_VER
@@ -76,6 +78,15 @@
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
 namespace {
+
+std::atomic<unsigned> stories_fake_kq_hits{0};
+std::atomic<unsigned> stories_fake_kqv_hits{0};
+
+__attribute__((destructor)) void stories_fake_report_paths() {
+    std::fprintf(stderr, "STORIES_FAKE_PATHS kq_tile23=%u kqv_zero_suffix=%u\n",
+                 stories_fake_kq_hits.load(std::memory_order_relaxed),
+                 stories_fake_kqv_hits.load(std::memory_order_relaxed));
+}
 
 inline float unhalf(ggml_fp16_t d) {
     return GGML_CPU_FP16_TO_FP32(d);
@@ -684,6 +695,58 @@ class tinyBLAS_RVV {
 #else // LMUL = 4
         if (m % 16 == 0 && (m/16 >= params->nth)) {
             const int64_t SIZE_N = BLOCK_SIZE<2>(n);
+#if defined(GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX) && GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX
+            if constexpr (std::is_same_v<V, vfloat16m2_t>) {
+                if (m == 48 && n == 256 && k == 256 && lda == 256 && ldb == 256 &&
+                    ldc == 48 && SIZE_N == 2 && params->nth == 1 && params->ith == 0 &&
+                    vlmax<V>() == 16 && kqv_zero_suffix_ready()) {
+                    gemm<2, 2, 8, kqv_verified_zero_suffix>(m, n, 36);
+                    stories_fake_kqv_hits.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+#endif
+#if defined(GGML_XSAI_RVV_F16_K48_FIXED) && GGML_XSAI_RVV_F16_K48_FIXED
+            if constexpr (std::is_same_v<V, vfloat16m2_t>) {
+                if (m == 256 && n == 256 && k == 48 && lda == 288 && ldb == 48 &&
+                    ldc == 256 && SIZE_N == 2 && params->nth == 1 && vlmax<V>() == 16) {
+                    gemm<2, 2, 8, 48>(m, n, 36);
+                    return true;
+                }
+            }
+#endif
+#if defined(GGML_XSAI_RVV_F16_K128_FIXED) && GGML_XSAI_RVV_F16_K128_FIXED
+            if constexpr (std::is_same_v<V, vfloat16m2_t>) {
+                if (m == 256 && n == 256 && k == 128 && lda == 1024 && ldb == 128 &&
+                    ldc == 256 && SIZE_N == 2 && params->nth == 1 && vlmax<V>() == 16) {
+                    gemm<2, 2, 8, 128>(m, n, 36);
+                    return true;
+                }
+            }
+#endif
+#if (defined(GGML_XSAI_RVV_F16_QWEN_TILE23) && GGML_XSAI_RVV_F16_QWEN_TILE23) || \
+    (defined(GGML_XSAI_RVV_F16_STORIES_TILE23) && GGML_XSAI_RVV_F16_STORIES_TILE23) || \
+    (defined(GGML_XSAI_RVV_F16_STORIES_KQV_TILE23) && GGML_XSAI_RVV_F16_STORIES_KQV_TILE23)
+            if constexpr (std::is_same_v<V, vfloat16m2_t>) {
+                bool use_tile23 = false;
+#if defined(GGML_XSAI_RVV_F16_QWEN_TILE23) && GGML_XSAI_RVV_F16_QWEN_TILE23
+                const bool kq = m == 256 && k == 128 && lda == 1024 && ldb == 128 && ldc == 256;
+                const bool kqv = m == 128 && k == 256 && lda == 256 && ldb == 256 && ldc == 128;
+                use_tile23 = kq || kqv;
+#endif
+#if defined(GGML_XSAI_RVV_F16_STORIES_TILE23) && GGML_XSAI_RVV_F16_STORIES_TILE23
+                use_tile23 = use_tile23 || (m == 256 && k == 48 && lda == 288 && ldb == 48 && ldc == 256);
+#endif
+#if defined(GGML_XSAI_RVV_F16_STORIES_KQV_TILE23) && GGML_XSAI_RVV_F16_STORIES_KQV_TILE23
+                use_tile23 = use_tile23 || (m == 48 && k == 256 && lda == 256 && ldb == 256 && ldc == 48);
+#endif
+                if (use_tile23 && n == 256 && params->nth == 1 && vlmax<V>() == 16) {
+                    gemm<2, 3, 8>(m, n, 36);
+                    stories_fake_kq_hits.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+#endif
             mnpack<2, 2, 8>(m, n, SIZE_N, 36);
             return true;
         }
@@ -702,6 +765,52 @@ class tinyBLAS_RVV {
     }
 
   private:
+#if defined(GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX) && GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX
+    static constexpr int kqv_verified_zero_suffix = -1;
+
+    inline bool kqv_zero_suffix_ready() const {
+        unsigned int rounding;
+        asm volatile("frrm %0" : "=r"(rounding) :: "memory");
+        if (rounding != 0) {
+            return false;
+        }
+        const auto disjoint_from_output = [this](const void * input, size_t bytes) {
+            const uintptr_t source = reinterpret_cast<uintptr_t>(input);
+            const uintptr_t output = reinterpret_cast<uintptr_t>(C);
+            return source <= output ? output - source >= bytes : source - output >= 48 * 256 * sizeof(*C);
+        };
+        if (!disjoint_from_output(A, 48 * 256 * sizeof(*A)) ||
+            !disjoint_from_output(B, 256 * 256 * sizeof(*B))) {
+            return false;
+        }
+        const auto finite = [](const uint16_t * data, size_t count) {
+            const size_t lanes = __riscv_vsetvlmax_e16m8();
+            for (size_t index = 0; index < count; index += lanes) {
+                const vuint16m8_t values = __riscv_vle16_v_u16m8(data + index, lanes);
+                const vuint16m8_t exponent = __riscv_vand_vx_u16m8(values, 0x7c00, lanes);
+                if (__riscv_vfirst_m_b2(__riscv_vmseq_vx_u16m8_b2(exponent, 0x7c00, lanes), lanes) >= 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!finite(A, 48 * 256) || !finite(B, 256 * 256)) {
+            return false;
+        }
+        for (size_t column = 0; column < 256; ++column) {
+            const uint16_t * row = B + column * 256;
+            for (size_t index = (column | 15u) + 1; index < 256;) {
+                const size_t lanes = __riscv_vsetvl_e16m8(256 - index);
+                const vuint16m8_t values = __riscv_vle16_v_u16m8(row + index, lanes);
+                if (__riscv_vfirst_m_b2(__riscv_vmsne_vx_u16m8_b2(values, 0, lanes), lanes) >= 0) {
+                    return false;
+                }
+                index += lanes;
+            }
+        }
+        return true;
+    }
+#endif
     template<int RM, int RN, int BM>
     inline void mnpack(int64_t m, int64_t n, int64_t SIZE_N, int64_t BN) {
         if (SIZE_N == RN) {
@@ -1078,14 +1187,28 @@ class tinyBLAS_RVV {
         C[ldc * (jj + 0) + (ii + 3)] = hsum(Cv03);
     }
 
-    inline void gemm_bloc_2x2(int64_t ii, int64_t jj) {
-        size_t vl = vlmax<V>();
+    template <int Columns, int FixedDepth = 0>
+    inline void gemm_bloc_2x(int64_t ii, int64_t jj) {
+        static_assert(Columns == 2 || Columns == 3);
+        const size_t vl = FixedDepth ? 16 : vlmax<V>();
         D Cv00 = set_zero<D>();
         D Cv01 = set_zero<D>();
         D Cv10 = set_zero<D>();
         D Cv11 = set_zero<D>();
+        D Cv20, Cv21;
+        if constexpr (Columns == 3) {
+            Cv20 = set_zero<D>();
+            Cv21 = set_zero<D>();
+        }
 
-        for (int64_t l = 0; l < k; l += vl) {
+        int64_t depth = FixedDepth == 48 ? FixedDepth : k;
+#if defined(GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX) && GGML_XSAI_RVV_F16_STORIES_KQV_ZERO_SUFFIX
+        if constexpr (FixedDepth == kqv_verified_zero_suffix) {
+            static_assert(Columns == 2);
+            depth = (jj | INT64_C(15)) + 1;
+        }
+#endif
+        for (int64_t l = 0; l < depth; l += vl) {
             V Av0 = load<V>(A + lda * (ii + 0) + l);
             V Av1 = load<V>(A + lda * (ii + 1) + l);
 
@@ -1096,12 +1219,22 @@ class tinyBLAS_RVV {
             V Bv1 = load<V>(B + ldb * (jj + 1) + l);
             Cv10 = madd(Av0, Bv1, Cv10);
             Cv11 = madd(Av1, Bv1, Cv11);
+
+            if constexpr (Columns == 3) {
+                V Bv2 = load<V>(B + ldb * (jj + 2) + l);
+                Cv20 = madd(Av0, Bv2, Cv20);
+                Cv21 = madd(Av1, Bv2, Cv21);
+            }
         }
 
         C[ldc * (jj + 0) + (ii + 0)] = hsum(Cv00);
         C[ldc * (jj + 0) + (ii + 1)] = hsum(Cv01);
         C[ldc * (jj + 1) + (ii + 0)] = hsum(Cv10);
         C[ldc * (jj + 1) + (ii + 1)] = hsum(Cv11);
+        if constexpr (Columns == 3) {
+            C[ldc * (jj + 2) + (ii + 0)] = hsum(Cv20);
+            C[ldc * (jj + 2) + (ii + 1)] = hsum(Cv21);
+        }
     }
 
     inline void gemm_bloc_2x1(int64_t ii, int64_t jj) {
@@ -1122,7 +1255,7 @@ class tinyBLAS_RVV {
         C[ldc * (jj + 0) + (ii + 1)] = hsum(Cv01);
     }
 
-    template <int RM, int RN>
+    template <int RM, int RN, int FixedDepth = 0>
     inline void gemm_bloc(int64_t ii, int64_t jj) {
         if constexpr (RM == 4) {
             if constexpr (RN == 6) { return gemm_bloc_4x6(ii, jj); }
@@ -1132,12 +1265,12 @@ class tinyBLAS_RVV {
             if constexpr (RN == 2) { return gemm_bloc_4x2(ii, jj); }
             if constexpr (RN == 1) { return gemm_bloc_4x1(ii, jj); }
         } else if constexpr (RM == 2) {
-            if constexpr (RN == 2) { return gemm_bloc_2x2(ii, jj); }
+            if constexpr (RN == 3 || RN == 2) { return gemm_bloc_2x<RN, FixedDepth>(ii, jj); }
             if constexpr (RN == 1) { return gemm_bloc_2x1(ii, jj); }
         }
     }
 
-    template <int RM, int RN, int BM>
+    template <int RM, int RN, int BM, int FixedDepth = 0>
     NOINLINE void gemm(int64_t m, int64_t n, int64_t BN) {
         GGML_ASSERT(m % (RM * BM) == 0);
         const int64_t ytiles = m / (RM * BM);
@@ -1172,7 +1305,7 @@ class tinyBLAS_RVV {
             for (int64_t bi = 0; bi < BM * RM; bi += RM) {
                 int64_t jj = jj0;
                 for (; jj < jj1; jj += RN) {
-                    gemm_bloc<RM, RN>(ii + bi, jj);
+                    gemm_bloc<RM, RN, FixedDepth>(ii + bi, jj);
                 }
                 if constexpr (RN > 1) {
                     for (; jj < jj2; jj += RN - 1) {
