@@ -711,6 +711,17 @@ inline static void ggml_vec_mad1_f32(const int n, float * y, const float * x, co
 #endif
 }
 
+// Shared by ordinary RMSNorm and producers that consume its output by block.
+// Keep the original F32 square, ordered ggml_float sum and F32 mean.
+inline static float ggml_vec_rms_norm_scale_f32(const int64_t n, const float * x, const float eps) {
+    ggml_float sum = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        sum += (ggml_float) (x[i] * x[i]);
+    }
+    const float mean = sum/n;
+    return 1.0f/sqrtf(mean + eps);
+}
+
 //inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) { for (int i = 0; i < n; ++i) y[i] *= v;          }
 inline static void ggml_vec_scale_f32(const int n, float * y, const float   v) {
 #if defined(GGML_USE_ACCELERATE)

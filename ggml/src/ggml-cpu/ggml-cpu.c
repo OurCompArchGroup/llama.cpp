@@ -16,6 +16,7 @@
 
 #if defined(GGML_USE_RV_AME)
 #include "arch/riscv/ame/ame-flash-attn.h"
+#include "arch/riscv/ame/ame.h"
 #endif
 #include "ggml.h"
 #include "common.h"
@@ -3564,6 +3565,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wsize     =*/ cplan->work_size,
         /*.wdata     =*/ cplan->work_data,
         /*.threadpool=*/ tp,
+        NULL,
     };
 
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d \n", state->ith, cplan, state->last_graph);
@@ -3579,6 +3581,19 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     if (xsai_detail) {
         xsai_detail_graph = ++g_ggml_xsai_op_profile_detail.graphs;
     }
+
+#if defined(GGML_USE_RV_AME)
+    struct ggml_ame_mx_activation_reuse mx_reuse = {0};
+    if (params.nth == 1 && params.ith == 0 && cplan->abort_callback == NULL && !xsai_detail && !xsai_progress) {
+        const char * reuse_env = getenv("GGML_AME_MXFP4_REUSE_ACTIVATION");
+        const char * fuse_env = getenv("GGML_AME_RMSNORM_MXFP4");
+        mx_reuse.legacy = reuse_env != NULL && strcmp(reuse_env, "1") == 0;
+        if (mx_reuse.legacy || (!xsai_profile && ggml_ame_rmsnorm_qkv_enabled(fuse_env))) {
+            mx_reuse.graph = cgraph;
+            params.ame_mx_reuse = &mx_reuse;
+        }
+    }
+#endif
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
@@ -3596,7 +3611,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_xsai_op_progress_log("begin", node_n, node);
         }
         const uint64_t xsai_profile_t0 = xsai_timing ? ggml_xsai_profile_read_cycle() : 0;
-        ggml_compute_forward(&params, node);
+        bool rms_fused = false;
+#if defined(GGML_USE_RV_AME)
+        bool mx_interpose = false;
+        if (params.ame_mx_reuse != NULL) {
+            mx_reuse.incoming = mx_reuse.published;
+            mx_reuse.published = false;
+            mx_interpose = mx_reuse.incoming && node->op != GGML_OP_MUL_MAT &&
+                ggml_ame_mx_activation_interpose(&mx_reuse, node, node_n);
+        }
+        // A fusion is one atomic completion unit. Preserve the original
+        // per-node cancellation/debug semantics by declining in those modes.
+        if (!mx_interpose && node->op == GGML_OP_RMS_NORM && params.nth == 1 && params.ith == 0 &&
+            cplan->abort_callback == NULL && !xsai_detail && !xsai_progress) {
+            if (!xsai_profile && ggml_ame_begin_rmsnorm_qkv(&params, cgraph, node_n)) {
+                ++node_n;
+                continue;
+            }
+            rms_fused = ggml_ame_try_fuse_rmsnorm_mxfp4(&params, cgraph, node_n);
+            if (rms_fused) {
+                node_n += 2;
+                node = cgraph->nodes[node_n];
+            }
+        }
+        if (mx_interpose && !rms_fused) {
+            struct ggml_compute_params isolated = params;
+            isolated.wdata = mx_reuse.interposer_work;
+            isolated.wsize = mx_reuse.interposer_bytes;
+            isolated.ame_mx_reuse = NULL;
+            ggml_compute_forward(&isolated, node);
+            mx_reuse.published = true;
+        } else
+#endif
+        if (!rms_fused) ggml_compute_forward(&params, node);
         const uint64_t xsai_profile_cycles = xsai_timing ? ggml_xsai_profile_read_cycle() - xsai_profile_t0 : 0;
         if (xsai_progress) {
             ggml_xsai_op_progress_log("end", node_n, node);

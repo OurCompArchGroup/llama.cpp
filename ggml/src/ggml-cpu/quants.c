@@ -46,8 +46,271 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_1_ref(x, y, k);
 }
 
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+#if !defined(__riscv_v) || __riscv_xlen != 64
+#error "MXFP4 phase profiling requires RV64 RVV"
+#endif
+static _Thread_local struct ggml_mxfp4_phase_profile mxfp4_phase_profile;
+
+void ggml_mxfp4_phase_profile_reset(void) {
+    memset(&mxfp4_phase_profile, 0, sizeof(mxfp4_phase_profile));
+    mxfp4_phase_profile.adjacent_tick_min = UINT64_MAX;
+    for (int i = 0; i < 64; ++i) {
+        const uint64_t begin = mxfp4_phase_tick(0.0f);
+        const uint64_t end = mxfp4_phase_tick(0.0f);
+        if (end - begin < mxfp4_phase_profile.adjacent_tick_min) {
+            mxfp4_phase_profile.adjacent_tick_min = end - begin;
+        }
+    }
+}
+
+void ggml_mxfp4_phase_profile_get(struct ggml_mxfp4_phase_profile * result) {
+    *result = mxfp4_phase_profile;
+}
+
+void ggml_mxfp4_phase_profile_rms(uint64_t stats, uint64_t copy, uint64_t apply) {
+    ++mxfp4_phase_profile.rms_rows;
+    mxfp4_phase_profile.rms_stats_cycles += stats;
+    mxfp4_phase_profile.rms_copy_cycles += copy;
+    mxfp4_phase_profile.rms_apply_cycles += apply;
+}
+#endif
+
+#if defined(__riscv_v)
+// Shared scale selection for the runtime quantizer and supplied-scale preflight.
+// Keep the reduction, cast domain and scale expression identical at both callers.
+static inline float mxfp4_block_amax(const float * values) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK_MXFP4;) {
+        const size_t vl = __riscv_vsetvl_e32m8(QK_MXFP4 - j);
+        const vfloat32m8_t vx = __riscv_vle32_v_f32m8(values + j, vl);
+        const vfloat32m8_t magnitude = __riscv_vfabs_v_f32m8(vx, vl);
+        const vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+        const vfloat32m1_t maximum = __riscv_vfredmax_vs_f32m8_f32m1(magnitude, zero, vl);
+        const float chunk_amax = __riscv_vfmv_f_s_f32m1_f32(maximum);
+        if (amax < chunk_amax) amax = chunk_amax;
+        j += (int) vl;
+    }
+    return amax;
+}
+
+static inline bool mxfp4_scale_cast_fallback(float amax) {
+    return !isfinite(amax) || (amax > 0.0f && amax < 0x1p-125f);
+}
+
+static inline uint8_t mxfp4_scale_from_amax(float amax) {
+    return amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+}
+
+static inline int mxfp4_threshold_search_eligible(uint8_t e, float d, float amax) {
+    uint32_t search_flags;
+    // Read, never clear/restore, the caller's accrued flags. FP inputs
+    // keep the original scale work before this observation; the memory
+    // clobber keeps the following lane loads after it. Check the actual
+    // target code when changing this dependency or compiler options.
+    __asm__ volatile ("frflags %0" : "=r" (search_flags) : "f" (d), "f" (amax) : "memory");
+    // Bound every finite lane by 16*d explicitly. Positive FP32 bit order
+    // gives this power-of-two bound without evaluating 16*d, which would
+    // overflow for e252 even though that block must retain paired errors.
+    const uint32_t bound_bits = (uint32_t) (e + 3) << 23;
+    return (search_flags & 1u) && e <= 251 &&
+        amax <= 0x1p127f && fp32_to_bits(amax) <= bound_bits;
+}
+#endif
+
+bool ggml_mxfp4_prepare_supplied_scales(
+    const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT scales, int64_t k
+) {
+#if defined(__riscv_v)
+    if (x == NULL || scales == NULL || k <= 0 || k % QK_MXFP4 != 0 ||
+        (uint64_t) k > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    const int64_t nb = k / QK_MXFP4;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * values = x + i * QK_MXFP4;
+        // Maximum-number reduction alone cannot reject NaN lanes. Inspect raw
+        // bits first, without ordered FP predicates that could add scalar NV.
+        for (int j = 0; j < QK_MXFP4; ++j) {
+            uint32_t bits;
+            memcpy(&bits, values + j, sizeof(bits));
+            if ((bits & 0x7f800000u) == 0x7f800000u) {
+                return false;
+            }
+        }
+        const float amax = mxfp4_block_amax(values);
+        if (mxfp4_scale_cast_fallback(amax)) {
+            return false;
+        }
+        const uint8_t e = mxfp4_scale_from_amax(amax);
+        if (e >= 253) {
+            return false;
+        }
+        const float d = GGML_E8M0_TO_FP32_HALF(e);
+        if (!mxfp4_threshold_search_eligible(e, d, amax)) {
+            return false;
+        }
+        scales[i] = e;
+    }
+    return true;
+#else
+    UNUSED(x);
+    UNUSED(scales);
+    UNUSED(k);
+    return false;
+#endif
+}
+
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+#if defined(__riscv_v)
+    assert(k % QK_MXFP4 == 0);
+    block_mxfp4 * GGML_RESTRICT blocks = y;
+    const int64_t nb = k / QK_MXFP4;
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+    ++mxfp4_phase_profile.calls;
+#endif
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * values = x + i * QK_MXFP4;
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+        const uint64_t phase_begin = mxfp4_phase_tick(0.0f);
+#endif
+        float amax = mxfp4_block_amax(values);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+        const uint64_t phase_amax = mxfp4_phase_tick(amax);
+        // Keep the scale work after this boundary in diagnostic builds.
+        __asm__ volatile ("" : "+f" (amax) : "r" (phase_amax) : "memory");
+        ++mxfp4_phase_profile.blocks;
+        mxfp4_phase_profile.amax_cycles += phase_amax - phase_begin;
+#endif
+        // Maximum-number reduction ignores NaN values; the unchanged ordered
+        // search (or reference fallback) still accrues NV for their lanes.
+        // Preserve final flags, not the time at which they become sticky.
+        // Preserve the legacy reference outside the finite scale-cast domain.
+        // This is not a new quantization/admission rule or an exponent clamp.
+        if (mxfp4_scale_cast_fallback(amax)) {
+            quantize_row_mxfp4_ref(values, blocks + i, QK_MXFP4);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+            mxfp4_phase_profile.fallback_cycles += mxfp4_phase_tick(amax) - phase_amax;
+            ++mxfp4_phase_profile.fallback_blocks;
+#endif
+            continue;
+        }
+        const uint8_t e = mxfp4_scale_from_amax(amax);
+        if (e >= 253) {
+            quantize_row_mxfp4_ref(values, blocks + i, QK_MXFP4);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+            mxfp4_phase_profile.fallback_cycles += mxfp4_phase_tick(amax) - phase_amax;
+            ++mxfp4_phase_profile.fallback_blocks;
+#endif
+            continue;
+        }
+        const float d = GGML_E8M0_TO_FP32_HALF(e);
+        blocks[i].e = e;
+        const int threshold_search = mxfp4_threshold_search_eligible(e, d, amax);
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+        uint64_t phase_scale;
+        __asm__ volatile ("rdcycle %0" : "=r" (phase_scale) :
+            "f" (d), "r" (threshold_search) : "memory");
+#endif
+        uint8_t codes[QK_MXFP4];
+        if (threshold_search) {
+            // The admitted threshold search has fewer live vectors than the
+            // paired-error path. Use m8 only here so a K32 block fits in one
+            // strip at VLEN128; keep the paired-error register budget intact.
+            for (int j = 0; j < QK_MXFP4;) {
+                const size_t vl = __riscv_vsetvl_e32m8(QK_MXFP4 - j);
+                const vfloat32m8_t vx = __riscv_vle32_v_f32m8(values + j, vl);
+#if defined(GGML_RV_MXFP4_ENCODE)
+                // Experimental custom3, not a standard RVV/Zames allocation.
+                // Keep the original scale/NX/envelope gate above. Only replace
+                // its lane search; paired errors, narrowing and packing stay.
+                const vuint32m8_t scales = __riscv_vmv_v_x_u32m8(e, vl);
+                vuint32m8_t index;
+                // funct7=3 is funct6=000001 with vm=1. Same-width aliases are
+                // legal; the two vector inputs establish e32m8 before issue.
+                __asm__ volatile (".insn r 0x7b, 1, 3, %0, %1, %2"
+                    : "=vr" (index) : "vr" (scales), "vr" (vx) : "memory");
+#else
+                vuint32m8_t index = __riscv_vmv_v_x_u32m8(0, vl);
+                // Adjacent nonzero-center errors are exact by Sterbenz.
+                // Strict midpoint comparisons retain the first minimum,
+                // including code0. Removed finite errors can add only NX,
+                // already sticky; real ordered comparisons retain NaN NV.
+                const float midpoints[] = {0.5f, 1.5f, 2.5f, 3.5f, 5.0f, 7.0f, 10.0f};
+                const vfloat32m8_t magnitude = __riscv_vfabs_v_f32m8(vx, vl);
+                for (int candidate = 1; candidate < 8; ++candidate) {
+                    const float threshold = midpoints[candidate - 1] * d;
+                    const vbool4_t better = __riscv_vmfgt_vf_f32m8_b4(magnitude, threshold, vl);
+                    index = __riscv_vmerge_vxm_u32m8(index, candidate, better, vl);
+                }
+                // Preserve global code0, including negative zero/tiny/ties.
+                // Ordered comparisons also retain accrued NV for NaN lanes.
+                const vbool4_t negative = __riscv_vmflt_vf_f32m8_b4(vx, 0.0f, vl);
+                const vbool4_t nonzero = __riscv_vmsne_vx_u32m8_b4(index, 0, vl);
+                const vbool4_t signed_winner = __riscv_vmand_mm_b4(negative, nonzero, vl);
+                index = __riscv_vmerge_vvm_u32m8(
+                    index, __riscv_vor_vx_u32m8(index, 8, vl), signed_winner, vl);
+#endif
+                const vuint16m4_t half = __riscv_vnsrl_wx_u16m4(index, 0, vl);
+                const vuint8m2_t bytes = __riscv_vnsrl_wx_u8m2(half, 0, vl);
+                __riscv_vse8_v_u8m2(codes + j, bytes, vl);
+                j += (int) vl;
+            }
+        } else {
+            for (int j = 0; j < QK_MXFP4;) {
+                const size_t vl = __riscv_vsetvl_e32m4(QK_MXFP4 - j);
+                const vfloat32m4_t vx = __riscv_vle32_v_f32m4(values + j, vl);
+                vuint32m4_t index = __riscv_vmv_v_x_u32m4(0, vl);
+                // Both errors must remain live: discarded opposite signs can
+                // contribute exceptions outside the bounded NX-sticky domain.
+                vfloat32m4_t best = __riscv_vfabs_v_f32m4(
+                    __riscv_vfrsub_vf_f32m4(vx, 0.0f, vl), vl);
+                for (int candidate = 1; candidate < 8; ++candidate) {
+                    const float value = kvalues_mxfp4[candidate] * d;
+                    const vfloat32m4_t positive = __riscv_vfabs_v_f32m4(
+                        __riscv_vfrsub_vf_f32m4(vx, value, vl), vl);
+                    const vfloat32m4_t negative = __riscv_vfabs_v_f32m4(
+                        __riscv_vfrsub_vf_f32m4(vx, -value, vl), vl);
+                    const vfloat32m4_t err = __riscv_vfmin_vv_f32m4(positive, negative, vl);
+                    const vbool8_t negative_better =
+                        __riscv_vmflt_vv_f32m4_b8(negative, positive, vl);
+                    const vuint32m4_t positive_index = __riscv_vmv_v_x_u32m4(candidate, vl);
+                    const vuint32m4_t candidate_index = __riscv_vmerge_vxm_u32m4(
+                        positive_index, candidate + 8, negative_better, vl);
+                    const vbool8_t better = __riscv_vmflt_vv_f32m4_b8(err, best, vl);
+                    best = __riscv_vmerge_vvm_f32m4(best, err, better, vl);
+                    index = __riscv_vmerge_vvm_u32m4(index, candidate_index, better, vl);
+                }
+                const vuint16m2_t half = __riscv_vnsrl_wx_u16m2(index, 0, vl);
+                const vuint8m1_t bytes = __riscv_vnsrl_wx_u8m1(half, 0, vl);
+                __riscv_vse8_v_u8m1(codes + j, bytes, vl);
+                j += (int) vl;
+            }
+        }
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+        const uint64_t phase_encode = mxfp4_phase_tick(d);
+#endif
+        for (int j = 0; j < QK_MXFP4 / 2;) {
+            const size_t vl = __riscv_vsetvl_e8m1(QK_MXFP4 / 2 - j);
+            const vuint8m1_t low = __riscv_vle8_v_u8m1(codes + j, vl);
+            const vuint8m1_t high = __riscv_vle8_v_u8m1(codes + QK_MXFP4 / 2 + j, vl);
+            const vuint8m1_t packed = __riscv_vor_vv_u8m1(
+                low, __riscv_vsll_vx_u8m1(high, 4, vl), vl);
+            __riscv_vse8_v_u8m1(blocks[i].qs + j, packed, vl);
+            j += (int) vl;
+        }
+#if defined(GGML_MXFP4_PHASE_PROFILE)
+        const uint64_t phase_pack = mxfp4_phase_tick(d);
+        mxfp4_phase_profile.scale_cycles += phase_scale - phase_amax;
+        mxfp4_phase_profile.encode_cycles += phase_encode - phase_scale;
+        mxfp4_phase_profile.pack_cycles += phase_pack - phase_encode;
+        mxfp4_phase_profile.threshold_blocks += threshold_search != 0;
+        mxfp4_phase_profile.paired_blocks += threshold_search == 0;
+#endif
+    }
+#else
     quantize_row_mxfp4_ref(x, y, k);
+#endif
 }
 
 //

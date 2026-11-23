@@ -10,6 +10,18 @@
 
 #include "ggml.h"
 
+// Matrix sync registers and scratch/cache state belong to a GGML worker, not
+// the process. Use one spelling in both the C kernels and C++ backend.
+#ifdef __cplusplus
+#define GGML_AME_THREAD_LOCAL thread_local
+#else
+#define GGML_AME_THREAD_LOCAL _Thread_local
+#endif
+
+static inline bool ggml_ame_rmsnorm_qkv_enabled(const char * mode) {
+    return mode != NULL && (strcmp(mode, "qkv") == 0 || strcmp(mode, "pipeline+qkv") == 0);
+}
+
 // AME debug logging can be forced at build time with AME_DEBUG=1 or enabled at
 // runtime with GGML_AME_LOG=1 so logs are visible in QEMU serial output.
 #ifndef AME_DEBUG
@@ -20,7 +32,7 @@ static inline int ame_log_enabled(void) {
 #if AME_DEBUG
     return 1;
 #else
-    static int cached = -1;
+    static GGML_AME_THREAD_LOCAL int cached = -1;
     if (cached == -1) {
         const char * value = getenv("GGML_AME_LOG");
         cached = 0;
@@ -50,6 +62,94 @@ static inline int ame_log_enabled(void) {
 #define AME_Q8_BLOCK_K 32
 #define AME_Q8_PACK_K 64
 
+// Backend-private MX32 panels. Each complete panel and scale stream occupies
+// whole cache lines; no masked/tail or noncompact hardware load is required.
+#define AME_MXFP4_K 32
+#define AME_MXFP4_TILE_BYTES (AME_TILE_M * AME_MXFP4_K / 2)
+#define AME_MXFP4_SCALE_BYTES AME_TILE_M
+#define AME_MXFP8_TILE_BYTES (AME_TILE_M * AME_MXFP4_K)
+
+// Private software mcfg bytes, NOT internal MteComputeType enum values.
+// Frozen spec/program_model.adoc:76,94-105 (table1, low type nibble).
+#define AME_MCFG_MXFP4 0x16
+#define AME_MCFG_MXFP8_E5M2 0x17
+#define AME_MCFG_MXFP8_E4M3 0x18
+
+static inline int ggml_ame_mxfp8_format_supported(int format) {
+    return format == AME_MCFG_MXFP8_E4M3 || format == AME_MCFG_MXFP8_E5M2;
+}
+
+static inline size_t ggml_ame_mx_block_bytes(int format) {
+    return format == AME_MCFG_MXFP4 ? 16 : (ggml_ame_mxfp8_format_supported(format) ? 32 : 0);
+}
+
+// Logical M stays the output leading dimension; only packed weight storage
+// rounds up to full hardware panels. Reject before signed rounding overflow.
+static inline int64_t ggml_ame_mx_padded_rows(int64_t M, int tile_mn) {
+    if ((tile_mn != 64 && tile_mn != AME_TILE_M_MAX) ||
+        M < tile_mn || M > INT64_MAX - (tile_mn - 1)) {
+        return 0;
+    }
+    return ((M + tile_mn - 1) / tile_mn) * tile_mn;
+}
+
+static inline int ggml_ame_mx_shape_supported(int64_t M, int64_t N, int64_t K, int tile_mn) {
+    return ggml_ame_mx_padded_rows(M, tile_mn) != 0 &&
+        N > 0 && K > 0 && K <= INT32_MAX &&
+        N % tile_mn == 0 && K % AME_MXFP4_K == 0;
+}
+
+static inline int ggml_ame_mxfp4_shape_supported(int64_t M, int64_t N, int64_t K) {
+    return ggml_ame_mx_shape_supported(M, N, K, 64);
+}
+
+// Explicit software configuration attestation; not a fake/probed capability.
+static inline int ggml_ame_mx_config_tile_mn(const char * config) {
+    if (config == NULL || strcmp(config, "CUTE_2Tops_64SCP") == 0) return 64;
+    return strcmp(config, "CUTE_2Tops_128SCP") == 0 ||
+        strcmp(config, "CUTE_8Tops_128SCP") == 0 ? AME_TILE_M_MAX : 0;
+}
+
+// Pure selection used by the backend only AFTER its existing dual opt-in and
+// metadata gate. No CSR discovery, numeric capability or occupancy attestation.
+static inline int ggml_ame_mx_select_tile_k(
+    int format, int64_t M, int64_t N, int64_t K, int nth, const char * k64
+) {
+    if (nth != 1 || ggml_ame_mx_block_bytes(format) == 0 ||
+        !ggml_ame_mxfp4_shape_supported(M, N, K)) {
+        return 0;
+    }
+    return format == AME_MCFG_MXFP4 && K % 64 == 0 &&
+        k64 != NULL && strcmp(k64, "1") == 0 ? 64 : 32;
+}
+
+static inline int ggml_ame_mx_tile_k_supported(int format, int tile_k) {
+    return ggml_ame_mx_block_bytes(format) != 0 &&
+        (tile_k == 32 || (format == AME_MCFG_MXFP4 && tile_k == 64));
+}
+
+// Both storage layouts are composed of canonical K32 packed blocks. K64
+// interleaves the two blocks within each data/scale row, not across rows.
+static inline size_t ggml_ame_mx_packed_block_index(
+    int64_t row, size_t kb, size_t nb32, int tile_k, int tile_mn
+) {
+    const size_t groups = (size_t) tile_k / AME_MXFP4_K;
+    const size_t panel = (size_t) (row / tile_mn) * (nb32 / groups) + kb / groups;
+    return (panel * (size_t) tile_mn + (size_t) (row % tile_mn)) * groups + kb % groups;
+}
+
+// Baseline Q8 only: retain the existing padded row64, quantizer and per-group
+// epilogue; consume exactly its one Q8 group32. This is NOT a capacity probe.
+static inline int ggml_ame_q8_baseline_compute_k(
+    int64_t M, int64_t N, int64_t K, int tile_m, int tile_n, int nth,
+    int packed, int whole_k, const char * opt_in
+) {
+    return opt_in != NULL && strcmp(opt_in, "1") == 0 && !packed && !whole_k &&
+        nth == 1 && (tile_m == 64 || tile_m == 128) && tile_n == tile_m &&
+        M > 0 && N > 0 && K > 0 && K <= INT32_MAX &&
+        M % tile_m == 0 && N % tile_n == 0 && K % AME_Q8_BLOCK_K == 0 ? 32 : 64;
+}
+
 typedef struct {
     uint64_t tlenb;
     uint64_t trlenb;
@@ -64,11 +164,39 @@ typedef struct {
     int fixed_tile_supported;
 } ggml_ame_hw_config;
 
+// Exact advertised geometry, not >=128: larger/different tops are unsupported.
+// Existing capacity CSR decoder is unchanged. This pure predicate is testable
+// with local values but production passes only the real canonical CSR result.
+static inline int ggml_ame_mx_capacity_matches(const ggml_ame_hw_config * cfg, int tile_mn) {
+    return cfg != NULL && cfg->valid && (tile_mn == 64 || tile_mn == 128) &&
+        cfg->rows == (uint64_t) tile_mn && cfg->int8_m_max == tile_mn &&
+        cfg->int32_n_max == tile_mn && cfg->int8_k_max == 64 && cfg->melen_bits == 32 &&
+        cfg->trlenb == 64 && cfg->tlenb == (uint64_t) tile_mn * 64 &&
+        cfg->arlenb == (uint64_t) tile_mn * 4 &&
+        cfg->alenb == (uint64_t) tile_mn * (uint64_t) tile_mn * 4;
+}
+
+static inline int ggml_ame_mx_native_tile_mn(const ggml_ame_hw_config * cfg, const char * config) {
+    const int tile_mn = ggml_ame_mx_config_tile_mn(config);
+    return config != NULL && ggml_ame_mx_capacity_matches(cfg, tile_mn) ? tile_mn : 0;
+}
+
 typedef enum {
     GGML_AME_I8_KERNEL_NONE = 0,
     GGML_AME_I8_KERNEL_64_64_64,
     GGML_AME_I8_KERNEL_128_64_128,
 } ggml_ame_i8_kernel_kind;
+
+static inline int ggml_ame_i8_128_whole_k_enabled(void) {
+    static GGML_AME_THREAD_LOCAL int cached = -1;
+    if (cached == -1) {
+        const char * value = getenv("GGML_AME_I8_128_WHOLE_K");
+        cached = value != NULL && value[0] != '\0' &&
+            strcmp(value, "0") != 0 && strcmp(value, "false") != 0 &&
+            strcmp(value, "off") != 0 && strcmp(value, "no") != 0;
+    }
+    return cached;
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,12 +207,19 @@ void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * B,
     int32_t * C);
 
+void ggml_ame_gemm_tile_i8_i32_bT_q8_k32(
+    const int8_t * A, const int8_t * B, int32_t * C);
+void ggml_ame_gemm_tile_i8_i32_bT_128_q8_k32(
+    const int8_t * A, const int8_t * B, int32_t * C);
+
 void ggml_ame_gemm_tile_i8_i32_bT_kloop(
     const int8_t * a_tiles,
     ptrdiff_t a_tile_stride,
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C);
 
 typedef void (*ggml_ame_overlap_fn)(void * opaque);
@@ -97,6 +232,8 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C,
     int transpose_c,
     ggml_ame_overlap_fn overlap_fn,
@@ -109,6 +246,8 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C0,
     int32_t * C1,
     int output_tiles,
@@ -155,7 +294,7 @@ typedef unsigned long (*ggml_ame_gemm_tile_i8_i32_bT_submit_fn)(
     const int8_t * B,
     int32_t * C);
 
-extern ggml_ame_sync_state ggml_ame_sync_state_global;
+extern GGML_AME_THREAD_LOCAL ggml_ame_sync_state ggml_ame_sync_state_global;
 
 #ifdef __cplusplus
 }
@@ -216,8 +355,8 @@ static inline const ggml_ame_i8_kernel * ggml_ame_i8_kernel_for_kind(ggml_ame_i8
 }
 
 static inline const ggml_ame_hw_config * ggml_ame_hw_config_get(void) {
-    static ggml_ame_hw_config cfg;
-    static int initialized = 0;
+    static GGML_AME_THREAD_LOCAL ggml_ame_hw_config cfg;
+    static GGML_AME_THREAD_LOCAL int initialized = 0;
     if (initialized) {
         return &cfg;
     }
@@ -329,6 +468,18 @@ static inline size_t ggml_ame_i8_kernel_workspace_size(const ggml_ame_i8_kernel 
     size = (size + 63) / 64 * 64;
     size += (size_t) tile_m * tile_n * sizeof(int32_t);
     return size;
+}
+
+// Partition whole output-row tiles, leaving K reduction within one worker.
+// M remains the original output leading dimension, even for an edge shard.
+static inline void ggml_ame_worker_rows(
+        int64_t M, int tile_m, int ith, int nth, int64_t * begin, int64_t * end) {
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth && tile_m > 0);
+    const int64_t tiles = (M + tile_m - 1) / tile_m;
+    *begin = (tiles * ith / nth) * tile_m;
+    *end = (tiles * (ith + 1) / nth) * tile_m;
+    if (*begin > M) *begin = M;
+    if (*end > M) *end = M;
 }
 
 static inline void ggml_ame_sync_begin_op(void) {
@@ -656,6 +807,11 @@ typedef struct {
 extern "C" {
 #endif
 
+// Existing system-mode nemu_signal owner, also used by explicit checkpoint
+// microbenchmarks. Codes retain docs/checkpoint-workload-template.md semantics.
+// Not a user-mode feature probe; callers must explicitly select system ROI.
+void ggml_ame_nemu_signal(int code);
+
 // Atomic tile GEMM (16x32x16)
 void ggml_ame_gemm_tile_i8_i32_bT(
     const int8_t * A,
@@ -679,6 +835,134 @@ void ggml_ame_gemm_tile_bf16_fp32_bT_kloop(
     float * C
 );
 
+// Shared K32 path: compact 16-byte E2M1 or 32-byte FP8 data rows and one E8M0
+// byte per row. Only called after the explicit MX32 capability attestation.
+void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
+    const uint8_t * a, const uint8_t * sa,
+    const uint8_t * b, const uint8_t * sb, int64_t k_tiles, float * c, int format, int tile_k, int tile_mn,
+    ggml_ame_overlap_fn overlap_fn, void * overlap_opaque);
+
+// Lossless GGML low=k/high=k+16 -> consecutive-K nibbles, separate E8M0.
+// Output sizes are nblocks*16 and nblocks bytes. Buffers must not overlap.
+// No hardware instructions, quantization or scale conversion.
+GGML_API bool ggml_ame_pack_mxfp4_blocks(
+    uint8_t * payload, uint8_t * scales, const void * src, int64_t nblocks);
+
+// CPU producer only: ordinary RMSNorm + gamma, real CPU MXFP4 quantizer and
+// canonical AME layout. No normalized full-tensor output or matrix instruction.
+// Inputs/outputs must not overlap; gamma has K contiguous F32 elements.
+// F32 rows are naturally aligned; byte stride must preserve that alignment.
+// Reject nonfinite normalized blocks and nonzero amax below 2^-125 before
+// invoking the legacy CPU scale cast; epsilon must be finite and positive.
+// On false discard all partial payload/scales. Scalar flags naturally accrue.
+// Optional row_scales are reciprocal factors validated by preflight below.
+// CPU-only first-panel preparation within that preflight is provisional;
+// downstream consumption requires successful WHOLE-input admission. Keep
+// source/gamma, rounding mode and factors unchanged through consumption.
+GGML_API bool ggml_ame_rmsnorm_pack_mxfp4(
+    uint8_t * payload, uint8_t * scales, const float * src, const float * gamma,
+    int64_t rows, int64_t K, size_t src_stride, float eps, int tile_k, int tile_mn,
+    const float * row_scales);
+
+// Optional first-panel output in exclusive scratch, not a published tensor.
+// On false discard factors AND all provisional payload/scales. profile!=0
+// measures just the existing producer call on RV64 (zero on other targets).
+struct ggml_ame_rmsnorm_first_panel {
+    uint8_t * payload;
+    uint8_t * scales;
+    int tile_k;
+    int profile;
+    uint64_t prepare_cycles;
+};
+
+// CPU-only whole-input admission before any native issue. Writes rows F32
+// factors into exclusive scratch, reuses the same normalized-block checks.
+// first==NULL preserves factors-only/no-packed-output behavior. Otherwise
+// prepare the first tile_mn rows ONCE using the same canonical producer, then
+// validate remaining rows. No output is usable until this call succeeds.
+GGML_API bool ggml_ame_rmsnorm_mxfp4_preflight(
+    float * row_scales, const float * src, const float * gamma,
+    int64_t rows, int64_t K, size_t src_stride, float eps, int tile_mn,
+    struct ggml_ame_rmsnorm_first_panel * first);
+
+// Native dispatch domain, deliberately stricter than the raw lossless packer:
+// GGML's half-scale decoder treats e=255 as finite; MX ISA treats it as NaN.
+GGML_API bool ggml_ame_mxfp4_native_domain(const void * src, int64_t nblocks);
+
+// Backend-private preparation only: no GGML tensor/model format or public API.
+// Complete K32 blocks, finite F32 sources, separate one-byte E8M0 per block.
+// Unknown formats, tails and nonfinite source tensors fail before output writes.
+bool ggml_ame_mxfp8_f32_domain(const float * src, int64_t nvalues, int format);
+bool ggml_ame_pack_mxfp8_f32(
+    uint8_t * payload, uint8_t * scales, const float * src, int64_t nvalues, int format);
+bool ggml_ame_mxfp8_native_domain(
+    const uint8_t * payload, const uint8_t * scales, int64_t nblocks, int format);
+// Internal directed test of actual compute rejection before CSR discovery.
+bool ggml_ame_mx_invalid_compute_selftest(void);
+bool ggml_ame_mxfp4_k64_selftest(void);
+bool ggml_ame_q8_k32_selftest(void);
+bool ggml_ame_mx128_selftest(bool run_native, bool qwen_shape);
+// Backend-private preparation seam: no CSR, allocation, sync or native issue.
+void ggml_ame_mx_prepare_activation(
+    uint8_t * payload, uint8_t * scales, const void * src,
+    int64_t N, int64_t K, size_t stride, int format, int tile_k, int tile_mn);
+
+// Software-only cache/callback regression; never probes or submits to AMU.
+GGML_API bool ggml_ame_mxfp4_cache_selftest(void);
+
+// Packed panel streams are [output_tile][K_block][row][packed_K].
+struct ggml_ame_rmsnorm_input {
+    const float * gamma;
+    const float * row_scales; // whole-input preflight, exclusive workspace prefix
+    float eps;
+    int pipeline;
+    int first_panel_prepared;
+    uint64_t preflight_cycles;
+    uint64_t prepare_cycles;
+    uint64_t prepared_panels;
+    uint64_t overlap_callbacks;
+};
+struct ggml_ame_mx_activation_reuse {
+    const struct ggml_cgraph * graph;
+    const struct ggml_tensor * source;
+    struct ggml_tensor * qkv_norm;
+    struct ggml_tensor * qkv_last;
+    const void * source_data;
+    const void * workspace;
+    size_t workspace_bytes;
+    void * interposer_work;
+    size_t interposer_bytes;
+    size_t stride;
+    int tile_k;
+    int tile_mn;
+    unsigned interposers;
+    unsigned qkv_dispatched;
+    unsigned fcsr;
+    int saved_errno;
+    bool legacy;
+    bool incoming;
+    bool published;
+    bool hit;
+};
+
+void ggml_ame_mul_mat_mx(
+    const uint8_t * a, const uint8_t * sa, const void * src1, float * dst,
+    int64_t M, int64_t N, int64_t K, size_t src1_stride,
+    void * work_data, int ith, int nth,
+    uint64_t weight_prepare_cycles, int weight_cache_hit, int format, int tile_k, int tile_mn,
+    struct ggml_ame_rmsnorm_input * rms, struct ggml_ame_mx_activation_reuse * reuse);
+void ggml_ame_mx_profile_finish(uint64_t elapsed_cycles, int format, int tile_k);
+void ggml_ame_mx_profile_qkv_producer(uint64_t elapsed_cycles, int tile_k);
+
+struct ggml_compute_params;
+bool ggml_ame_mx_activation_interpose(
+    struct ggml_ame_mx_activation_reuse * reuse, const struct ggml_tensor * node, int node_index);
+bool ggml_ame_begin_rmsnorm_qkv(
+    struct ggml_compute_params * params, const struct ggml_cgraph * graph, int node_index);
+bool ggml_ame_try_fuse_rmsnorm_mxfp4(
+    struct ggml_compute_params * params, const struct ggml_cgraph * graph, int node_index);
+bool ggml_ame_rmsnorm_fusion_selftest(bool run_native, int fixture, bool benchmark);
+
 void ggml_ame_bf16_profile_reset(void);
 void ggml_ame_bf16_profile_snapshot(ggml_ame_bf16_profile * profile);
 
@@ -695,6 +979,9 @@ void ggml_ame_gemm_q8_0(
 
 void ggml_ame_profile_reset(void);
 void ggml_ame_profile_dump_now(void);
+// Pure quantizer test seam; q has ceil(k/64)*64 bytes, scale ceil(k/64)
+// floats. Includes padded lanes; does not issue AME or update profiling/cache.
+void ggml_ame_quantize_whole_k_test(const float * x, int64_t k, int8_t * q, float * scale);
 
 // Quantize a row of F32 values to Q8_0 format
 void ggml_ame_quantize_row_f32_to_q8_0(const float * x, void * y, int k);
@@ -732,7 +1019,9 @@ void ggml_ame_mul_mat_q8_0(
     int64_t ne11,
     size_t src1_stride,  // stride in bytes for src1 columns (nb[1])
     void * work_data,
-    size_t work_size
+    size_t work_size,
+    int ith,
+    int nth
 );
 
 void ggml_ame_mul_mat_bf16(
@@ -746,7 +1035,9 @@ void ggml_ame_mul_mat_bf16(
     size_t src1_stride,
     enum ggml_type src1_type,
     void * work_data,
-    size_t work_size
+    size_t work_size,
+    int ith,
+    int nth
 );
 
 void ggml_ame_mul_mat_q8_0_ame64(
@@ -765,7 +1056,9 @@ void ggml_ame_mul_mat_q8_0_ame64(
     const void * graph_key,
     uint64_t src1_generation,
     void * work_data,
-    size_t work_size
+    size_t work_size,
+    int ith,
+    int nth
 );
 
 // GGML integration wrapper for Q4_0 quantized matrix multiplication

@@ -5,7 +5,7 @@
 #include <string.h>
 
 static int ame_tile_progress_enabled(void) {
-    static int cached = -1;
+    static GGML_AME_THREAD_LOCAL int cached = -1;
     if (cached == -1) {
         const char * value = getenv("GGML_AME_TILE_PROGRESS_LOG");
         cached = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0 &&
@@ -33,7 +33,7 @@ static int ame_tile_progress_enabled(void) {
 // Tile size: M=AME_TILE_M, K=AME_TILE_K, N=AME_TILE_N (atomic AME variant)
 // C(MxN) = A(MxK) × B^T(NxK), where B is transposed in memory
 // This function computes a single MxN tile output
-#define DEFINE_AME_GEMM_TILE(FUNC, TILE_M_VALUE, TILE_K_VALUE, TILE_N_VALUE, TAG)       \
+#define DEFINE_AME_GEMM_TILE(FUNC, TILE_M_VALUE, TILE_K_VALUE, TILE_N_VALUE, TAG, COMPUTE_K) \
 void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                            \
     const int TILE_M = (TILE_M_VALUE);                                                  \
     const int TILE_K = (TILE_K_VALUE);                                                  \
@@ -43,7 +43,7 @@ void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                    
     AME_TILE_PROGRESS_LOG("mset_begin%s A=%p B=%p C=%p", TAG,                           \
         (const void *) A, (const void *) B, (void *) C);                                \
     MSETTILEM(tmp, TILE_M);                                                             \
-    MSETTILEK(tmp, TILE_K);                                                             \
+    MSETTILEK(tmp, COMPUTE_K);                                                          \
     MSETTILEN(tmp, TILE_N);                                                             \
     ggml_ame_config_i8_i32();                                                           \
     AME_TILE_PROGRESS_LOG("mset_done%s", TAG);                                         \
@@ -83,8 +83,12 @@ void FUNC(const int8_t * A, const int8_t * B, int32_t * C) {                    
     AME_TILE_PROGRESS_LOG("macquire_done%s target=%lu", TAG, acquire_target);          \
 }
 
-DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT, 64, 64, 64, "")
-DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT_128_64_128, 128, 64, 128, "_128")
+DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT, 64, 64, 64, "", 64)
+DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT_128_64_128, 128, 64, 128, "_128", 64)
+// Same padded row64 as baseline. Only the consumed K changes: ONE Q8 group32
+// and ONE MMACC, not two scale groups/tuples. Async/whole-K paths stay K64.
+DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT_q8_k32, 64, 64, 64, "_q8_k32", 32)
+DEFINE_AME_GEMM_TILE(ggml_ame_gemm_tile_i8_i32_bT_128_q8_k32, 128, 64, 128, "_128_q8_k32", 32)
 
 void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     const int8_t * a_tiles,
@@ -92,6 +96,8 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C,
     int transpose_c,
     ggml_ame_overlap_fn overlap_fn,
@@ -102,9 +108,9 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     }
 
     int tmp;
-    MSETTILEM(tmp, AME_TILE_M);
+    MSETTILEM(tmp, tile_m);
     MSETTILEK(tmp, AME_TILE_K);
-    MSETTILEN(tmp, AME_TILE_N);
+    MSETTILEN(tmp, tile_n);
     ggml_ame_config_i8_i32();
 
     MZERO(acc0);
@@ -148,9 +154,9 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
     // compiler cannot recycle the address register while the store is pending.
     register int32_t * c_live __asm__("s11") = C;
     if (transpose_c) {
-        MSCT(acc0, c_live, AME_TILE_M * (int) sizeof(int32_t));
+        MSCT(acc0, c_live, tile_m * (int) sizeof(int32_t));
     } else {
-        MSC(acc0, c_live, AME_TILE_N * (int) sizeof(int32_t));
+        MSC(acc0, c_live, tile_n * (int) sizeof(int32_t));
     }
     const unsigned long target = ggml_ame_sync_release();
     ggml_ame_sync_acquire_wait(target);
@@ -163,10 +169,12 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop(
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C
 ) {
     ggml_ame_gemm_tile_i8_i32_bT_kloop_overlap(
-        a_tiles, a_tile_stride, b_tiles, b_tile_stride, k_tiles, C, 0, NULL, NULL);
+        a_tiles, a_tile_stride, b_tiles, b_tile_stride, k_tiles, tile_m, tile_n, C, 0, NULL, NULL);
 }
 
 #define AME_KLOOP_COMPUTE(ACC) do {                                      \
@@ -200,6 +208,8 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
     const int8_t * b_tiles,
     ptrdiff_t b_tile_stride,
     int k_tiles,
+    int tile_m,
+    int tile_n,
     int32_t * C0,
     int32_t * C1,
     int output_tiles,
@@ -212,9 +222,9 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
     }
 
     int tmp;
-    MSETTILEM(tmp, AME_TILE_M);
+    MSETTILEM(tmp, tile_m);
     MSETTILEK(tmp, AME_TILE_K);
-    MSETTILEN(tmp, AME_TILE_N);
+    MSETTILEN(tmp, tile_n);
     ggml_ame_config_i8_i32();
     AME_MLOAD_FENCE_BEFORE_LOAD("_double_buffer");
 
@@ -249,15 +259,15 @@ void ggml_ame_gemm_tile_i8_i32_bT_kloop_double_buffer(
 
         if (slot == 0) {
             if (transpose_c) {
-                MSCT(acc0, c0_live, AME_TILE_M * (int) sizeof(int32_t));
+                MSCT(acc0, c0_live, tile_m * (int) sizeof(int32_t));
             } else {
-                MSC(acc0, c0_live, AME_TILE_N * (int) sizeof(int32_t));
+                MSC(acc0, c0_live, tile_n * (int) sizeof(int32_t));
             }
         } else {
             if (transpose_c) {
-                MSCT(acc1, c1_live, AME_TILE_M * (int) sizeof(int32_t));
+                MSCT(acc1, c1_live, tile_m * (int) sizeof(int32_t));
             } else {
-                MSC(acc1, c1_live, AME_TILE_N * (int) sizeof(int32_t));
+                MSC(acc1, c1_live, tile_n * (int) sizeof(int32_t));
             }
         }
         pending_target = ggml_ame_sync_release();
