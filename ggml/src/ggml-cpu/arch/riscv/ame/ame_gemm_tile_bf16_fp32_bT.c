@@ -22,7 +22,7 @@ void ggml_ame_gemm_tile_mx_fp32_bT_kloop(
     unsigned long saved_mfrm;
     asm volatile("csrrw %0, 0x809, zero" : "=r"(saved_mfrm) : : "memory");
     MZERO(acc0);
-    asm volatile("fence rw, rw" ::: "memory");
+    asm volatile("mfence" ::: "memory");
 
     // The AMU may consume address GPRs after scalar issue. Keep every load
     // base live until acquire, as in the existing INT8 kloop store path.
